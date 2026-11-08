@@ -11,7 +11,7 @@ is conservative: **link by default, never silent-delete or overwrite originals**
 | Cloud poller | `cloud` | Reuses official Open API / MCP listing + download |
 | Filesystem | `filesystem` | Import an on-disk audio path |
 | Upload | `upload` | Multipart / Web App “Add audio” |
-| BLE | `ble` | **Stub only** — interface + `serial:sessionId` key shape; no OpenPlod protocol |
+| BLE | `ble` | **Experimental** — OpenPlod-adapted adapter (`docs/ble.md`); `serial:sessionId`; radio needs bridge + identity |
 
 Feature flag: `[ingest] enabled` in `config.toml` (default `true`). When
 `enabled = false`, fall back to poller + legacy upload-only behaviour.

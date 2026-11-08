@@ -1917,6 +1917,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+ble = [
+    { name = "cryptography" },
+]
 cloud = [
     { name = "anthropic" },
     { name = "assemblyai" },
@@ -1929,6 +1932,7 @@ cuda = [
     { name = "nvidia-cudnn-cu12" },
 ]
 dev = [
+    { name = "cryptography" },
     { name = "mcp" },
     { name = "mypy" },
     { name = "pypdf" },
@@ -1968,6 +1972,8 @@ requires-dist = [
     { name = "argon2-cffi", specifier = ">=25.1" },
     { name = "assemblyai", marker = "extra == 'cloud'", specifier = ">=0.28" },
     { name = "authlib", specifier = ">=1.6.5,<2" },
+    { name = "cryptography", marker = "extra == 'ble'", specifier = ">=42" },
+    { name = "cryptography", marker = "extra == 'dev'", specifier = ">=42" },
     { name = "deepgram-sdk", marker = "extra == 'cloud'", specifier = ">=3.2" },
     { name = "fastapi", specifier = ">=0.111" },
     { name = "faster-whisper", marker = "extra == 'cuda'", specifier = ">=1.0" },
@@ -2010,7 +2016,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "whisperx", marker = "extra == 'forced-align'", specifier = ">=3.4" },
 ]
-provides-extras = ["faster-whisper", "cuda", "mlx", "diarize", "forced-align", "vad", "local-llm", "cloud", "mcp", "dev"]
+provides-extras = ["faster-whisper", "cuda", "mlx", "diarize", "forced-align", "vad", "local-llm", "cloud", "mcp", "ble", "dev"]
 
 [[package]]
 name = "lxml"

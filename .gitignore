@@ -7,6 +7,10 @@ config.toml.*
 *.cookie
 *.token
 secrets/
+plaud-device.json
+**/plaud-device.json
+plaud-developer.json
+**/plaud-developer.json
 
 # ---- Data (audio, transcripts, db) ----
 data/

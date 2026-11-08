@@ -28,7 +28,7 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
       - name: Install application and provider test dependencies
-        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev --extra cloud
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev --extra cloud --extra ble
       - name: Install CPU tensor test dependency
         run: uv pip install "torch>=2.8" --index-url https://download.pytorch.org/whl/cpu
       - name: Lint

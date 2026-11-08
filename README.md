@@ -4,16 +4,17 @@
 > [ATTRIBUTION.md](ATTRIBUTION.md). Local LLM traffic targets
 > [inference-gateway-manager](https://github.com/vkotios/inference-gateway-manager)
 > (`/v1`, concurrency 1, HTTP 409 busy retry) — [docs/deploy-fedora-igm.md](docs/deploy-fedora-igm.md).
-> Phase 3 adds unified ingest + library dedupe (link-by-default; BLE stub only) —
-> [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Phase 5 adds a **local knowledge
-> MCP** (`plaud-local-knowledge-mcp`) over the local library — distinct from the
-> official `@plaud-ai/mcp` cloud ingest client —
-> [docs/mcp-knowledge.md](docs/mcp-knowledge.md). Phase 6 publishes the
-> [platform matrix](docs/platform-matrix.md) and Fedora/Windows/Docker packaging
-> ([deploy-fedora.md](docs/deploy-fedora.md), [windows.md](docs/windows.md),
-> [ble-host.md](docs/ble-host.md)): Compose `core` profile, BLE unsupported in
-> default containers, AMD/IGM not CUDA. Private/RE Plaud APIs remain rejected;
-> BLE Note Pro protocol remains a separate experimental track (PR #6).
+> Phase 3 adds unified ingest + library dedupe (link-by-default) —
+> [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Phase 4 ships an **experimental /
+> deferred** BLE Note Pro adapter (code kept; Partner authorize blocked for now) —
+> [docs/ble.md](docs/ble.md). **Supported cloud path:** official Open API via
+> `localplaud auth login` + poll/download. Phase 5 adds a **local knowledge MCP**
+> (`plaud-local-knowledge-mcp`) — [docs/mcp-knowledge.md](docs/mcp-knowledge.md).
+> Phase 6 publishes the [platform matrix](docs/platform-matrix.md) and
+> Fedora/Windows/Docker packaging ([deploy-fedora.md](docs/deploy-fedora.md),
+> [windows.md](docs/windows.md), [ble-host.md](docs/ble-host.md)): Compose `core`
+> profile, BLE unsupported in default containers, AMD/IGM not CUDA. Private/RE
+> Plaud APIs remain rejected.
 
 <p align="center">
   <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">

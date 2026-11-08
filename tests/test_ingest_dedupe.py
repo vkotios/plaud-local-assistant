@@ -317,7 +317,7 @@ def test_ingest_status_and_provenance_endpoints(monkeypatch, tmp_path):
 def test_ble_transfer_stub_raises():
     from localplaud.ingest.backends import BleBackend
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError, match="BLE|bridge|experimental|feature flag"):
         BleBackend().transfer()
 
 

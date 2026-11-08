@@ -105,6 +105,21 @@ class IngestConfig(BaseModel):
     fingerprint_hook: bool = False
 
 
+class BleConfig(BaseModel):
+    """Experimental Bluetooth Note Pro adapter (Phase 4).
+
+    Off by default. Protocol 20 / Note Pro only. Requires paste-token provision
+    (``plaud-device.json``) and a built ``plaud-bridge`` for radio transfer.
+    """
+
+    enabled: bool = False
+    identity_path: str | None = None
+    bridge_path: str | None = None
+    domain: Literal["platform-us.plaud.ai", "platform-jp.plaud.ai"] = (
+        "platform-us.plaud.ai"
+    )
+
+
 class StoreConfig(BaseModel):
     database_url: str = "sqlite:///./data/localplaud.db"
     # Plaud remains the durable raw-audio source. Once every enabled pipeline
@@ -603,6 +618,7 @@ class Settings(BaseSettings):
     plaud: PlaudConfig = Field(default_factory=PlaudConfig)
     poller: PollerConfig = Field(default_factory=PollerConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
+    ble: BleConfig = Field(default_factory=BleConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     asr: AsrConfig = Field(default_factory=AsrConfig)

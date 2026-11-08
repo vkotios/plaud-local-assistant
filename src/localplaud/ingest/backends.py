@@ -127,23 +127,57 @@ class UploadBackend:
 
 
 class BleBackend:
-    """Stub Bluetooth Note Pro backend — interface only (Phase 4).
+    """Bluetooth Note Pro backend (Phase 4, experimental).
 
-    No OpenPlod protocol, crypto, or vendor modules are imported here.
+    Protocol/crypto/provision live in ``localplaud.ble`` (OpenPlod-adapted).
+    Radio transfer needs a built ``plaud-bridge`` + ``plaud-device.json``.
+    Decoded audio still ingests via ``item_from_session`` / orchestrator.
     """
 
     name = "ble"
 
     def describe(self) -> dict:
+        enabled = False
+        bridge_present = False
+        identity_present = False
+        try:
+            from ..ble.doctor import ble_doctor_status
+            from ..config import get_settings
+
+            enabled = bool(get_settings().ble.enabled)
+            report = ble_doctor_status(enabled=enabled)
+            bridge_present = bool(report.get("bridgePresent"))
+            identity_present = bool(report.get("identityPresent"))
+        except Exception:  # noqa: BLE001 — describe must never raise
+            pass
+        if not enabled:
+            status = "disabled"
+            notes = (
+                "Experimental OpenPlod-adapted BLE adapter present but feature-flagged "
+                "off ([ble] enabled=false). External id: serial:sessionId."
+            )
+        elif bridge_present and identity_present:
+            status = "experimental"
+            notes = (
+                "BLE enabled with identity + bridge; radio transfer remains experimental "
+                "(protocol 20 / Note Pro). Prefer Linux acceptance; Windows path first."
+            )
+        else:
+            status = "experimental"
+            notes = (
+                "BLE adapter modules available. Provision identity and build "
+                "vendor/openplod-ble/plaud-bridge for radio ops. "
+                "Decoded-audio ingest works without radio."
+            )
         return {
             "name": self.name,
             "transport": "ble",
-            "status": "stub",
-            "notes": (
-                "Interface reserved for Phase 4 OpenPlod-adapted adapter. "
-                "External id shape: serial:sessionId. Not operational."
-            ),
+            "status": status,
+            "notes": notes,
             "external_id_shape": "serial:sessionId",
+            "enabled": enabled,
+            "bridgePresent": bridge_present,
+            "identityPresent": identity_present,
         }
 
     def item_from_session(
@@ -155,7 +189,7 @@ class BleBackend:
         filename: str | None = None,
         metadata: dict | None = None,
     ) -> BackendItem:
-        """Build a BLE-shaped candidate for orchestrator tests / future adapter."""
+        """Build a BLE-shaped candidate for orchestrator / adapter ingest."""
         path = Path(audio_path) if audio_path is not None else None
         return BackendItem(
             transport="ble",
@@ -170,8 +204,15 @@ class BleBackend:
         )
 
     def transfer(self, *_args, **_kwargs) -> None:
+        from ..ble.service import transfer_not_available_reason
+
+        reason = transfer_not_available_reason()
+        if reason:
+            raise NotImplementedError(reason)
         raise NotImplementedError(
-            "BLE ingest is a Phase 4 stub; no OpenPlod/protocol transfer is available"
+            "Live BLE radio download is experimental; use provision + bridge doctor, "
+            "then ingest decoded audio via BleBackend.item_from_session / "
+            "localplaud.ble.service.ingest_decoded_session"
         )
 
 

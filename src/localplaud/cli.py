@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -22,6 +23,10 @@ app = typer.Typer(
 )
 auth_app = typer.Typer(help="Manage your Plaud session.")
 app.add_typer(auth_app, name="auth")
+ble_app = typer.Typer(
+    help="Experimental Bluetooth Note Pro adapter (OpenPlod-adapted; feature-flagged).",
+)
+app.add_typer(ble_app, name="ble")
 console = Console()
 
 
@@ -910,6 +915,132 @@ def benchmark_speech_command(
         console.print(table)
     if report["aggregate"]["failed"]:
         raise typer.Exit(1)
+
+
+# --------------------------------------------------------------------------- #
+# ble (experimental)
+# --------------------------------------------------------------------------- #
+
+
+@ble_app.command("doctor")
+def ble_doctor(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON."),
+):
+    """Report BLE readiness (redacted; never prints tokens/keys/serials)."""
+    from .ble.service import status
+
+    report = status()
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    console.print("[bold]BLE doctor[/] (experimental)")
+    console.print(f"  enabled: {report.get('enabled')}")
+    console.print(f"  platform: {report.get('platform')}  wsl={report.get('wsl')}")
+    console.print(f"  backend: {report.get('bluetoothBackend')}")
+    console.print(f"  bridge: {report.get('bridgePresent')}  identity: {report.get('identityPresent')}")
+    console.print(f"  identity path: {report.get('identityPath')}")
+    for note in report.get("notes") or []:
+        console.print(f"  • {note}", markup=False)
+
+
+@ble_app.command("provision")
+def ble_provision(
+    serial: str = typer.Option(..., "--serial", help="16-char uppercase hex Note Pro serial."),
+    identifier: str = typer.Option(
+        ...,
+        "--identifier",
+        help="Bluetooth BD_ADDR (Linux/Windows) or CoreBluetooth UUID (macOS).",
+    ),
+    token_file: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--token-file",
+        help="File containing Plaud tokenstr / Bearer JWT (preferred over argv).",
+    ),
+    domain: str = typer.Option(
+        "platform-us.plaud.ai",
+        "--domain",
+        help="platform-us.plaud.ai or platform-jp.plaud.ai",
+    ),
+    identity_path: Path | None = typer.Option(  # noqa: B008
+        None, "--identity-path", help="Where to write plaud-device.json."
+    ),
+    from_stdin: bool = typer.Option(
+        False, "--stdin", help="Read the sign-in token from stdin."
+    ),
+):
+    """Authorize this computer: paste Plaud sign-in token → gen-key + sn-sign.
+
+    Get tokenstr from web.plaud.ai → DevTools → Application → Local Storage → tokenstr.
+    Never commit plaud-device.json. Tokens/keys/serials are not echoed.
+    """
+    from .ble.service import provision
+
+    token = ""
+    if token_file is not None:
+        token = Path(token_file).read_text(encoding="utf-8")
+    elif from_stdin or not sys.stdin.isatty():
+        token = sys.stdin.read()
+    else:
+        token = typer.prompt("Paste Plaud sign-in token (tokenstr)", hide_input=True)
+    if not token.strip():
+        console.print("[red]✗[/] Empty token.")
+        raise typer.Exit(1)
+    try:
+        result = provision(
+            token=token,
+            serial=serial.strip().upper(),
+            identifier=identifier.strip(),
+            domain=domain.strip(),
+            identity_path=str(identity_path) if identity_path else None,
+        )
+    except ValueError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from None
+    console.print("[green]✓[/] Device identity written (contents not printed).")
+    console.print(f"  path: {result.get('identityPath')}")
+    identity = result.get("identity") or {}
+    console.print(f"  serial: {identity.get('serial')}")
+    console.print(f"  identifier: {identity.get('identifier')}")
+    console.print(f"  deviceType: {identity.get('deviceType')}")
+
+
+@ble_app.command("scan")
+def ble_scan(
+    timeout: float = typer.Option(15.0, "--timeout", help="Scan window seconds."),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Optional BLE scan via plaud-bridge (redacted output)."""
+    from .ble.service import try_scan
+
+    result = try_scan(timeout=timeout)
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if not result.get("ok"):
+        console.print(f"[yellow]![/] Scan unavailable: {result.get('error')}")
+        raise typer.Exit(1)
+    console.print(f"[green]✓[/] {result.get('count', 0)} probe(s) (serials/ids redacted)")
+    for device in result.get("devices") or []:
+        console.print(
+            f"  • {device.get('name') or 'recorder'}  "
+            f"serial={device.get('serial')}  id={device.get('identifier')}"
+        )
+
+
+@ble_app.command("clear-identity")
+def ble_clear_identity(
+    identity_path: Path | None = typer.Option(None, "--identity-path"),  # noqa: B008
+    yes: bool = typer.Option(False, "--yes", help="Confirm deletion."),
+):
+    """Remove local plaud-device.json authorization."""
+    from .ble.identity import clear_stored_identity, identity_file_path
+
+    path = identity_file_path(identity_path)
+    if not yes:
+        console.print(f"Refusing to delete {path} without --yes")
+        raise typer.Exit(1)
+    removed = clear_stored_identity(identity_path)
+    console.print("[green]✓[/] Cleared." if removed else "[yellow]![/] Nothing to clear.")
 
 
 @app.command("recover-owner-password")

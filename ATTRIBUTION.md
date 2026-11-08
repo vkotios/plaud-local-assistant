@@ -16,12 +16,23 @@
 - **Reuse:** Client-only. Plaud-local does not vendor IGM. Configure
   `llm.ai_gateway.base_url` to the gateway’s OpenAI-compatible `/v1` endpoint.
 
-## Deferred — OpenPlod / openplaud (Bluetooth adapter)
+## OpenPlod / openplaud (Bluetooth adapter — Phase 4)
 
-Not vendored in Phase 2. Future Phase 4 attribution will list:
-
-- OpenPlod MIT contributions and third-party crate/npm notices
-- openplaud provenance status after compliance review
+- **Project:** [RemiPelloux/OpenPlod](https://github.com/RemiPelloux/OpenPlod)
+- **License:** MIT (Copyright (c) 2026 Remi Pelloux and OpenPlod contributors)
+- **Pinned revision:** `d5c27989b05837cd49ff7780595514e133bd1c0d`
+- **Reuse (selective):**
+  - Python adaptations in `src/localplaud/ble/` from OpenPlod `src/sync/`
+    (provision, protocol, session cipher, audio, transfer checksum, bridge
+    locate/spawn concepts).
+  - Vendored Rust `plaud-bridge` under `vendor/openplod-ble/plaud-bridge/`.
+- **Not reused:** OpenPlod vault, React/Tauri UI, transcription stack, MCP
+  product server, Android companion, cloud-import product flows.
+- **Provenance note:** OpenPlod derives historically from openplaud; see
+  `vendor/openplod-ble/NOTICE`. Residual openplaud LICENSE-file gap is an
+  accepted owner risk for this adapter.
+- **Third-party (bridge):** btleplug (MIT/Apache-2.0/BSD-3-Clause), rsa crate
+  (MIT/Apache-2.0); Python optional `cryptography` for ChaCha20 / RSA unwrap.
 
 ## Explicitly not incorporated
 
