@@ -23,6 +23,7 @@
 //! recorder-like peripheral it can see, which keeps a single identity file
 //! portable across operating systems.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -80,12 +81,20 @@ fn main() {
     let result = match mode {
         "doctor" => runtime.block_on(run_doctor()),
         "scan" => runtime.block_on(run_scan()),
+        "scan-verbose" => {
+            let seconds = args
+                .get(2)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(150)
+                .clamp(15, 300);
+            runtime.block_on(run_scan_verbose(Duration::from_secs(seconds)))
+        }
         "connect" => {
             let identifier = args.get(2).cloned().unwrap_or_default();
             runtime.block_on(run_connect(identifier))
         }
         _ => {
-            eprintln!("usage: plaud-bridge <doctor|scan|connect> [identifier]");
+            eprintln!("usage: plaud-bridge <doctor|scan|scan-verbose [seconds]|connect> [identifier]");
             std::process::exit(2);
         }
     };
@@ -117,14 +126,95 @@ fn normalize_identifier(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_plaud(properties: &PeripheralProperties) -> bool {
+/// Why a peripheral matched the recorder filter (for verbose diagnostics only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaudMatch {
+    Name,
+    Service,
+    Manufacturer,
+}
+
+/// WinRT often omits local name and incomplete service UUID lists while still
+/// exposing manufacturer payloads (and sometimes service-data sections). Mac
+/// CoreBluetooth `scan-plaud.swift` matches name only; OpenPlod's Rust bridge
+/// matches name OR `0x1910` in `services`. We widen further for WinRT:
+/// name OR service UUID in `services`/`service_data` OR Note Pro manufacturer
+/// framing (projects 881/883).
+fn classify_plaud(properties: &PeripheralProperties) -> Option<PlaudMatch> {
     let named = properties
         .local_name
         .as_deref()
         .map(|name| name.to_ascii_lowercase().contains(NAME_HINT))
         .unwrap_or(false);
-    let advertised = properties.services.contains(&SERVICE_UUID);
-    named || advertised
+    if named {
+        return Some(PlaudMatch::Name);
+    }
+    if advertises_service_1910(properties) {
+        return Some(PlaudMatch::Service);
+    }
+    if manufacturer_looks_like_note_pro(&properties.manufacturer_data) {
+        return Some(PlaudMatch::Manufacturer);
+    }
+    None
+}
+
+fn advertises_service_1910(properties: &PeripheralProperties) -> bool {
+    properties.services.contains(&SERVICE_UUID)
+        || properties.service_data.contains_key(&SERVICE_UUID)
+}
+
+fn is_plaud(properties: &PeripheralProperties) -> bool {
+    classify_plaud(properties).is_some()
+}
+
+/// Raw manufacturer map from btleplug (company id → payload without company bytes).
+fn manufacturer_looks_like_note_pro(manufacturer_data: &HashMap<u16, Vec<u8>>) -> bool {
+    for (company, payload) in manufacturer_data {
+        // Path A: restore company id LE prefix (OpenPlod / btleplug framing).
+        let mut framed = Vec::with_capacity(payload.len() + 2);
+        framed.extend_from_slice(&company.to_le_bytes());
+        framed.extend_from_slice(payload);
+        if note_pro_framed_ad(&framed).is_some() {
+            return true;
+        }
+        // Path B: some stacks already include company bytes in the payload.
+        if note_pro_framed_ad(payload).is_some() {
+            return true;
+        }
+        // Path C: looser project-id scan when TLV markers are shifted/truncated.
+        if payload_mentions_note_pro_project(payload) || payload_mentions_note_pro_project(&framed) {
+            return true;
+        }
+    }
+    false
+}
+
+fn payload_mentions_note_pro_project(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 {
+        return false;
+    }
+    // Look for project 881/883 as little-endian u16 in the first 8 bytes.
+    let end = bytes.len().min(8).saturating_sub(1);
+    for i in 0..end {
+        let project = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        if project == 881 || project == 883 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `(project, protocol_version)` when framing matches Note Pro ads.
+fn note_pro_framed_ad(bytes: &[u8]) -> Option<(u16, u16)> {
+    if bytes.len() < 22 || bytes[2] != 2 || bytes[5] != 4 || bytes[10] != 8 {
+        return None;
+    }
+    let project = u16::from_le_bytes([bytes[3], bytes[4]]);
+    if project != 881 && project != 883 {
+        return None;
+    }
+    let protocol_version = u16::from_le_bytes([bytes[20], bytes[21]]);
+    Some((project, protocol_version))
 }
 
 /// Find a recorder, preferring an exact address match but falling back to the
@@ -304,21 +394,133 @@ fn parse_note_pro_advertisement(manufacturer_data: &[Value]) -> (Option<String>,
         let Ok(bytes) = BASE64.decode(encoded) else {
             continue;
         };
-        if bytes.len() < 22 || bytes[2] != 2 || bytes[5] != 4 || bytes[10] != 8 {
+        let Some((_project, protocol_version)) = note_pro_framed_ad(&bytes) else {
             continue;
-        }
-        let project = u16::from_le_bytes([bytes[3], bytes[4]]);
-        if project != 881 && project != 883 {
-            continue;
-        }
+        };
         let serial = bytes[11..19]
             .iter()
             .map(|byte| format!("{byte:02X}"))
             .collect::<String>();
-        let protocol_version = u16::from_le_bytes([bytes[20], bytes[21]]);
         return (Some(serial), Some(protocol_version));
     }
     (None, None)
+}
+
+/// Continuous scan that prints filter-stage **counts only** (no MAC/serial/name).
+///
+/// Used to diagnose WinRT advertisement gaps vs CoreBluetooth: how many
+/// peripherals appear, and how many fail each recognition stage.
+async fn run_scan_verbose(duration: Duration) -> Result<(), String> {
+    let adapter = adapter().await?;
+    adapter
+        .start_scan(ScanFilter::default())
+        .await
+        .map_err(|error| format!("Bluetooth scan could not start: {error}"))?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut with_local_name = 0usize;
+    let mut name_contains_plaud = 0usize;
+    let mut service_1910_count = 0usize;
+    let mut with_manufacturer_data = 0usize;
+    let mut manufacturer_note_pro_shape = 0usize;
+    let mut accepted = 0usize;
+    let mut via_name = 0usize;
+    let mut via_service = 0usize;
+    let mut via_manufacturer = 0usize;
+    let mut legacy_name_or_service = 0usize;
+    let mut properties_missing = 0usize;
+
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let peripherals = adapter
+            .peripherals()
+            .await
+            .map_err(|error| format!("Bluetooth scan failed: {error}"))?;
+        for peripheral in peripherals {
+            let key = normalize_identifier(&peripheral.address().to_string());
+            if key.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            let Some(properties) = peripheral.properties().await.ok().flatten() else {
+                properties_missing += 1;
+                continue;
+            };
+            if properties.local_name.as_ref().is_some_and(|name| !name.is_empty()) {
+                with_local_name += 1;
+            }
+            if properties
+                .local_name
+                .as_deref()
+                .is_some_and(|name| name.to_ascii_lowercase().contains(NAME_HINT))
+            {
+                name_contains_plaud += 1;
+            }
+            if advertises_service_1910(&properties) {
+                service_1910_count += 1;
+            }
+            if !properties.manufacturer_data.is_empty() {
+                with_manufacturer_data += 1;
+            }
+            if manufacturer_looks_like_note_pro(&properties.manufacturer_data) {
+                manufacturer_note_pro_shape += 1;
+            }
+            let legacy = properties
+                .local_name
+                .as_deref()
+                .is_some_and(|name| name.to_ascii_lowercase().contains(NAME_HINT))
+                || properties.services.contains(&SERVICE_UUID);
+            if legacy {
+                legacy_name_or_service += 1;
+            }
+            match classify_plaud(&properties) {
+                Some(PlaudMatch::Name) => {
+                    accepted += 1;
+                    via_name += 1;
+                }
+                Some(PlaudMatch::Service) => {
+                    accepted += 1;
+                    via_service += 1;
+                }
+                Some(PlaudMatch::Manufacturer) => {
+                    accepted += 1;
+                    via_manufacturer += 1;
+                }
+                None => {}
+            }
+        }
+    }
+    let _ = adapter.stop_scan().await;
+
+    let report = json!({
+        "mode": "scan-verbose",
+        "backend": backend(),
+        "durationSeconds": duration.as_secs(),
+        "uniquePeripherals": seen.len(),
+        "propertiesMissing": properties_missing,
+        "withLocalName": with_local_name,
+        "nameContainsPlaud": name_contains_plaud,
+        "advertisesService1910": service_1910_count,
+        "withManufacturerData": with_manufacturer_data,
+        "manufacturerNoteProShape": manufacturer_note_pro_shape,
+        "acceptedByFilter": accepted,
+        "acceptedVia": {
+            "name": via_name,
+            "service": via_service,
+            "manufacturer": via_manufacturer,
+        },
+        "legacyFilterWouldAccept": legacy_name_or_service,
+        "detail": if accepted > 0 {
+            "At least one peripheral matched the widened Plaud filter (name, 0x1910, or Note Pro manufacturer framing)."
+        } else if seen.is_empty() {
+            "No BLE advertisements observed. Check adapter power, radio interference, or OS Bluetooth permissions."
+        } else {
+            "BLE advertisements seen, but none matched name/0x1910/Note Pro manufacturer framing. Device may not be advertising, or WinRT is stripping usable AD fields."
+        },
+    });
+    println!("{report}");
+    let _ = std::io::stdout().flush();
+    Ok(())
 }
 
 async fn verify_connection(peripheral: &Peripheral) -> bool {

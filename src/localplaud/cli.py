@@ -1027,6 +1027,34 @@ def ble_scan(
         )
 
 
+@ble_app.command("scan-verbose")
+def ble_scan_verbose(
+    seconds: float = typer.Option(
+        150.0, "--seconds", help="Continuous scan window (15–300)."
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+):
+    """Count total ads vs filter rejects (no MAC/serial). WinRT diagnosis."""
+    from .ble.service import try_scan_verbose
+
+    result = try_scan_verbose(seconds=seconds)
+    if json_output:
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if not result.get("ok"):
+        console.print(f"[yellow]![/] Verbose scan unavailable: {result.get('error')}")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]✓[/] unique={result.get('uniquePeripherals')}  "
+        f"accepted={result.get('acceptedByFilter')}  "
+        f"rejected={result.get('rejectedByFilter')}  "
+        f"namePlaud={result.get('nameContainsPlaud')}  "
+        f"svc1910={result.get('advertisesService1910')}  "
+        f"mfgNotePro={result.get('manufacturerNoteProShape')}  "
+        f"legacyWouldAccept={result.get('legacyFilterWouldAccept')}"
+    )
+
+
 @ble_app.command("clear-identity")
 def ble_clear_identity(
     identity_path: Path | None = typer.Option(None, "--identity-path"),  # noqa: B008

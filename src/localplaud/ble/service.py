@@ -16,7 +16,12 @@ from .doctor import ble_doctor_status
 from .identity import identity_file_path, read_stored_identity
 from .provision import DEFAULT_PLAUD_DOMAIN, provision_device
 from .redact import identity_public_view, redact_identifier, redact_serial
-from .transport import PlaudTransportError, run_bridge_doctor, scan_note_pros
+from .transport import (
+    PlaudTransportError,
+    run_bridge_doctor,
+    scan_note_pros,
+    scan_verbose_counts,
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,33 @@ def try_scan(*, timeout: float = 15.0) -> dict[str, Any]:
         "detected": detected,
         "devices": devices,
     }
+
+
+def try_scan_verbose(*, seconds: float = 150.0) -> dict[str, Any]:
+    """Filter-stage counts only (no MAC/serial). Safe for reports."""
+    try:
+        counts = scan_verbose_counts(seconds=seconds)
+    except PlaudTransportError as exc:
+        return {"ok": False, "error": str(exc)}
+    # Drop any accidental identity fields if a future bridge adds them.
+    safe = {
+        key: value
+        for key, value in counts.items()
+        if key
+        not in {
+            "identifier",
+            "serial",
+            "address",
+            "mac",
+            "name",
+            "manufacturerData",
+        }
+    }
+    unique = int(safe.get("uniquePeripherals") or 0)
+    accepted = int(safe.get("acceptedByFilter") or 0)
+    safe["ok"] = True
+    safe["rejectedByFilter"] = max(0, unique - accepted)
+    return safe
 
 
 def ingest_decoded_session(request: BleIngestRequest) -> IngestResult:

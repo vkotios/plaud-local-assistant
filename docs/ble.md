@@ -94,7 +94,22 @@ localplaud ble doctor --json
 | `localplaud ble doctor` | Redacted readiness (flag, bridge, identity, ffmpeg) |
 | `localplaud ble provision` | Paste token → Partner SDK → `plaud-device.json` |
 | `localplaud ble scan` | Optional scan when bridge present (redacted) |
+| `localplaud ble scan-verbose` | Count ads vs filter rejects (no MAC/serial) |
 | `localplaud ble clear-identity --yes` | Delete local authorization |
+
+### WinRT scan filter (vs Mac)
+
+Mac `scan-plaud.swift` matches **name contains "plaud"** only. OpenPlod's Rust
+bridge matches name **or** GATT service `0x1910`. On Windows, WinRT ads often
+omit both while still carrying Note Pro manufacturer data, so `plaud-bridge`
+also accepts:
+
+- service UUID `0x1910` in `services` **or** `service_data`
+- manufacturer framing for projects **881 / 883** (strict TLV or looser project-id)
+
+`scan-verbose` reports count-only stages (`uniquePeripherals`,
+`acceptedByFilter`, `rejectedByFilter`, `legacyFilterWouldAccept`, …) with no
+identifiers.
 
 Optional Python crypto: `pip install 'localplaud[ble]'` (ChaCha20 / RSA unwrap).
 

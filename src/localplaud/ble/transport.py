@@ -225,3 +225,41 @@ def scan_note_pros(
         except json.JSONDecodeError:
             continue
     return probes
+
+
+def scan_verbose_counts(
+    *,
+    bridge_path: str | Path | None = None,
+    seconds: float = 150.0,
+) -> dict[str, Any]:
+    """Run ``plaud-bridge scan-verbose`` and return filter-stage counts only.
+
+    Output contains no MAC/serial/name — safe for reports and CI logs.
+    """
+    binary = find_rust_bridge(bridge_path)
+    if binary is None:
+        raise PlaudTransportError("plaud-bridge binary not found")
+    duration = max(15, min(300, int(seconds)))
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [str(binary), "scan-verbose", str(duration)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=float(duration) + 30.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PlaudTransportError(str(exc)) from exc
+    for line in (completed.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("mode") == "scan-verbose":
+            return payload
+    raise PlaudTransportError(
+        f"scan-verbose produced no count report (exit={completed.returncode})"
+    )
