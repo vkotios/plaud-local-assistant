@@ -126,6 +126,24 @@ fn normalize_identifier(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn address_is_unusable(address: &str) -> bool {
+    let normalized = normalize_identifier(address);
+    normalized.is_empty() || normalized.chars().all(|character| character == '0')
+}
+
+/// Stable connect/provision key for a peripheral.
+///
+/// CoreBluetooth (macOS) does not expose a BD_ADDR — `btleplug` reports the zero
+/// address — so we must use the CoreBluetooth UUID from `Peripheral::id()`.
+/// WinRT/BlueZ keep using the Bluetooth address when it is real.
+fn peripheral_identifier(peripheral: &Peripheral) -> String {
+    let address = peripheral.address().to_string();
+    if cfg!(target_os = "macos") || address_is_unusable(&address) {
+        return peripheral.id().to_string();
+    }
+    address
+}
+
 /// Why a peripheral matched the recorder filter (for verbose diagnostics only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlaudMatch {
@@ -243,7 +261,7 @@ async fn find_peripheral(
             .map_err(|error| format!("Bluetooth scan failed: {error}"))?;
         for peripheral in peripherals {
             if !target.is_empty()
-                && normalize_identifier(&peripheral.address().to_string()) == target
+                && normalize_identifier(&peripheral_identifier(&peripheral)) == target
             {
                 exact = Some(peripheral);
                 break 'outer;
@@ -331,7 +349,7 @@ async fn run_scan() -> Result<(), String> {
             "detail": "No advertising Plaud found. Wake the device and keep it near this computer.",
         }),
         Some(peripheral) => {
-            let address = peripheral.address().to_string();
+            let identifier = peripheral_identifier(&peripheral);
             let properties = peripheral.properties().await.ok().flatten();
             let name = properties
                 .as_ref()
@@ -363,7 +381,7 @@ async fn run_scan() -> Result<(), String> {
             json!({
                 "detected": true,
                 "name": name,
-                "identifier": address,
+                "identifier": identifier,
                 "serial": serial,
                 "protocolVersion": protocol_version,
                 "rssi": rssi,
@@ -438,7 +456,7 @@ async fn run_scan_verbose(duration: Duration) -> Result<(), String> {
             .await
             .map_err(|error| format!("Bluetooth scan failed: {error}"))?;
         for peripheral in peripherals {
-            let key = normalize_identifier(&peripheral.address().to_string());
+            let key = normalize_identifier(&peripheral_identifier(&peripheral));
             if key.is_empty() || !seen.insert(key) {
                 continue;
             }

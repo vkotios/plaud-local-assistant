@@ -169,12 +169,13 @@ def run_bridge_doctor(bridge_path: str | Path | None = None) -> dict[str, Any]:
     if binary is None:
         return {"ok": False, "error": "bridge_missing"}
     try:
+        # Cold CoreBluetooth adapter bring-up can exceed 30s on macOS.
         completed = subprocess.run(  # noqa: S603
             [str(binary), "doctor"],
             check=False,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=180,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": str(exc)}

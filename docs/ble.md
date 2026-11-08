@@ -97,6 +97,14 @@ localplaud ble doctor --json
 | `localplaud ble scan-verbose` | Count ads vs filter rejects (no MAC/serial) |
 | `localplaud ble clear-identity --yes` | Delete local authorization |
 
+### macOS CoreBluetooth identifier
+
+On macOS, CoreBluetooth does **not** expose a Bluetooth MAC. `plaud-bridge`
+therefore reports the CoreBluetooth peripheral UUID as `identifier` (not
+`00:00:00:00:00:00`). Use that UUID with `ble provision --identifier`. The same
+identity file remains usable later on Windows once a working radio path can
+scan; Windows still needs WinRT (or another stack) to pull new recordings.
+
 ### WinRT scan filter (vs Mac)
 
 Mac `scan-plaud.swift` matches **name contains "plaud"** only. OpenPlod's Rust
