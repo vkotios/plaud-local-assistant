@@ -302,7 +302,9 @@ def test_ingest_status_and_provenance_endpoints(monkeypatch, tmp_path):
     names = {b["name"] for b in payload["backends"]}
     assert names == {"cloud", "filesystem", "upload", "ble"}
     ble = next(b for b in payload["backends"] if b["name"] == "ble")
-    assert ble["status"] == "stub"
+    # Phase 4: feature-flagged off by default → "disabled"; never silent "stub".
+    assert ble["status"] in {"disabled", "experimental"}
+    assert ble["external_id_shape"] == "serial:sessionId"
 
     audio = _write_wav(tmp_path / "prov.wav")
     result = ingest_filesystem_path(audio, external_id="fs-prov", settings=settings)

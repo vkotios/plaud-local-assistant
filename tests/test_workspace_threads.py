@@ -30,6 +30,8 @@ SAFE_TARGETS = {
     "run",
     "report",
     "dispatch",
+    # BLE bridge stdout reader: JSON-lines IPC only; no workspace/DB access.
+    "self._read_loop",
 }
 BOUND = ("run_in_current_workspace(", "copy_context().run")
 
