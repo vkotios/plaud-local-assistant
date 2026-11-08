@@ -204,13 +204,14 @@ def scan_note_pros(
     binary = find_rust_bridge(bridge_path)
     if binary is None:
         raise PlaudTransportError("plaud-bridge binary not found")
+    # OpenPlod plaud-bridge ``scan`` takes no timeout flag; host waits here.
     try:
         completed = subprocess.run(  # noqa: S603
-            [str(binary), "scan", "--timeout", str(int(timeout * 1000))],
+            [str(binary), "scan"],
             check=False,
             capture_output=True,
             text=True,
-            timeout=timeout + 10,
+            timeout=max(timeout + 10.0, 30.0),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PlaudTransportError(str(exc)) from exc

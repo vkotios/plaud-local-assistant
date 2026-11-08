@@ -78,6 +78,8 @@ def try_scan(*, timeout: float = 15.0) -> dict[str, Any]:
         identifier = probe.get("identifier") or probe.get("address") or probe.get("id")
         devices.append(
             {
+                "detected": bool(probe.get("detected")),
+                "detail": probe.get("detail"),
                 "serial": redact_serial(str(serial) if serial else None),
                 "identifier": redact_identifier(str(identifier) if identifier else None),
                 "name": probe.get("name"),
@@ -85,7 +87,13 @@ def try_scan(*, timeout: float = 15.0) -> dict[str, Any]:
                 "protocolVersion": probe.get("protocolVersion") or probe.get("protocol"),
             }
         )
-    return {"ok": True, "count": len(devices), "devices": devices}
+    detected = sum(1 for device in devices if device.get("detected"))
+    return {
+        "ok": True,
+        "count": len(devices),
+        "detected": detected,
+        "devices": devices,
+    }
 
 
 def ingest_decoded_session(request: BleIngestRequest) -> IngestResult:

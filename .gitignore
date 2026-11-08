@@ -51,6 +51,10 @@ htmlcov/
 caddy_data/
 caddy_config/
 
+# ---- Local BLE bridge build artifacts (never commit binaries) ----
+bin/
+vendor/**/target/
+
 # ---- Session / local agent artifacts ----
 GOAL_CONDITION.md
 GOAL_PROMPT.md
