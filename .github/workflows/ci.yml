@@ -33,5 +33,8 @@ jobs:
         run: uv pip install "torch>=2.8" --index-url https://download.pytorch.org/whl/cpu
       - name: Lint
         run: uv run --no-sync ruff check src tests
+      # Full suite (upstream parity). Focused IGM/gateway smoke while iterating:
+      #   uv run pytest -q tests/test_ai_gateway.py tests/test_config.py
+      # Extras guidance (AMD/CPU, no CUDA assumption): docs/extras-matrix.md
       - name: Test
         run: uv run --no-sync pytest -q

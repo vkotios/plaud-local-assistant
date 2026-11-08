@@ -62,6 +62,9 @@ def test_defaults_without_env(monkeypatch, tmp_path):
     # Text models come from profiles or gateway aliases, never a concrete default.
     assert s.llm.openai.model is None
     assert s.llm.ai_gateway.model == "sky-quality"
+    assert s.llm.ai_gateway.client_name == "plaud-local"
+    assert s.llm.ai_gateway.busy_max_attempts == 8
+    assert s.llm.ai_gateway.serial_calls is False
     assert s.llm.ai_gateway.quota_reserve_percent == 5
     assert s.llm.ai_gateway.quota_check_timeout_seconds == 20
     assert not hasattr(s.llm, "codex_local")

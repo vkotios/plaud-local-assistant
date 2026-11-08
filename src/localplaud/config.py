@@ -406,13 +406,18 @@ class CodexQuotaConfig(BaseModel):
 
 
 class AiGatewayLlmConfig(BaseModel):
-    """OpenAI-compatible gateway that resolves semantic aliases to models.
+    """OpenAI-compatible gateway client (Plaud-local: inference-gateway-manager).
 
-    ``model`` is an alias such as ``sky-quality``; the gateway's policy decides
-    which concrete model answers, and each response's model is recorded as
-    provenance. The gateway spends the ChatGPT subscription whose Codex login
-    lives in ``quota_codex_home``; that login's usage window is checked before
-    every call so the protected reserve is never spent.
+    ``base_url`` should include the ``/v1`` suffix (for example
+    ``http://127.0.0.1:9000/v1``). ``model`` may be a gateway alias or the
+    currently loaded engine model id. Optional Codex subscription reserve
+    guarding remains available for operators who point this client at a
+    subscription-backed gateway; IGM deployments set ``quota_guard = false``.
+
+    IGM admits one inference at a time and returns HTTP 409 when busy. The
+    client retries with exponential backoff and sends ``X-Client-Name`` for
+    occupancy attribution. Cloud LLM providers stay opt-in via a different
+    ``[llm].provider`` — they are not selected by configuring this block alone.
     """
 
     api_key: str | None = None
@@ -420,6 +425,7 @@ class AiGatewayLlmConfig(BaseModel):
     model: str = "sky-quality"
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = "high"
     # Responses streaming keeps bytes flowing while a high-effort turn reasons.
+    # Prefer "chat" for OpenAI-compatible local gateways such as IGM.
     api_mode: Literal["chat", "responses"] = "responses"
     # Whole-call limit. The SDK does not retry: a repeated long turn would spend
     # the subscription twice, and the correction stage splits timed-out requests.
@@ -430,6 +436,16 @@ class AiGatewayLlmConfig(BaseModel):
     # alias target is recorded in each resolved profile so a remap is not
     # mistaken for the model that produced an existing artifact.
     policy_file: str | None = None
+    # Occupancy attribution for gateways that expose X-Client-Name (IGM).
+    client_name: str = "plaud-local"
+    # When true, polish/evidence stages avoid overlapping calls so a concurrency-1
+    # gateway is less likely to return 409. IGM-oriented configs enable this.
+    serial_calls: bool = False
+    # Retry HTTP 409 (gateway busy) with exponential backoff. Attempts include
+    # the first try; set to 1 to disable client-side busy retries.
+    busy_max_attempts: int = Field(default=8, ge=1, le=32)
+    busy_backoff_base_seconds: float = Field(default=1.0, ge=0.05, le=60.0)
+    busy_backoff_max_seconds: float = Field(default=60.0, ge=0.05, le=600.0)
     # When false, calls are sent without reading the subscription window; the
     # gateway's own rate-limit errors are then the only stop.
     quota_guard: bool = True

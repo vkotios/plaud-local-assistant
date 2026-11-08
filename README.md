@@ -1,3 +1,12 @@
+> **Plaud-local** (`vkotios/plaud-local-assistant`) is a product tree based on
+> [localplaud](https://github.com/skyhong2002/localplaud) (MIT). Upstream history
+> is preserved; see [docs/UPSTREAM.md](docs/UPSTREAM.md), [NOTICE](NOTICE), and
+> [ATTRIBUTION.md](ATTRIBUTION.md). Local LLM traffic targets
+> [inference-gateway-manager](https://github.com/vkotios/inference-gateway-manager)
+> (`/v1`, concurrency 1, HTTP 409 busy retry) — [docs/deploy-fedora-igm.md](docs/deploy-fedora-igm.md).
+> Private/RE Plaud APIs and Bluetooth/OpenPlod code are out of scope for this
+> foundation phase.
+
 <p align="center">
   <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">
 </p>

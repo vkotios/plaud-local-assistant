@@ -107,10 +107,12 @@ def test_gateway_requests_alias_streams_without_sdk_retries_and_records_answerin
     assert request["text"]["format"]["strict"] is True
     assert clients[0]["max_retries"] == 0
     assert clients[0]["timeout"] == 1800.0
+    assert clients[0]["default_headers"] == {"X-Client-Name": "plaud-local"}
     # The reserve is read from the Codex login that shares the subscription.
     assert reads[0].cfg.codex_home == "~/.codex"
     assert provider.polish_chunk_chars == 8_000
     assert provider.summary_chunk_chars == 32_000
+    assert provider.supports_parallel_calls is True
 
 
 def test_gateway_reserve_blocks_before_any_request(monkeypatch):
@@ -310,3 +312,92 @@ def test_fresh_quota_reading_is_shared_by_overlapping_calls_but_failures_never_a
     with pytest.raises(LLMQuotaExhausted, match="reserve protected"):
         provider.complete("text")
     assert len(calls) == 6
+
+
+def _busy_error():
+    return openai.APIStatusError(
+        "busy",
+        response=httpx.Response(409, request=httpx.Request("POST", "http://gateway.test/v1")),
+        body=None,
+    )
+
+
+def test_gateway_retries_http_409_busy_with_backoff(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(ai_gateway.time, "sleep", sleeps.append)
+    monkeypatch.setattr(ai_gateway.random, "uniform", lambda _lo, hi: hi)
+
+    attempts = {"n": 0}
+
+    class Responses:
+        def create(self, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise _busy_error()
+            return iter(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="ok"),
+                    _completed("m"),
+                ]
+            )
+
+    def make_client(**kwargs):
+        return SimpleNamespace(responses=Responses())
+
+    module = SimpleNamespace(**{name: getattr(openai, name) for name in dir(openai)})
+    module.OpenAI = make_client
+    monkeypatch.setitem(sys.modules, "openai", module)
+    _quota(monkeypatch, 60)
+
+    provider = AiGatewayLLM(
+        _config(quota_guard=False, busy_max_attempts=5, busy_backoff_base_seconds=2.0)
+    )
+    assert provider.complete("text") == "ok"
+    assert attempts["n"] == 3
+    assert sleeps == [2.0, 4.0]
+
+
+def test_gateway_409_retries_exhausted_become_transient(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(ai_gateway.time, "sleep", sleeps.append)
+    monkeypatch.setattr(ai_gateway.random, "uniform", lambda _lo, hi: 0.0)
+    _fake_openai(monkeypatch, error=_busy_error())
+    _quota(monkeypatch, 60)
+
+    with pytest.raises(LLMTransientError, match="HTTP 409"):
+        AiGatewayLLM(_config(quota_guard=False, busy_max_attempts=3)).complete("text")
+    assert len(sleeps) == 2
+
+
+def test_serial_calls_disables_parallel_stage_overlap():
+    assert AiGatewayLLM(_config(serial_calls=True)).supports_parallel_calls is False
+    assert AiGatewayLLM(_config()).supports_parallel_calls is True
+
+
+def test_readiness_probes_models_endpoint(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append({"url": url, "headers": headers, "timeout": timeout})
+        return httpx.Response(200, json={"data": []}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(ai_gateway.httpx, "get", fake_get)
+    ok, detail = AiGatewayLLM(_config(quota_guard=False)).readiness()
+    assert ok and "reachable" in detail
+    assert calls[0]["url"] == "http://gateway.test/v1/models"
+    assert calls[0]["headers"]["Authorization"] == "Bearer client-key"
+    assert calls[0]["headers"]["X-Client-Name"] == "plaud-local"
+
+
+def test_igm_defaults_are_documented_in_settings(monkeypatch, tmp_path):
+    import os
+
+    for key in list(os.environ):
+        if key.startswith("LOCALPLAUD_"):
+            monkeypatch.delenv(key)
+    monkeypatch.chdir(tmp_path)
+    gateway = Settings().llm.ai_gateway
+    assert gateway.client_name == "plaud-local"
+    assert gateway.busy_max_attempts == 8
+    assert gateway.serial_calls is False
+    assert gateway.quota_guard is True

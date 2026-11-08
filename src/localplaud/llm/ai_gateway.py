@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 import time
 from pathlib import Path
@@ -48,6 +49,12 @@ class AiGatewayLLM(OpenAILLM):
         self._reserve_checked_at: float | None = None
 
     @property
+    def supports_parallel_calls(self) -> bool:  # type: ignore[override]
+        # Class attribute on OpenAILLM is True; IGM-oriented configs opt into
+        # serial stage calls so a concurrency-1 gateway sees fewer 409s.
+        return not bool(self.cfg.serial_calls)
+
+    @property
     def summary_chunk_chars(self) -> int:
         return self.cfg.summary_chunk_chars
 
@@ -55,11 +62,15 @@ class AiGatewayLLM(OpenAILLM):
         return bool(self.cfg.api_key and self.cfg.base_url)
 
     def _client(self, openai_class):
+        headers: dict[str, str] = {}
+        if self.cfg.client_name:
+            headers["X-Client-Name"] = self.cfg.client_name
         return openai_class(
             api_key=self.cfg.api_key,
             base_url=self.cfg.base_url,
             timeout=float(self.cfg.timeout_seconds),
             max_retries=0,
+            default_headers=headers or None,
         )
 
     def _call_time_limit(self) -> int | None:
@@ -90,6 +101,14 @@ class AiGatewayLLM(OpenAILLM):
             self._quota_reader()._ensure_quota_reserve()
             self._reserve_checked_at = time.monotonic()
 
+    def _busy_backoff_seconds(self, attempt: int) -> float:
+        """Exponential backoff with jitter for HTTP 409 (gateway busy)."""
+        base = float(self.cfg.busy_backoff_base_seconds)
+        cap = float(self.cfg.busy_backoff_max_seconds)
+        delay = min(cap, base * (2 ** max(0, attempt - 1)))
+        # Full jitter keeps competing clients from retrying in lockstep.
+        return random.uniform(0.0, delay)
+
     def health(self) -> tuple[bool, str]:
         if not self.available():
             return False, "gateway base URL or client key is not configured"
@@ -103,6 +122,31 @@ class AiGatewayLLM(OpenAILLM):
             f"gateway alias {self.cfg.model}; {remaining}% of the subscription window "
             f"remains; {self.cfg.quota_reserve_percent}% is protected"
         )
+
+    def readiness(self) -> tuple[bool, str]:
+        """Probe ``GET {base_url}/models`` for gateway reachability.
+
+        This checks transport + auth for OpenAI-compatible gateways (including
+        IGM). It does not prove a model is loaded; IGM still requires an
+        explicit engine/model load before inference.
+        """
+        if not self.available():
+            return False, "gateway base URL or client key is not configured"
+        headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
+        if self.cfg.client_name:
+            headers["X-Client-Name"] = self.cfg.client_name
+        url = f"{self.cfg.base_url.rstrip('/')}/models"
+        try:
+            response = httpx.get(url, headers=headers, timeout=10.0)
+        except httpx.HTTPError as exc:
+            return False, f"gateway /models unreachable: {exc}"
+        if response.status_code == 401:
+            return False, "gateway rejected the client key"
+        if response.status_code == 409:
+            return False, "gateway is busy (HTTP 409)"
+        if response.status_code >= 400:
+            return False, f"gateway /models returned HTTP {response.status_code}"
+        return True, f"gateway /models reachable ({response.status_code})"
 
     def complete(
         self,
@@ -122,34 +166,56 @@ class AiGatewayLLM(OpenAILLM):
             import openai
         except ImportError as exc:
             raise LLMUnavailable("AI gateway: the 'openai' package is not installed") from exc
-        try:
-            return super().complete(
-                prompt,
-                system=system,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                json_schema=json_schema,
-            )
-        except (openai.APITimeoutError, httpx.TimeoutException) as exc:
-            # A stream that stalls mid-response surfaces as a raw httpx error.
-            raise LLMTimeout(f"AI gateway timed out after {self.cfg.timeout_seconds}s") from exc
-        except (openai.APIConnectionError, httpx.TransportError) as exc:
-            raise LLMTransientError("AI gateway connection failed") from exc
-        except openai.RateLimitError as exc:
-            raise LLMQuotaExhausted("AI gateway reported a usage limit") from exc
-        except openai.AuthenticationError as exc:
-            raise LLMUnavailable("AI gateway rejected the client key") from exc
-        except openai.APIStatusError as exc:
-            if exc.status_code >= 500:
-                raise LLMTransientError(f"AI gateway failed with HTTP {exc.status_code}") from exc
-            if any(marker in str(exc).lower() for marker in _CONTEXT_MARKERS):
-                raise LLMInputTooLarge("AI gateway input exceeded the model context") from exc
-            raise LLMError(f"AI gateway rejected the request with HTTP {exc.status_code}") from exc
-        except openai.APIError as exc:
-            # An error event inside the stream carries no HTTP status.
-            if any(marker in str(exc).lower() for marker in _CONTEXT_MARKERS):
-                raise LLMInputTooLarge("AI gateway input exceeded the model context") from exc
-            raise LLMTransientError("AI gateway stream failed") from exc
+
+        attempts = int(self.cfg.busy_max_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                return super().complete(
+                    prompt,
+                    system=system,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    json_schema=json_schema,
+                )
+            except (openai.APITimeoutError, httpx.TimeoutException) as exc:
+                # A stream that stalls mid-response surfaces as a raw httpx error.
+                raise LLMTimeout(f"AI gateway timed out after {self.cfg.timeout_seconds}s") from exc
+            except (openai.APIConnectionError, httpx.TransportError) as exc:
+                raise LLMTransientError("AI gateway connection failed") from exc
+            except openai.RateLimitError as exc:
+                raise LLMQuotaExhausted("AI gateway reported a usage limit") from exc
+            except openai.AuthenticationError as exc:
+                raise LLMUnavailable("AI gateway rejected the client key") from exc
+            except openai.APIStatusError as exc:
+                if exc.status_code == 409:
+                    if attempt >= attempts:
+                        raise LLMTransientError(
+                            "AI gateway is busy (HTTP 409); retries exhausted"
+                        ) from exc
+                    delay = self._busy_backoff_seconds(attempt)
+                    log.info(
+                        "AI gateway busy (HTTP 409); retry %s/%s after %.2fs",
+                        attempt,
+                        attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                if exc.status_code >= 500:
+                    raise LLMTransientError(
+                        f"AI gateway failed with HTTP {exc.status_code}"
+                    ) from exc
+                if any(marker in str(exc).lower() for marker in _CONTEXT_MARKERS):
+                    raise LLMInputTooLarge("AI gateway input exceeded the model context") from exc
+                raise LLMError(
+                    f"AI gateway rejected the request with HTTP {exc.status_code}"
+                ) from exc
+            except openai.APIError as exc:
+                # An error event inside the stream carries no HTTP status.
+                if any(marker in str(exc).lower() for marker in _CONTEXT_MARKERS):
+                    raise LLMInputTooLarge("AI gateway input exceeded the model context") from exc
+                raise LLMTransientError("AI gateway stream failed") from exc
+        raise LLMTransientError("AI gateway is busy (HTTP 409); retries exhausted")
 
 
 _POLICY_CACHE: dict[str, tuple[float, dict]] = {}

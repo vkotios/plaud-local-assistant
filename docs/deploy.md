@@ -5,6 +5,11 @@ Compose **profiles**. A bundled Caddy reverse proxy terminates HTTPS for your
 domain automatically. See [ADR 0004](adr/0004-deployment-profiles.md) for the
 rationale.
 
+**Plaud-local operators:** for Fedora + inference-gateway-manager (IGM) client
+wiring, AMD/CPU extras, and Windows WSL policy, see
+[deploy-fedora-igm.md](deploy-fedora-igm.md) and [extras-matrix.md](extras-matrix.md).
+Those overlays do not change the upstream Docker profiles below.
+
 | Profile | Hardware                     | ASR                                   |
 | ------- | ---------------------------- | ------------------------------------- |
 | `cpu`   | CPU-only machine             | local turbo where practical; explicit cloud opt-in |
