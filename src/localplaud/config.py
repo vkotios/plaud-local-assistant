@@ -1,0 +1,614 @@
+"""Configuration for localplaud.
+
+Config is layered, later layers win:
+
+1. Built-in defaults (this file).
+2. A TOML file — ``config.toml`` in the working directory by default, or the
+   path in ``LOCALPLAUD_CONFIG``.
+3. Environment variables and an optional ``.env`` file, prefixed
+   ``LOCALPLAUD_`` with ``__`` as the nesting separator
+   (e.g. ``LOCALPLAUD_ASR__OPENAI__API_KEY``).
+
+Secrets (API keys and HF token) should come from the environment or
+``.env`` and never be committed. The example config marks which fields those
+are.
+"""
+
+from __future__ import annotations
+
+import os
+import tomllib
+from pathlib import Path
+from typing import Any, Literal
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+# --------------------------------------------------------------------------- #
+# Sub-models
+# --------------------------------------------------------------------------- #
+
+
+class PlaudOfficialConfig(BaseModel):
+    """The official Plaud Open API (platform.plaud.ai) with sanctioned OAuth.
+
+    The one-time browser sign-in uses localplaud's native loopback S256 PKCE;
+    after that, localplaud reads and auto-refreshes the token set in
+    ``tokens_path``. No Node.js or client secret is needed for the public client.
+    """
+
+    api_base: str = "https://platform.plaud.ai/developer/api"
+    authorization_url: str = "https://web.plaud.ai/platform/oauth"
+    token_url: str = "https://platform.plaud.ai/developer/api/oauth/third-party/access-token"
+    refresh_url: str = (
+        "https://platform.plaud.ai/developer/api/oauth/third-party/access-token/refresh"
+    )
+    client_id: str = "client_f9e0b214-c11f-434b-8b95-c4497d1feb81"
+    redirect_uri: str = "http://localhost:8199/auth/callback"
+    login_timeout_seconds: float = 120.0
+    # Compatible with the official CLI's token cache.
+    tokens_path: Path = Path("~/.plaud/tokens.json")
+    request_timeout_seconds: float = 30.0
+
+
+class PlaudMcpConfig(BaseModel):
+    """Official Plaud MCP stdio server used as a read-only cloud transport."""
+
+    command: str = "npx"
+    args: list[str] = Field(default_factory=lambda: ["-y", "@plaud-ai/mcp@latest"])
+    tokens_path: Path = Path("~/.plaud/tokens-mcp.json")
+    request_timeout_seconds: float = 30.0
+
+
+class PlaudConfig(BaseModel):
+    """How to reach and authenticate against the Plaud cloud.
+
+    ``provider`` picks the client:
+
+    - ``official`` (default) — the sanctioned Open API with auto-refreshing
+      OAuth (see ``official``). No more pasting browser sessions.
+    - ``mcp`` — Plaud's official local MCP server and its separate OAuth cache.
+    The removed reverse-engineered browser-session adapter is not a valid
+    provider. Use one of the two sanctioned read-only transports above.
+    """
+
+    provider: Literal["official", "mcp"] = "official"
+    official: PlaudOfficialConfig = Field(default_factory=PlaudOfficialConfig)
+    mcp: PlaudMcpConfig = Field(default_factory=PlaudMcpConfig)
+
+
+class PollerConfig(BaseModel):
+    enabled: bool = True
+    interval_seconds: int = 300
+    # The first catalog sync is always metadata-only. After that durable baseline,
+    # newly uploaded recordings download automatically for the independent pipeline.
+    auto_download: bool = True
+    include_trash: bool = False
+    download_dir: Path = Path("./data/audio")
+    # Cap concurrent downloads to be gentle on the cloud + local disk.
+    max_concurrent_downloads: int = 2
+
+
+class StoreConfig(BaseModel):
+    database_url: str = "sqlite:///./data/localplaud.db"
+    # Plaud remains the durable raw-audio source. Once every enabled pipeline
+    # stage succeeds, the local original/WAV/waveform copies may be evicted and
+    # restored on demand without changing the recording's completed state.
+    evict_plaud_audio_after_processing: bool = False
+    # WAL keeps the Web App readable while the worker writes. Override only for
+    # storage that cannot support it (some network filesystems).
+    sqlite_journal_mode: Literal["wal", "delete"] = "wal"
+    # How long a writer waits for a competing write before failing. Contention
+    # here is normal (API + poller + worker); failing fast turns it into a
+    # failed stage run.
+    sqlite_busy_timeout_ms: int = Field(default=30_000, ge=0, le=600_000)
+
+
+class PipelineConfig(BaseModel):
+    """Which local processing stages to run after a file is downloaded."""
+
+    convert: bool = True  # opus -> 16kHz mono wav for ASR
+    convert_timeout_seconds: int = Field(default=900, ge=1, le=86_400)
+    transcribe: bool = True
+    align: bool = True  # validate durable word timestamps before diarization
+    diarize: bool = True
+    polish: bool = True  # AI correction after speakers, before notes/index
+    summarize: bool = True
+    mind_map: bool = True  # nested Markdown outline rendered as a tree
+    # Timestamped chapter outline ("Outline") from the canonical transcript.
+    outline: bool = False  # opt in; do not add paid calls to existing installations
+    # ``llm`` uses the text LLM selected for the mind-map stage. ``time_slices``
+    # is an explicit, clearly labelled deterministic alternative (fixed windows
+    # titled by their first salient sentence); it is never a silent fallback.
+    outline_method: Literal["llm", "time_slices"] = "llm"
+    index: bool = True  # embeddings for Q&A / semantic search
+    # Recordings at or above this length are treated as accidental (the Plaud
+    # recorder stops at its 5-hour cap) and are left as metadata-only instead of
+    # being auto-downloaded and processed. Manual "Import audio" / "Reprocess"
+    # in the Web App still work on them. Set to null/None to disable.
+    auto_skip_duration_minutes: int | None = Field(default=300, ge=1, le=10_080)
+
+    def auto_skip_threshold_ms(self) -> int | None:
+        """Skip threshold in milliseconds, or None when disabled."""
+        if self.auto_skip_duration_minutes is None:
+            return None
+        return self.auto_skip_duration_minutes * 60_000
+
+    # Number of files processed concurrently by the worker.
+    concurrency: int = 1
+    # The daemon yields after a small newest-first batch so fresh recordings
+    # are discovered promptly instead of sitting behind a months-long backlog.
+    files_per_cycle: int = 1
+    # Admit only recordings without local transcription; manual resume is unaffected.
+    auto_process_untranscribed_only: bool = False
+    # In that mode, a recording whose local transcription completed within this
+    # window keeps its bounded automatic retries, so a new recording whose
+    # correction or notes failed still finishes. Older transcripts remain
+    # manual-resume only. 0 disables the exception.
+    untranscribed_only_retry_hours: int = Field(default=72, ge=0, le=720)
+    # Consecutive daemon retries for pipeline failures. A failed/partial recording
+    # becomes eligible after exponential backoff; manual Resume resets the budget.
+    retry_max_attempts: int = Field(default=5, ge=0, le=50)
+    retry_base_seconds: int = Field(default=300, ge=1, le=86_400)
+    retry_max_seconds: int = Field(default=21_600, ge=1, le=604_800)
+    # After the fast retry budget, keep trying at this slower cadence instead of
+    # waiting for a person: provider outages and quota windows resolve on their own.
+    # 0 restores the old behaviour of stopping until a manual Resume.
+    retry_exhausted_interval_seconds: int = Field(default=86_400, ge=0, le=2_592_000)
+    # Character budget per LLM call. Longer transcripts are covered through
+    # hierarchical map/reduce notes instead of being truncated.
+    summary_chunk_chars: int = 6_000
+    # Evidence extraction, source review and note review use the selected stage provider.
+    # Legacy is an explicit compatibility mode, never an automatic fallback.
+    # standard: the whole transcript in one request when the provider has the
+    #   context (a Plaud-style, topic-organized note in minutes). Longer
+    #   recordings or small-context providers fall back to bounded chunks.
+    # evidence: audited fact ledger with citations; thorough but slow, opt-in.
+    # legacy: the original chunked algorithm, kept for explicit compatibility.
+    note_quality: Literal["standard", "evidence", "legacy"] = "standard"
+    # Largest transcript, in characters, sent as one note request to a provider that
+    # advertises a large context. Leave room for the template and the answer.
+    note_single_pass_chars: int = Field(default=120_000, ge=6_000, le=400_000)
+    note_evidence_chunk_chars: int = Field(default=120_000, ge=2_000, le=120_000)
+    note_repair_attempts: int = Field(default=2, ge=0, le=2)
+    # Independent evidence chunks, plan groups and draft batches may run at once
+    # on providers that tolerate concurrent requests (remote subscription gateways).
+    # Output is merged in source order, so this changes wall time, never content.
+    note_parallelism: int = Field(default=3, ge=1, le=8)
+    # A speech stage whose worker process was killed or ran out of memory is attempted
+    # again, after a pause for memory to clear, before the pipeline moves on. Without
+    # this the notes run on a transcript missing its speakers and are redone later.
+    speech_resource_retries: int = Field(default=2, ge=0, le=5)
+    speech_resource_retry_seconds: int = Field(default=60, ge=0, le=600)
+    polish_chunk_chars: int = Field(default=12_000, ge=1_000, le=60_000)
+    # Independent correction chunks and review batches that may run at once on providers
+    # that tolerate overlapping requests. Output equals a sequential run.
+    polish_parallelism: int = Field(default=4, ge=1, le=8)
+    # Characters per edit-review request on large-context providers. Review judges each
+    # edit independently, so larger batches only avoid resending shared context.
+    polish_review_chars: int = Field(default=60_000, ge=1_000, le=240_000)
+    # Reasoning effort for correction requests only (proposals and edit review). Each is
+    # a narrow lexical judgement, so it needs less deliberation than notes. This can
+    # lower a provider's configured effort, never raise it; None keeps the provider's.
+    polish_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = "medium"
+    # Which summary template to use. The Plaud Web Autopilot snapshot is the
+    # default; legacy or unknown keys fall back to this captured Plaud prompt.
+    summary_template: str = "plaud-autopilot"
+    # independent: Plaud supplies metadata + raw audio only; only locally
+    # generated transcripts may satisfy the processing pipeline.
+    # migration: allow explicitly imported Plaud Intelligence artifacts for
+    # comparison/backfill. This mode is never the subscription-free default.
+    artifact_mode: Literal["independent", "migration"] = "independent"
+    # Migration/debug import only. The independent primary workflow keeps this
+    # false and derives every artifact from raw audio. This compatibility flag
+    # is effective only when artifact_mode = "migration".
+    prefer_cloud_artifacts: bool = False
+
+    @property
+    def cloud_import_enabled(self) -> bool:
+        return self.artifact_mode == "migration" and self.prefer_cloud_artifacts
+
+
+# ---- ASR providers ------------------------------------------------------- #
+
+
+class FasterWhisperConfig(BaseModel):
+    model: str = "large-v3-turbo"
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    compute_type: Literal["auto", "int8", "int8_float16", "float16", "float32"] = "auto"
+
+
+class WhisperCppConfig(BaseModel):
+    binary: str = "whisper-cli"  # from whisper.cpp; uses Metal on Apple Silicon
+    model_path: Path = Path("./models/ggml-large-v3-turbo.bin")
+    extra_args: list[str] = Field(default_factory=list)
+    timeout_seconds: int = Field(default=14400, ge=1, le=86_400)
+
+
+class MlxWhisperConfig(BaseModel):
+    model: str = "mlx-community/whisper-large-v3-turbo"
+
+
+class OpenAIAsrConfig(BaseModel):
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str = "whisper-1"
+
+
+class DeepgramConfig(BaseModel):
+    api_key: str | None = None
+    model: str = "nova-2"
+    diarize: bool = True  # Deepgram returns speaker labels server-side
+
+
+class AssemblyAIConfig(BaseModel):
+    api_key: str | None = None
+    speaker_labels: bool = True
+
+
+class VadConfig(BaseModel):
+    """Voice Activity Detection (the first stage of the speech pipeline).
+
+    When enabled, speech regions are detected before ASR so long silences are
+    trimmed and long recordings are transcribed in bounded chunks with globally
+    correct timestamps. Local silero-vad requires the optional ``vad`` extra
+    (``pip install 'localplaud[vad]'``); faster-whisper's native ``vad_filter``
+    bundles its own silero and needs no extra. Defaults to disabled until it is
+    benchmarked on real Taiwan Mandarin / code-switch recordings.
+    """
+
+    enabled: bool = False
+    # silero-vad thresholds (defaults match silero's own recommendations).
+    threshold: float = 0.5  # speech probability cutoff (0-1)
+    min_speech_ms: int = 250  # drop speech blips shorter than this
+    min_silence_ms: int = 100  # silence needed to close a speech region
+    speech_pad_ms: int = 30  # padding silero adds around each detected region
+    # Chunk planning for the local (mlx) path — see asr.vad.merge_speech_regions.
+    merge_gap_s: float = 0.5  # merge regions separated by a shorter gap
+    region_pad_s: float = 0.2  # extra padding per chunk so words aren't clipped
+    max_region_s: float = 30.0  # split longer regions to bound each ASR call
+
+
+class QwenAsrConfig(BaseModel):
+    checkpoint_dir: str = "data/speech-checkpoints"
+    model: str = "Qwen/Qwen3-ASR-1.7B-hf"
+    revision: str = "bcd2b5b7f32b480ab5790554cfa8347f246a14f3"
+    aligner: str = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
+    aligner_revision: str = "c07281df297b9905d24a508279258cccf987a064"
+    python: str = ""  # isolated runtime; empty uses the current interpreter
+    max_chunk_seconds: float = Field(default=120, ge=5, le=240)
+    timeout_seconds: int = Field(default=14400, ge=60)
+
+
+AsrProviderName = Literal[
+    "faster-whisper", "whispercpp", "mlx-whisper", "openai", "deepgram", "assemblyai", "qwen"
+]
+
+
+class AsrConfig(BaseModel):
+    """ASR is pluggable, with local Whisper large-v3-turbo as the default
+    subscription-independent quality baseline. ``fallback`` names providers tried
+    in order when the primary is unavailable; paid cloud fallback requires explicit
+    operator configuration."""
+
+    provider: AsrProviderName = "faster-whisper"
+    language: str = "auto"  # ISO code (e.g. "en", "zh") or "auto"
+    fallback: list[AsrProviderName] = Field(default_factory=list)
+
+    qwen: QwenAsrConfig = Field(default_factory=QwenAsrConfig)
+    vad: VadConfig = Field(default_factory=VadConfig)
+    faster_whisper: FasterWhisperConfig = Field(default_factory=FasterWhisperConfig)
+    whispercpp: WhisperCppConfig = Field(default_factory=WhisperCppConfig)
+    mlx_whisper: MlxWhisperConfig = Field(default_factory=MlxWhisperConfig)
+    openai: OpenAIAsrConfig = Field(default_factory=OpenAIAsrConfig)
+    deepgram: DeepgramConfig = Field(default_factory=DeepgramConfig)
+    assemblyai: AssemblyAIConfig = Field(default_factory=AssemblyAIConfig)
+
+
+class DiarizeConfig(BaseModel):
+    python: str = ""
+    revision: str = "a435e9867d79e789e90053f9b6d6834053af564a"
+    timeout_seconds: int = Field(default=14400, ge=60)
+    provider: Literal["pyannote", "nemotron", "none"] = "pyannote"
+    model: str = "pyannote/speaker-diarization-community-1"
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    hf_token: str | None = None
+    # Optional hints; leave 0/None to auto-detect. An exact count wins over a range.
+    num_speakers: int | None = None
+    min_speakers: int | None = None
+    max_speakers: int | None = None
+
+
+# ---- LLM (summaries + Q&A) ----------------------------------------------- #
+
+
+class OllamaConfig(BaseModel):
+    host: str = "http://localhost:11434"
+    model: str = "llama3.1:8b"
+    # Pin the actual runtime window; the model's advertised capacity is not
+    # Ollama's loaded context size. Keep Mandarin summary chunks bounded too.
+    context_tokens: int = Field(default=8192, ge=8192, le=262144)
+    summary_chunk_chars: int = Field(default=3000, ge=1000, le=60000)
+    # Per-request ceiling. Small models on constrained GPUs (the WSL worker's
+    # 8 GB card) can legitimately need far longer than the old hard-coded 600s
+    # for long map-reduce prompts.
+    timeout_seconds: int = 600
+    # Keep structured transcript maps bounded on local 8-9B models. The whole
+    # transcript is still covered across sequential chunks with neighbour
+    # context, while each JSON response remains small enough to finish and
+    # validate reliably.
+    # 2k keeps prompt + same-length structured output inside the common 4k
+    # context used by local 8-9B Ollama models.  Larger chunks repeatedly reach
+    # the context edge, spend minutes generating truncated JSON, then get
+    # bisected by the structural retry path.
+    polish_chunk_chars: int = Field(default=2_000, ge=1_000, le=60_000)
+
+
+class OpenAILlmConfig(BaseModel):
+    api_key: str | None = None
+    base_url: str | None = None
+    # No default: a concrete model here would bypass the AI gateway's aliases.
+    # Profiles always pass their selected model; the legacy global ``[llm]``
+    # provider must name one explicitly.
+    model: str | None = None
+    # Leave unset for legacy/OpenAI-compatible endpoints. Reasoning models use
+    # max_completion_tokens and do not receive sampling temperature.
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = None
+    # "responses" streams typed events — including reasoning progress — so a
+    # long high-effort request keeps bytes flowing. Chat Completions stays
+    # silent until the first output token, which reverse proxies in front of
+    # hosted relays terminate (Cloudflare 524). Prefer "responses" for
+    # reasoning models behind a relay; "chat" remains the compatible default.
+    api_mode: Literal["chat", "responses"] = "chat"
+    # How much transcript one correction request may carry. Relays that front
+    # the API with a proxy (Cloudflare and friends) cut a request that produces
+    # no bytes for too long, and a high reasoning effort spends minutes before
+    # the first token — so the practical ceiling is per-endpoint, not global.
+    polish_chunk_chars: int = Field(default=12_000, ge=1_000, le=60_000)
+
+
+class AnthropicLlmConfig(BaseModel):
+    api_key: str | None = None
+    model: str = "claude-haiku-4-5"
+
+
+class OpenCodeGoLlmConfig(BaseModel):
+    """Supported OpenCode CLI boundary; credentials remain owned by OpenCode."""
+
+    executable: str = "opencode"
+    model: str = "qwen3.7-plus"
+    agent: str = "transcript-polish"
+    # Transcript correction is a long-context generation task.  Production
+    # recordings routinely need more than the short interactive CLI timeout.
+    timeout_seconds: int = Field(default=900, ge=10, le=1800)
+    polish_chunk_chars: int = Field(default=12_000, ge=1_000, le=60_000)
+
+
+class CodexQuotaConfig(BaseModel):
+    """Read a ChatGPT subscription window through a local Codex login.
+
+    Used only to protect a reserve before another client (the AI gateway)
+    spends the same subscription. Codex owns the credentials; nothing here runs
+    a model.
+    """
+
+    executable: str = "codex"
+    codex_home: str = "~/.codex"
+    # Fail closed before every inference call when the remaining allowance is too
+    # close to the user's reserve.  The extra headroom accounts for the call that
+    # is about to start, so a large response cannot consume the protected floor.
+    quota_reserve_percent: int = Field(default=5, ge=3, le=50)
+    quota_call_headroom_percent: int = Field(default=2, ge=0, le=20)
+    # The app-server can still be draining a previous response; give the local
+    # quota RPC enough time to answer instead of failing the call.
+    quota_check_timeout_seconds: int = Field(default=20, ge=2, le=30)
+
+
+class AiGatewayLlmConfig(BaseModel):
+    """OpenAI-compatible gateway that resolves semantic aliases to models.
+
+    ``model`` is an alias such as ``sky-quality``; the gateway's policy decides
+    which concrete model answers, and each response's model is recorded as
+    provenance. The gateway spends the ChatGPT subscription whose Codex login
+    lives in ``quota_codex_home``; that login's usage window is checked before
+    every call so the protected reserve is never spent.
+    """
+
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str = "sky-quality"
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = "high"
+    # Responses streaming keeps bytes flowing while a high-effort turn reasons.
+    api_mode: Literal["chat", "responses"] = "responses"
+    # Whole-call limit. The SDK does not retry: a repeated long turn would spend
+    # the subscription twice, and the correction stage splits timed-out requests.
+    timeout_seconds: int = Field(default=1800, ge=30, le=3600)
+    polish_chunk_chars: int = Field(default=8_000, ge=1_000, le=60_000)
+    summary_chunk_chars: int = Field(default=32_000, ge=6_000, le=240_000)
+    # The gateway's alias policy (JSON with ``revision`` and ``aliases``). Its
+    # alias target is recorded in each resolved profile so a remap is not
+    # mistaken for the model that produced an existing artifact.
+    policy_file: str | None = None
+    # When false, calls are sent without reading the subscription window; the
+    # gateway's own rate-limit errors are then the only stop.
+    quota_guard: bool = True
+    quota_executable: str = "codex"
+    quota_codex_home: str = "~/.codex"
+    # Optional ChatGPT account id the quota login must report; a different
+    # login would guard the wrong subscription.
+    quota_account_id: str | None = None
+    quota_reserve_percent: int = Field(default=5, ge=3, le=50)
+    quota_call_headroom_percent: int = Field(default=2, ge=0, le=20)
+    quota_check_timeout_seconds: int = Field(default=20, ge=2, le=30)
+
+
+class LlmConfig(BaseModel):
+    provider: Literal["ollama", "openai", "anthropic", "opencode-go", "ai-gateway"] = "ollama"
+    ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+    openai: OpenAILlmConfig = Field(default_factory=OpenAILlmConfig)
+    anthropic: AnthropicLlmConfig = Field(default_factory=AnthropicLlmConfig)
+    opencode_go: OpenCodeGoLlmConfig = Field(default_factory=OpenCodeGoLlmConfig)
+    ai_gateway: AiGatewayLlmConfig = Field(default_factory=AiGatewayLlmConfig)
+
+
+# ---- Embeddings (Q&A / search) ------------------------------------------- #
+
+
+class LocalEmbeddingsConfig(BaseModel):
+    model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+class OpenAIEmbeddingsConfig(BaseModel):
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str = "text-embedding-3-small"
+
+
+class OllamaEmbeddingsConfig(BaseModel):
+    """Local embeddings via Ollama — no torch/sentence-transformers needed."""
+
+    host: str = "http://localhost:11434"
+    model: str = "bge-m3"
+
+
+class EmbeddingsConfig(BaseModel):
+    provider: Literal["local", "openai", "ollama"] = "local"
+    local: LocalEmbeddingsConfig = Field(default_factory=LocalEmbeddingsConfig)
+    openai: OpenAIEmbeddingsConfig = Field(default_factory=OpenAIEmbeddingsConfig)
+    ollama: OllamaEmbeddingsConfig = Field(default_factory=OllamaEmbeddingsConfig)
+
+
+class OpenAIBudgetConfig(BaseModel):
+    """Fail-closed guard for the operator's daily OpenAI free token pools."""
+
+    enabled: bool = False
+    admin_key: str = ""
+    timezone: str = "Asia/Taipei"
+    high_pool_limit: int = Field(default=250_000, gt=0)
+    mini_pool_limit: int = Field(default=2_500_000, gt=0)
+    mini_model_patterns: list[str] = Field(default_factory=lambda: ["*mini*", "*nano*"])
+    safety_margin_fraction: float = Field(default=0.03, ge=0, lt=1)
+
+    @field_validator("admin_key")
+    @classmethod
+    def admin_key_must_be_an_environment_reference(cls, value: str) -> str:
+        if value and not value.startswith("env:"):
+            raise ValueError("admin_key must be an env:VARIABLE reference")
+        return value
+
+
+class ApiConfig(BaseModel):
+    # SHA-256 of a dedicated random machine credential; completion metadata only.
+    completion_token_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    accounts_enabled: bool = False
+    owner_email: str = ""
+    owner_username: str = "sky"
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+    google_redirect_uri: str | None = None
+
+    @model_validator(mode="after")
+    def validate_accounts(self):
+        if self.accounts_enabled and not self.session_secret:
+            raise ValueError("api.session_secret is required when accounts are enabled")
+        return self
+
+    # Loopback by default so an accidental `localplaud run` isn't exposed to the
+    # LAN. In Docker this is overridden to 0.0.0.0 (the container sits behind
+    # Caddy and its port isn't published).
+    host: str = "127.0.0.1"
+    port: int = 8080
+    # Optional shared secret. When set, every request must present it as an
+    # ``X-Auth-Token`` header or ``?token=`` query param. Prefer putting real
+    # auth (e.g. Caddy basic_auth) in front; this is a lightweight backstop.
+    auth_token: str | None = None
+    # Optional password for the Web App's own /login form. This is separate
+    # from Plaud OAuth and from auth_token (which remains available to API
+    # clients). Configure it through an environment variable in production.
+    login_password: str | None = None
+    # HMAC key for signed browser sessions. Required when login_password is set.
+    session_secret: str | None = None
+    session_max_age_seconds: int = Field(default=2_592_000, ge=300, le=31_536_000)
+    # Keep enabled for HTTPS deployments. A Tailnet-only HTTP development
+    # service may explicitly disable it because browsers reject Secure cookies
+    # delivered over plain HTTP.
+    session_cookie_secure: bool = True
+    # Used to build absolute links behind a reverse proxy; set per machine.
+    public_url: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Root settings
+# --------------------------------------------------------------------------- #
+
+
+def _toml_config_path() -> Path:
+    return Path(os.environ.get("LOCALPLAUD_CONFIG", "config.toml"))
+
+
+class _TomlSource(PydanticBaseSettingsSource):
+    """Load the TOML file (if present) as a settings source."""
+
+    def get_field_value(self, field, field_name):  # pragma: no cover - unused
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        path = _toml_config_path()
+        if not path.exists():
+            return {}
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="LOCALPLAUD_",
+        env_nested_delimiter="__",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    plaud: PlaudConfig = Field(default_factory=PlaudConfig)
+    poller: PollerConfig = Field(default_factory=PollerConfig)
+    store: StoreConfig = Field(default_factory=StoreConfig)
+    pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+    asr: AsrConfig = Field(default_factory=AsrConfig)
+    diarize: DiarizeConfig = Field(default_factory=DiarizeConfig)
+    llm: LlmConfig = Field(default_factory=LlmConfig)
+    embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
+    openai_budget: OpenAIBudgetConfig = Field(default_factory=OpenAIBudgetConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        # Precedence (first wins): init kwargs, env, .env, TOML file, defaults.
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _TomlSource(settings_cls),
+        )
+
+
+_settings: Settings | None = None
+
+
+def get_settings(reload: bool = False) -> Settings:
+    """Return the process-wide settings singleton."""
+    global _settings
+    if _settings is None or reload:
+        # pydantic-settings reads .env only for LOCALPLAUD_* fields; `env:NAME`
+        # secret references (provider connections, the OpenAI budget gate)
+        # resolve through os.environ, so export the same .env into the process
+        # without overriding variables set by the service manager.
+        load_dotenv(override=False)
+        _settings = Settings()
+    return _settings

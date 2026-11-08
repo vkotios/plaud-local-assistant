@@ -1,0 +1,258 @@
+# localplaud configuration — copy to config.toml and edit.
+#
+# Secrets (API keys and HF token) are better kept OUT of this file.
+# Any field can be overridden by an environment variable using the prefix
+# LOCALPLAUD_ and "__" between levels, e.g.:
+#     LOCALPLAUD_ASR__OPENAI__API_KEY="sk-..."
+# You can also put those in a .env file (see .env.example). config.toml and
+# .env are git-ignored.
+
+[plaud]
+# Which Plaud cloud client to use:
+#   "official" (default) — Plaud's sanctioned Open API with OAuth that
+#       auto-refreshes. One-time setup: `localplaud auth login` (opens your
+#       browser once, tokens land in ~/.plaud/tokens.json). Recommended.
+#   "mcp"       — Plaud's official local MCP server. One-time setup:
+#       `npx -y @plaud-ai/mcp@latest install`; uses ~/.plaud/tokens-mcp.json.
+provider = "official"
+
+  [plaud.official]
+  # Defaults work for everyone; override only if Plaud changes its platform.
+  # api_base = "https://platform.plaud.ai/developer/api"
+  # tokens_path = "~/.plaud/tokens.json"
+
+  [plaud.mcp]
+  # command = "npx"
+  # args = ["-y", "@plaud-ai/mcp@latest"]
+  # tokens_path = "~/.plaud/tokens-mcp.json"
+  # request_timeout_seconds = 30
+
+[poller]
+enabled = true
+interval_seconds = 300           # how often to poll the Plaud cloud
+auto_download = true             # first sync is metadata-only; later new audio downloads automatically
+include_trash = false
+download_dir = "./data/audio"    # where downloaded .opus files land
+max_concurrent_downloads = 2
+
+[store]
+database_url = "sqlite:///./data/localplaud.db"
+# Keep local uploads forever. When enabled, completed Plaud-backed recordings
+# retain transcripts/notes/indexes but release original audio, WAV, and waveform
+# caches; playback, audio export, and reprocessing fetch the audio again on demand.
+evict_plaud_audio_after_processing = false
+
+# --------------------------------------------------------------------------- #
+# OpenAI free-pool budget gate — opt in only when calling the real OpenAI API.
+# It fails closed before egress if organization usage cannot prove the call will
+# remain inside the configured zero-cost daily pool. Compatible relay base URLs
+# are not gated. Store only an environment reference here, never an admin key.
+# --------------------------------------------------------------------------- #
+[openai_budget]
+enabled = false
+admin_key = "env:OPENAI_ADMIN_KEY"
+timezone = "Asia/Taipei"
+high_pool_limit = 250000
+mini_pool_limit = 2500000
+mini_model_patterns = ["*mini*", "*nano*"]
+safety_margin_fraction = 0.03
+
+[pipeline]
+# Local processing stages to run after each download.
+convert = true                   # opus -> 16kHz mono wav (needs ffmpeg)
+  transcribe = true
+  align = true                      # provider/model is selected by execution profile
+  diarize = true
+polish = true                    # contextual AI cleanup; raw ASR stays immutable
+summarize = true
+mind_map = true                  # nested Markdown outline rendered as a tree in the Web App
+outline = false                 # opt in to automatic timestamped chapters
+outline_method = "llm"           # mind-map profile text model; or explicit "time_slices" (no model)
+index = true                     # build embeddings for Q&A / search
+concurrency = 1                  # shared recording slots, including manual Web/CLI work
+convert_timeout_seconds = 900    # per ffmpeg conversion attempt; kill the process group on expiry
+files_per_cycle = 1              # serial/CLI batch; parallel daemon selects one file per slot
+auto_process_untranscribed_only = false # true skips existing local transcripts and background backfills; manual resume remains available
+untranscribed_only_retry_hours = 72     # with the above, recordings transcribed this recently keep automatic retries (0 = off)
+# Recordings at/over this length (the Plaud recorder stops at its 5-hour cap)
+# are treated as accidental: kept metadata-only, never auto-downloaded or
+# processed. "Import audio" / "Resume processing" in the Web App still work.
+# Comment out or raise to change; remove the limit entirely with a very large value.
+auto_skip_duration_minutes = 300
+retry_max_attempts = 5           # fast exponential retries before the slow unattended cadence
+retry_base_seconds = 300         # exponential delay: 5m, 10m, 20m, …
+retry_max_seconds = 21600        # cap fast retry delay at 6h
+retry_exhausted_interval_seconds = 86400 # keep retrying daily after that; 0 stops until manual Resume
+summary_chunk_chars = 12000      # full transcript is hierarchically summarized above this size
+note_quality = "standard"       # whole transcript in one request: a topic-organized note in minutes. "evidence" = audited fact ledger (slow, thorough); "legacy" = original chunked
+note_single_pass_chars = 120000  # largest transcript sent as one note request to a large-context provider
+note_evidence_chunk_chars = 120000 # also bounded by the selected provider's context
+note_repair_attempts = 2         # bounded repairs; unresolved reviewer objections are published as caveats
+note_parallelism = 3              # concurrent evidence chunks/drafts on gateway-style providers; output is identical to 1
+speech_resource_retries = 2        # re-run a diarize stage whose worker was killed for memory, before degrading it
+speech_resource_retry_seconds = 60 # pause between those attempts
+polish_chunk_chars = 12000       # contiguous segment context sent per correction call
+polish_parallelism = 4           # correction chunks and review batches in flight at once on gateway-style providers; output equals 1
+polish_review_chars = 60000       # characters per edit-review request on gateway-style providers (small local models keep polish_chunk_chars)
+polish_reasoning_effort = "medium" # correction requests only; can lower a provider's effort, never raise it; unset keeps the provider's
+summary_template = "plaud-autopilot" # Plaud Web Autopilot; also: default | meeting | call | lecture | personal
+# "independent" (default) accepts only raw audio + metadata from Plaud and
+# requires a local transcript. "migration" permits explicitly imported Plaud
+# Intelligence artifacts for comparison/backfill.
+artifact_mode = "independent"
+# Migration/debug only. The subscription-independent workflow keeps this false
+# and derives every artifact from raw audio; imported Plaud rows remain separately
+# labelled and are not reused. Effective only in migration mode.
+prefer_cloud_artifacts = false
+
+# --------------------------------------------------------------------------- #
+# ASR — speech recognition. Local turbo is the subscription-independent baseline;
+# cloud providers are explicit operator choices, never a silent paid fallback.
+# --------------------------------------------------------------------------- #
+[asr]
+provider = "faster-whisper"      # faster-whisper | whispercpp | mlx-whisper | openai | deepgram | assemblyai
+language = "auto"                # ISO code (e.g. "en", "zh") or "auto"
+fallback = []                    # opt in explicitly; avoid surprise paid processing
+
+  [asr.vad]                      # Voice Activity Detection — first stage of the speech pipeline
+  # Off by default until benchmarked on real Taiwan Mandarin / code-switch audio.
+  # Enabling the local (mlx-whisper) path needs the optional 'vad' extra:
+  #   pip install 'localplaud[vad]'   (silero-vad). faster-whisper's native VAD
+  # filter bundles its own silero and needs no extra. If enabled but the package
+  # is missing, ASR logs a warning and falls back to whole-file transcription.
+  enabled = false
+  threshold = 0.5                # silero speech-probability cutoff (0-1)
+  min_speech_ms = 250            # drop speech blips shorter than this
+  min_silence_ms = 100           # silence needed to close a speech region
+  speech_pad_ms = 30             # padding silero adds around each region
+  merge_gap_s = 0.5              # merge regions separated by a shorter gap (mlx path)
+  region_pad_s = 0.2             # extra padding per ASR chunk so words aren't clipped
+  max_region_s = 30.0            # split longer regions to bound each ASR call
+
+  [asr.faster_whisper]           # local, CPU or NVIDIA CUDA (CTranslate2)
+  model = "large-v3-turbo"
+  device = "auto"                # auto | cpu | cuda
+  compute_type = "auto"          # auto | int8 | int8_float16 | float16 | float32
+
+  [asr.whispercpp]               # local, uses Metal on Apple Silicon
+  binary = "whisper-cli"
+  model_path = "./models/ggml-large-v3-turbo.bin"
+  timeout_seconds = 14400        # whole whisper-cli invocation, including descendants
+
+  [asr.mlx_whisper]              # local, Apple Silicon (MLX / Metal)
+  model = "mlx-community/whisper-large-v3-turbo"
+
+  [asr.openai]                   # cloud
+  # api_key via LOCALPLAUD_ASR__OPENAI__API_KEY
+  model = "whisper-1"
+
+  [asr.deepgram]                 # cloud, does speaker diarization server-side
+  # api_key via LOCALPLAUD_ASR__DEEPGRAM__API_KEY
+  model = "nova-2"
+  diarize = true
+
+  [asr.assemblyai]               # cloud, speaker labels server-side
+  # api_key via LOCALPLAUD_ASR__ASSEMBLYAI__API_KEY
+  speaker_labels = true
+
+# --------------------------------------------------------------------------- #
+# Diarization — only used when the ASR provider didn't already return speakers.
+# Cloud ASR (deepgram/assemblyai) return speakers directly, so this is skipped.
+# --------------------------------------------------------------------------- #
+[diarize]
+provider = "pyannote"            # required for the default Plaud-like speaker workflow
+model = "pyannote/speaker-diarization-community-1"
+device = "auto"                  # auto | cpu | cuda (auto uses CUDA when available, else CPU)
+# hf_token via LOCALPLAUD_DIARIZE__HF_TOKEN (needed to download pyannote models)
+# num_speakers = 2               # optional hint; omit to auto-detect
+
+# --------------------------------------------------------------------------- #
+# LLM — used by the initial execution profile for transcript correction,
+# summaries / structured notes, and Q&A answers. Later profile versions may
+# choose a different capable provider independently for each stage.
+# --------------------------------------------------------------------------- #
+[llm]
+provider = "ollama"              # ollama | openai | anthropic | opencode-go | ai-gateway
+
+  [llm.ollama]                   # local, no API key
+  host = "http://localhost:11434"
+  model = "llama3.1:8b"
+  context_tokens = 8192         # explicit Ollama runtime window; truncation is rejected
+  summary_chunk_chars = 3000    # reserve room for instructions and detailed Chinese notes
+  polish_chunk_chars = 2000      # fits prompt + structured output in a 4k context
+
+  [llm.openai]
+  # api_key via LOCALPLAUD_LLM__OPENAI__API_KEY
+  # No default model: name one explicitly when this is the global provider.
+  # Prefer the ai-gateway alias in execution profiles.
+  # model = "..."
+  # Set for OpenAI reasoning models. Leave unset for OpenAI-compatible
+  # endpoints that only support the legacy sampling request.
+  # reasoning_effort = "medium"
+
+  [llm.anthropic]
+  # api_key via LOCALPLAUD_LLM__ANTHROPIC__API_KEY
+  model = "claude-haiku-4-5"
+
+  [llm.opencode_go]              # credentials remain in OpenCode, never localplaud
+  executable = "opencode"
+  model = "qwen3.7-plus"
+  agent = "transcript-polish"    # project agent denies every tool
+  timeout_seconds = 900
+  polish_chunk_chars = 12000      # conservative CLI batch; structural failures split further
+
+  [llm.ai_gateway]               # central OpenAI-compatible gateway; select it per profile
+  # client key via a connection secret_ref such as env:LOCALPLAUD_AI_GATEWAY_KEY
+  base_url = "http://127.0.0.1:8317/v1"
+  model = "sky-quality"          # a gateway alias, never a concrete model
+  reasoning_effort = "high"
+  api_mode = "responses"         # streamed, so long reasoning turns keep the connection busy
+  timeout_seconds = 1800         # whole-call limit; no SDK retries
+  polish_chunk_chars = 8000
+  summary_chunk_chars = 32000
+  policy_file = "~/Projects/ai-gateway/model-policy.json" # alias targets recorded in profiles
+  quota_guard = true             # false: never read the window; spend until the gateway refuses
+  quota_codex_home = "~/.codex"  # Codex login of the subscription the gateway spends
+  quota_reserve_percent = 5      # never spend the last 5% of the subscription window
+  quota_call_headroom_percent = 2 # do not start a call too close to that floor
+  quota_check_timeout_seconds = 20 # tolerate a busy app-server between consecutive stages
+
+# --------------------------------------------------------------------------- #
+# Embeddings — for Q&A ("Ask Plaud" equivalent) and semantic search.
+# --------------------------------------------------------------------------- #
+[embeddings]
+provider = "local"               # local (sentence-transformers) | ollama | openai
+
+  [embeddings.local]
+  model = "sentence-transformers/all-MiniLM-L6-v2"
+
+  [embeddings.ollama]            # local, no torch — just a running Ollama daemon
+  host = "http://localhost:11434"
+  model = "bge-m3"
+
+  [embeddings.openai]
+  # api_key via LOCALPLAUD_EMBEDDINGS__OPENAI__API_KEY
+  model = "text-embedding-3-small"
+
+[api]
+# Loopback by default so a stray `localplaud run` isn't LAN-exposed. Docker
+# overrides this to 0.0.0.0 (it sits behind Caddy).
+host = "127.0.0.1"
+port = 8080
+# Recommended Web App accounts (see docs/accounts.md). Google is optional for
+# existing local accounts. Bootstrap the owner with the configured Google email.
+# accounts_enabled = true
+# owner_username = "sky"
+# owner_email = "owner@example.com"
+# public_url = "https://plaud.example.com"
+# google_redirect_uri = "https://plaud.example.com/auth/google/callback"
+# Keep credentials in .env, never in this file:
+# LOCALPLAUD_API__SESSION_SECRET
+# LOCALPLAUD_API__GOOGLE_CLIENT_ID
+# LOCALPLAUD_API__GOOGLE_CLIENT_SECRET
+# session_max_age_seconds = 2592000
+# session_cookie_secure = true  # false only for isolated HTTP development
+# Completion notifications use a separate metadata-only machine credential:
+# LOCALPLAUD_API__COMPLETION_TOKEN_SHA256 (see docs/completion-watcher.md)
+# Legacy single-user mode (accounts_enabled=false) supports login_password and
+# auth_token. Account mode rejects BOTH, including Bearer/X-Auth-Token/?token=.

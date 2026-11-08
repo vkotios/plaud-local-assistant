@@ -1,0 +1,243 @@
+"""Database engine/session setup and initialization."""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from ..config import get_settings
+from ..error_redaction import sanitize_error_value
+from . import tenancy as _tenancy  # noqa: F401 - registers workspace isolation
+from .models import Base
+
+_engine: Engine | None = None
+_Session: sessionmaker[Session] | None = None
+_schema_thread_lock = threading.Lock()
+
+
+@event.listens_for(Session, "before_flush")
+def _sanitize_durable_diagnostics(session: Session, _flush_context, _instances) -> None:
+    """Redact diagnostic fields immediately before ORM persistence."""
+    for instance in session.new.union(session.dirty):
+        for attribute in ("error", "health", "detail", "response_excerpt"):
+            if not hasattr(instance, attribute):
+                continue
+            value = getattr(instance, attribute)
+            sanitized = sanitize_error_value(value)
+            if sanitized != value:
+                setattr(instance, attribute, sanitized)
+
+
+def _configure_sqlite_connection(dbapi_connection, _record) -> None:
+    """Make concurrent access wait instead of failing the caller.
+
+    The API, poller, and worker all write this database from separate threads
+    and processes. Without WAL a reader blocks the writer outright, and with
+    the driver's 5s default a stage that collides with a slow commit dies with
+    ``database is locked`` — which surfaces as a failed stage run rather than a
+    retry. WAL plus a long busy timeout turns that contention into a wait.
+    """
+    store = get_settings().store
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute(f"PRAGMA journal_mode={store.sqlite_journal_mode}")
+        cursor.execute(f"PRAGMA busy_timeout={store.sqlite_busy_timeout_ms}")
+        if store.sqlite_journal_mode == "wal":
+            # Safe with WAL: a crash can lose the last commits, never the
+            # database. Under the rollback journal it would not be.
+            cursor.execute("PRAGMA synchronous=NORMAL")
+    finally:
+        cursor.close()
+
+
+def _ensure_sqlite_dir(url: str) -> None:
+    prefix = "sqlite:///"
+    if url.startswith(prefix):
+        path = Path(url[len(prefix) :])
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def get_engine() -> Engine:
+    global _engine, _Session
+    if _engine is None:
+        url = get_settings().store.database_url
+        _ensure_sqlite_dir(url)
+        is_sqlite = url.startswith("sqlite")
+        connect_args = (
+            {"check_same_thread": False, "timeout": 30.0} if is_sqlite else {}
+        )
+        _engine = create_engine(url, connect_args=connect_args, future=True)
+        if is_sqlite:
+            event.listen(_engine, "connect", _configure_sqlite_connection)
+        _Session = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
+    return _engine
+
+
+@contextmanager
+def _schema_initialization_lock(engine: Engine):
+    """Serialize check-then-create migrations across processes."""
+    dialect = engine.dialect.name
+    if dialect == "sqlite" and engine.url.database not in {None, ":memory:"}:
+        try:
+            import fcntl
+        except ImportError:
+            with _schema_thread_lock:
+                yield
+            return
+        database_path = Path(str(engine.url.database)).resolve()
+        lock_path = database_path.with_name(f"{database_path.name}.schema.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if dialect == "postgresql":
+        with engine.connect() as connection:
+            connection.exec_driver_sql("SELECT pg_advisory_lock(1280330575)")
+            try:
+                yield
+            finally:
+                connection.exec_driver_sql("SELECT pg_advisory_unlock(1280330575)")
+        return
+    with _schema_thread_lock:
+        yield
+
+
+def init_db(*, reconcile_index: bool = True) -> dict[str, int] | None:
+    """Create and migrate the schema and seed every workspace.
+
+    ``reconcile_index=False`` skips the library-wide note index reconcile so a
+    service can start serving quickly and run
+    ``knowledge_index.reconcile_knowledge_documents`` in the background.
+    """
+    """Create tables and prepare legacy cloud-derived rows when required."""
+    engine = get_engine()
+    with _schema_initialization_lock(engine):
+        return _init_db_locked(engine, reconcile_index=reconcile_index)
+
+
+def _init_db_locked(engine: Engine, *, reconcile_index: bool = True) -> dict[str, int] | None:
+    Base.metadata.create_all(engine)
+    from .migrations import migrate_account_sessions
+
+    migrate_account_sessions(engine)
+    from .migrations import migrate_workspace_columns
+
+    migrate_workspace_columns(engine)
+    from ..providers.service import bootstrap_default_profile
+    from .migrations import (
+        migrate_artifact_lineage_columns,
+        migrate_ask_provenance_schema,
+        migrate_ask_request_claim_schema,
+        migrate_automation_ownership_schema,
+        migrate_chunk_file_index,
+        migrate_editable_note_provenance_schema,
+        migrate_editable_note_revision_schema,
+        migrate_editable_note_source_schema,
+        migrate_generated_title_columns,
+        migrate_import_schema,
+        migrate_incremental_import_schema,
+        migrate_knowledge_index_schema,
+        migrate_legacy_note_template_schema,
+        migrate_legacy_provider_profile_schema,
+        migrate_legacy_stage_run_schema,
+        migrate_legacy_summary_schema,
+        migrate_local_transcript_uniqueness,
+        migrate_note_template_schema,
+        migrate_organization_schema,
+        migrate_pipeline_retry_schema,
+        migrate_processing_claim_schema,
+        migrate_profile_resolution_schema,
+        migrate_profile_snapshot_columns,
+        migrate_quality_floor_schema,
+        migrate_share_link_options_schema,
+        migrate_speaker_timeline_schema,
+        migrate_speech_override_column,
+        migrate_stage_attempt_schema,
+        migrate_summary_revision_schema,
+        migrate_tag_kind_columns,
+        migrate_transcript_revision_provenance,
+        migrate_vocabulary_schema,
+        redact_legacy_error_text,
+    )
+
+    migrate_legacy_provider_profile_schema(engine)
+    migrate_quality_floor_schema(engine)
+    migrate_legacy_note_template_schema(engine)
+    migrate_legacy_summary_schema(engine)
+    migrate_legacy_stage_run_schema(engine)
+    migrate_local_transcript_uniqueness(engine)
+    migrate_profile_snapshot_columns(engine)
+    migrate_generated_title_columns(engine)
+    migrate_tag_kind_columns(engine)
+    migrate_automation_ownership_schema(engine)
+    migrate_stage_attempt_schema(engine)
+    migrate_transcript_revision_provenance(engine)
+    migrate_organization_schema(engine)
+    migrate_pipeline_retry_schema(engine)
+    migrate_processing_claim_schema(engine)
+    migrate_profile_resolution_schema(engine)
+    migrate_note_template_schema(engine)
+    migrate_artifact_lineage_columns(engine)
+    migrate_summary_revision_schema(engine)
+    migrate_ask_provenance_schema(engine)
+    migrate_ask_request_claim_schema(engine)
+    migrate_editable_note_source_schema(engine)
+    migrate_editable_note_revision_schema(engine)
+    migrate_editable_note_provenance_schema(engine)
+    migrate_speaker_timeline_schema(engine)
+    migrate_speech_override_column(engine)
+    migrate_import_schema(engine)
+    migrate_incremental_import_schema(engine)
+    migrate_knowledge_index_schema(engine)
+    migrate_vocabulary_schema(engine)
+    migrate_share_link_options_schema(engine)
+    migrate_chunk_file_index(engine)
+    redact_legacy_error_text(engine)
+    from .migrations import migrate_workspaces
+
+    migrate_workspaces(engine)
+    with Session(engine) as session:
+        bootstrap_default_profile(session, get_settings())
+        session.commit()
+    from ..workspaces import prepare_workspace
+    from .models import Workspace
+    from .tenancy import system_scope, workspace_scope
+
+    with system_scope(), Session(engine) as session:
+        workspace_ids = list(session.scalars(select(Workspace.id).order_by(Workspace.id)))
+    for workspace_id in workspace_ids:
+        with workspace_scope(workspace_id), Session(engine) as session:
+            prepare_workspace(session, reconcile_index=reconcile_index)
+            session.commit()
+    if get_settings().pipeline.artifact_mode == "independent":
+        from .migrations import prepare_independent_mode
+
+        return prepare_independent_mode(engine)
+    return None
+
+
+@contextmanager
+def session_scope() -> Iterator[Session]:
+    """Transactional session context."""
+    if _Session is None:
+        get_engine()
+    assert _Session is not None
+    session = _Session()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()

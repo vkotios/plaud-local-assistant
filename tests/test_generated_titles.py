@@ -1,0 +1,338 @@
+"""Locally generated recording titles: invariant, precedence, and backfill.
+
+Every local transcript gets a generated-title artifact. It never overrides the
+display precedence of a manual ``local_title`` and carries provider/model
+provenance so it is not mistaken for a user edit or a Plaud-provided name.
+"""
+
+from __future__ import annotations
+
+
+def _init_db(monkeypatch, tmp_path):
+    import localplaud.db.session as db_session
+    from localplaud.config import get_settings
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path / 'titles.db'}")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    from localplaud.db.session import init_db
+
+    init_db()
+
+
+def test_clean_generated_title_strips_markup_and_caps():
+    from localplaud.worker.pipeline import _clean_generated_title, _generated_title_candidate
+
+    assert _clean_generated_title("# 「會議：口琴社」  ") == "會議：口琴社"
+    assert _clean_generated_title('  "A Quoted Title"\n') == "A Quoted Title"
+    assert _clean_generated_title("眾人驚呼「哇，一定是高級」") == "眾人驚呼「哇，一定是高級」"
+    assert _clean_generated_title("眾人驚呼「哇，一定是高級") is None
+    assert _clean_generated_title("   ") is None
+    assert _clean_generated_title(None) is None
+    assert _clean_generated_title("x" * 500) is None
+    assert _clean_generated_title("以下是根據您提供的內容整理出的摘要") is None
+    assert _clean_generated_title("**清楚的會議標題**") == "清楚的會議標題"
+    assert _clean_generated_title("Autopilot") is None
+    assert _clean_generated_title("Coverage Notes Summary") is None
+    assert _clean_generated_title("Transcript Overview") is None
+    assert _clean_generated_title("逐字稿摘要") is None
+    assert _clean_generated_title("逐字稿內容概覽") is None
+    assert _clean_generated_title("轉錄內容概覽") is None
+    assert _clean_generated_title("转录内容概览") is None
+    assert _clean_generated_title("轉錄內容摘要") is None
+    assert _clean_generated_title("转录内容摘要") is None
+    assert _clean_generated_title("轉錄內容質量異常") is None
+    assert _clean_generated_title("轉錄內容無法可靠總結") is None
+    assert _clean_generated_title("逐字稿內容異常，無法可靠總結") is None
+    assert _clean_generated_title("Transcript quality issue prevents reliable summary") is None
+    assert _clean_generated_title("Mind map") is None
+    assert _clean_generated_title("智能總結") is None
+    assert _clean_generated_title("Autopilot 模板") is None
+    assert _clean_generated_title("Key Points") is None
+    assert _clean_generated_title("自適應結構") is None
+    assert _clean_generated_title("Transcript 總結") is None
+    assert _clean_generated_title("SPEAKER_02: 安") is None
+    assert _clean_generated_title("安安安安安安安安") is None
+    assert _clean_generated_title("Tips") is None
+    assert _clean_generated_title("Content Summary") is None
+    assert _clean_generated_title("會談內容") is None
+    assert _clean_generated_title("錄音內容摘要") is None
+    assert _clean_generated_title("Meeting summary") is None
+    assert _clean_generated_title("研究發表會重點摘要") is None
+    assert _clean_generated_title("論文場次摘要") is None
+    assert _clean_generated_title("討論摘要") is None
+    assert _clean_generated_title("讨论摘要") is None
+    assert _clean_generated_title("討論內容摘要") is None
+    assert _clean_generated_title("社區管委會會議重點摘要") is None
+    assert _generated_title_candidate(None, "\n# AI heading\nbody") == "AI heading"
+    assert _generated_title_candidate(None, "## Generated heading\nbody") == "Generated heading"
+    assert _generated_title_candidate(None, "Generated first line\nbody") is None
+
+
+def test_display_title_precedence_and_source():
+    from localplaud.db.models import PlaudFile
+
+    row = PlaudFile(id="abcdef123456789", filename="Plaud name")
+    assert row.display_title == "Plaud name"
+    assert row.title_source == "plaud"
+
+    row.generated_title = "Generated name"
+    assert row.display_title == "Generated name"
+    assert row.title_source == "generated"
+
+    row.local_title = "Manual name"
+    assert row.display_title == "Manual name"
+    assert row.title_source == "manual"
+
+    empty = PlaudFile(id="0123456789abcdef", filename="")
+    assert empty.display_title == "0123456789ab"
+    assert empty.title_source == "id"
+
+
+def test_template_leaks_cannot_be_saved_or_hidden_by_note_subheadings():
+    from localplaud.worker.pipeline import _clean_generated_title, _generated_title_candidate
+
+    for bad in (
+        "Autopilot 模板總結：系統設計與架構",
+        "Autopilot 模板使用示例",
+        "Autopilot 智能總結：會議與反思",
+        "Autopilot 總結：音樂理論與練習指導",
+        "Autopilot: 智能內容結構匹配",
+        "Autopilot: Intelligent Structure Matching",
+        "內容智能匹配總結結構",
+        "會議總結：新版部署",
+        "Content Summary: Deployment",
+    ):
+        assert _clean_generated_title(bad) is None
+        assert _generated_title_candidate(bad, "## 發布時程\n- 週五") is None
+    assert _clean_generated_title("Tesla Autopilot 駕駛測試") == "Tesla Autopilot 駕駛測試"
+    assert _clean_generated_title("Autopilot 駕駛輔助系統測試") == "Autopilot 駕駛輔助系統測試"
+
+
+def test_apply_generated_title_sets_provenance_when_unnamed(monkeypatch, tmp_path):
+    _init_db(monkeypatch, tmp_path)
+    from localplaud.config import get_settings
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.session import session_scope
+    from localplaud.worker.pipeline import _apply_generated_title
+
+    default_template = get_settings().pipeline.summary_template
+    with session_scope() as session:
+        session.add(PlaudFile(id="rec", filename="20260722_meeting"))
+    with session_scope() as session:
+        _apply_generated_title(
+            session,
+            "rec",
+            {"title": "# Weekly Sync", "provider": "remote-worker", "model": "qwen3:8b"},
+            default_template,
+        )
+    with session_scope() as session:
+        row = session.get(PlaudFile, "rec")
+        assert row.generated_title == "Weekly Sync"
+        assert row.generated_title_provider == "remote-worker"
+        assert row.generated_title_model == "qwen3:8b"
+        assert row.generated_title_at is not None
+        assert row.display_title == "Weekly Sync"
+
+
+def test_apply_generated_title_preserves_manual_display_and_ignores_secondary_template(
+    monkeypatch, tmp_path
+):
+    _init_db(monkeypatch, tmp_path)
+    from localplaud.config import get_settings
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.session import session_scope
+    from localplaud.worker.pipeline import _apply_generated_title
+
+    default_template = get_settings().pipeline.summary_template
+    with session_scope() as session:
+        session.add(PlaudFile(id="manual", filename="raw", local_title="My hand title"))
+        session.add(PlaudFile(id="rec2", filename="raw2"))
+        session.add(PlaudFile(id="auto", filename="raw3"))
+
+    with session_scope() as session:
+        # Manual display rename stays preferred, but the AI artifact is stored.
+        _apply_generated_title(
+            session,
+            "manual",
+            {"title": "Auto title", "provider": "p", "model": "m"},
+            default_template,
+        )
+        # A non-default note template must not rename the recording.
+        _apply_generated_title(
+            session,
+            "rec2",
+            {"title": "Auto title", "provider": "p", "model": "m"},
+            default_template + "-other",
+        )
+        _apply_generated_title(
+            session,
+            "auto",
+            {
+                "title": None,
+                "content_md": "# Auto-selected heading\nbody",
+                "provider": "p",
+                "model": "m",
+            },
+            default_template + "-auto",
+            primary_summary=True,
+        )
+    with session_scope() as session:
+        assert session.get(PlaudFile, "manual").generated_title == "Auto title"
+        assert session.get(PlaudFile, "manual").display_title == "My hand title"
+        assert session.get(PlaudFile, "rec2").generated_title is None
+        assert session.get(PlaudFile, "auto").generated_title == "Auto-selected heading"
+
+
+def test_ensure_generated_title_runs_at_transcript_boundary(monkeypatch, tmp_path):
+    _init_db(monkeypatch, tmp_path)
+    from localplaud.asr.base import Segment, Transcript
+    from localplaud.config import get_settings
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.session import session_scope
+    from localplaud.worker import pipeline
+
+    settings = get_settings()
+    transcript = Transcript(
+        segments=[Segment(start=0, end=1, text="討論口琴社暑期演出")],
+        provider="test-asr",
+        model="test-model",
+    )
+    with session_scope() as session:
+        session.add(PlaudFile(id="fresh", filename="raw"))
+
+    monkeypatch.setattr(
+        pipeline.summarize,
+        "generate_recording_title",
+        lambda *_args, **_kwargs: "口琴社暑期演出規劃",
+    )
+    snapshot = {
+        "stages": {
+            "summarize": {
+                "provider_type": "ai-gateway",
+                "model": "sky-quality",
+            }
+        }
+    }
+    assert pipeline._ensure_generated_title("fresh", transcript, settings, snapshot)
+    with session_scope() as session:
+        row = session.get(PlaudFile, "fresh")
+        assert row.generated_title == "口琴社暑期演出規劃"
+        assert row.generated_title_provider == "ai-gateway"
+        assert row.generated_title_model == "sky-quality"
+        assert row.generated_title_at is not None
+
+
+def test_backfill_titles_cli_fills_every_local_transcript(monkeypatch, tmp_path):
+    _init_db(monkeypatch, tmp_path)
+    from typer.testing import CliRunner
+
+    from localplaud.cli import app
+    from localplaud.config import get_settings
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.models import Summary as SummaryRow
+    from localplaud.db.session import session_scope
+
+    template = get_settings().pipeline.summary_template
+    with session_scope() as session:
+        from localplaud.db.models import Transcript
+
+        session.add(PlaudFile(id="unnamed", filename="raw-1"))
+        session.add(PlaudFile(id="named", filename="raw-2", local_title="Kept"))
+        session.add(PlaudFile(id="heading", filename="raw-3"))
+        for fid in ("unnamed", "named", "heading"):
+            session.add(
+                Transcript(
+                    file_id=fid,
+                    provider="asr",
+                    source="local",
+                    text="hello",
+                    segments=[{"text": "hello", "start": 0, "end": 1}],
+                )
+            )
+            if fid != "heading":
+                session.add(
+                    SummaryRow(
+                        file_id=fid,
+                        template=template,
+                        source="local",
+                        title="# Summary Heading",
+                        content_md="body",
+                        llm_provider="remote-worker",
+                        model="qwen3:8b",
+                    )
+                )
+        session.add(
+            SummaryRow(
+                file_id="heading",
+                template=template,
+                source="local",
+                title=None,
+                content_md="Generated prose without a Markdown heading.",
+                llm_provider="ollama",
+                model="qwen3:8b",
+            )
+        )
+        session.add(
+            SummaryRow(
+                file_id="heading",
+                template="mind_map",
+                source="local",
+                title=None,
+                content_md="# AI mind-map heading\n- body",
+                llm_provider="ollama",
+                model="qwen3:8b",
+            )
+        )
+
+    result = CliRunner().invoke(app, ["backfill-titles"])
+    assert result.exit_code == 0, result.output
+    with session_scope() as session:
+        assert session.get(PlaudFile, "unnamed").generated_title == "Summary Heading"
+        # Manual rename remains visible while the generated artifact also exists.
+        assert session.get(PlaudFile, "named").generated_title == "Summary Heading"
+        assert session.get(PlaudFile, "named").display_title == "Kept"
+        assert session.get(PlaudFile, "heading").generated_title == "AI mind-map heading"
+
+
+def test_backfill_titles_dry_run_writes_nothing(monkeypatch, tmp_path):
+    _init_db(monkeypatch, tmp_path)
+    from typer.testing import CliRunner
+
+    from localplaud.cli import app
+    from localplaud.config import get_settings
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.models import Summary as SummaryRow
+    from localplaud.db.session import session_scope
+
+    template = get_settings().pipeline.summary_template
+    with session_scope() as session:
+        from localplaud.db.models import Transcript
+
+        session.add(PlaudFile(id="rec", filename="raw"))
+        session.add(
+            Transcript(
+                file_id="rec",
+                provider="asr",
+                source="local",
+                text="hello",
+                segments=[{"text": "hello", "start": 0, "end": 1}],
+            )
+        )
+        session.add(
+            SummaryRow(
+                file_id="rec",
+                template=template,
+                source="local",
+                title="Heading",
+                content_md="b",
+                llm_provider="p",
+                model="m",
+            )
+        )
+    result = CliRunner().invoke(app, ["backfill-titles", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    with session_scope() as session:
+        assert session.get(PlaudFile, "rec").generated_title is None

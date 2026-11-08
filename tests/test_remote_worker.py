@@ -1,0 +1,1325 @@
+"""Remote worker v1 auth, durability, idempotency, client, and pipeline dispatch."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from localplaud.remote.client import (
+    ArtifactChecksumError,
+    RemoteWorkerClient,
+    RemoteWorkerError,
+)
+from localplaud.remote.protocol import (
+    ArtifactDescriptor,
+    InputReference,
+    JobResponse,
+    JobStage,
+    JobStatus,
+    JobSubmitRequest,
+)
+
+
+def _client(monkeypatch, tmp_path):
+    import localplaud.db.session as db_session
+    from localplaud.api.app import app
+    from localplaud.config import get_settings
+    from localplaud.db.session import init_db
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path / 'worker.db'}")
+    monkeypatch.setenv("LOCALPLAUD_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    init_db()
+    return TestClient(app)
+
+
+def _request(key="same-job"):
+    return {
+        "protocol_version": "1",
+        "idempotency_key": key,
+        "stage": "summarize",
+        "model": "test",
+        "inputs": [
+            {
+                "name": "transcript",
+                "media_type": "application/json",
+                "kind": "inline_json",
+                "value": {"segments": []},
+            }
+        ],
+        "options": {},
+    }
+
+
+def test_maintenance_rejects_submission_without_creating_job(monkeypatch, tmp_path):
+    import fcntl
+
+    from sqlalchemy import func, select
+
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import session_scope
+
+    client = _client(monkeypatch, tmp_path)
+    with (tmp_path / "worker.db.gpu-maintenance.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        response = client.post(
+            "/api/worker/v1/jobs", json=_request(),
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "120"
+    with session_scope() as session:
+        assert session.scalar(select(func.count()).select_from(RemoteJob)) == 0
+
+
+@pytest.mark.parametrize("artifact_download", [False, True])
+def test_worker_reads_do_not_load_uploaded_audio(monkeypatch, tmp_path, artifact_download):
+    from sqlalchemy import event
+
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import get_engine, session_scope
+    from localplaud.remote.server import _artifact
+
+    client = _client(monkeypatch, tmp_path)
+    result = b"verified-result"
+    with session_scope() as session:
+        session.add(
+            RemoteJob(
+                id="large-input",
+                idempotency_key="large-input",
+                stage="transcribe",
+                status="succeeded" if artifact_download else "running",
+                input_manifest={"inputs": [{"name": "audio", "value": "A" * 1_000_000}]},
+                artifacts=[_artifact("result.bin", "application/octet-stream", result)],
+            )
+        )
+
+    queries = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "FROM remote_jobs" in statement:
+            queries.append(statement)
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        suffix = "/artifacts/result.bin" if artifact_download else ""
+        response = client.get(
+            "/api/worker/v1/jobs/large-input" + suffix,
+            headers={"authorization": "Bearer worker-secret"},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert response.status_code == 200
+    if artifact_download:
+        assert response.content == result
+    else:
+        assert response.json()["status"] == "running"
+        assert response.json()["artifacts"][0]["sha256"] == hashlib.sha256(result).hexdigest()
+    assert queries
+    assert all("input_manifest" not in statement for statement in queries)
+
+
+def test_title_only_worker_returns_provenance_without_generating_notes(monkeypatch):
+    import base64
+
+    from localplaud.config import Settings
+    from localplaud.remote import server
+    from localplaud.worker import summarize
+
+    monkeypatch.setattr(server, "get_settings", lambda: Settings())
+    monkeypatch.setattr(summarize, "generate_recording_title", lambda *_: "新版部署安排")
+    monkeypatch.setattr(summarize, "summarize", lambda *_: pytest.fail("notes must not run"))
+    request = _request("title-only")
+    request["options"] = {"title_only": True}
+    artifact = server._execute(JobSubmitRequest(**request))[0]
+    result = json.loads(base64.b64decode(artifact["data_base64"]))
+    assert result == {
+        "title": "新版部署安排",
+        "provider": "ollama",
+        "model": "test",
+        "title_prompt_version": "recording-title/v4",
+    }
+
+
+def test_worker_rejects_unsupported_title_version_and_refreshes_old_cache(monkeypatch, tmp_path):
+    import base64
+
+    from localplaud.remote import server
+    from localplaud.worker.title_policy import TITLE_PROMPT_VERSION
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    request = _request("versioned-title")
+    request["options"] = {"title_only": True, "title_prompt_version": "future"}
+    assert client.post("/api/worker/v1/jobs", headers=headers, json=request).status_code == 409
+    request["options"]["title_prompt_version"] = TITLE_PROMPT_VERSION
+    versions = iter(["old", TITLE_PROMPT_VERSION])
+    monkeypatch.setattr(
+        server,
+        "_execute",
+        lambda _: [
+            server._artifact(
+                "result.json",
+                "application/json",
+                json.dumps(
+                    {"title": "Launch plan", "title_prompt_version": next(versions)}
+                ).encode(),
+            )
+        ],
+    )
+    first = client.post("/api/worker/v1/jobs", headers=headers, json=request).json()
+    second = client.post("/api/worker/v1/jobs", headers=headers, json=request).json()
+    assert first["job_id"] == second["job_id"]
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        row = session.get(RemoteJob, first["job_id"])
+        payload = json.loads(base64.b64decode(row.artifacts[0]["data_base64"]))
+        assert payload["title_prompt_version"] == TITLE_PROMPT_VERSION
+
+
+def test_worker_auth_handshake_idempotency_and_persistence(monkeypatch, tmp_path):
+    import localplaud.remote.server as server
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import session_scope
+
+    client = _client(monkeypatch, tmp_path)
+    assert client.get("/api/worker/v1/capabilities").status_code == 401
+    headers = {"authorization": "Bearer worker-secret"}
+    handshake = client.get("/api/worker/v1/capabilities", headers=headers)
+    assert handshake.status_code == 200
+    assert handshake.json()["protocol"] == "localplaud-worker"
+    assert handshake.json()["version"] == "1"
+
+    monkeypatch.setattr(
+        server,
+        "_execute",
+        lambda request: [
+            server._artifact(
+                "result.json",
+                "application/json",
+                b'{"ok":true,"coverage":{"note_prompt_version":"recording-notes/v1"}}',
+            )
+        ],
+    )
+    first = client.post("/api/worker/v1/jobs", headers=headers, json=_request())
+    assert first.status_code == 200
+    job_id = first.json()["job_id"]
+    status = client.get(f"/api/worker/v1/jobs/{job_id}", headers=headers).json()
+    assert status["status"] == "succeeded"
+    assert status["progress"] == 1.0
+    second = client.post("/api/worker/v1/jobs", headers=headers, json=_request())
+    assert second.json()["job_id"] == job_id
+    artifact = client.get(status["artifacts"][0]["download_url"], headers=headers)
+    assert (
+        artifact.content == b'{"ok":true,"coverage":{"note_prompt_version":"recording-notes/v1"}}'
+    )
+    with session_scope() as session:
+        assert session.query(RemoteJob).count() == 1
+        assert session.get(RemoteJob, job_id).artifacts
+
+
+def test_worker_cancel_and_structured_retry_error(monkeypatch, tmp_path):
+    import localplaud.remote.server as server
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    real_execute_job = server.execute_job
+    monkeypatch.setattr(server, "execute_job", lambda job_id: None)
+    queued = client.post("/api/worker/v1/jobs", headers=headers, json=_request("cancel-me")).json()
+    cancelled = client.post(
+        f"/api/worker/v1/jobs/{queued['job_id']}/cancel", headers=headers
+    ).json()
+    assert cancelled["status"] == "cancelled"
+
+    monkeypatch.setattr(
+        server, "_execute", lambda request: (_ for _ in ()).throw(OSError("GPU busy"))
+    )
+    failed = client.post("/api/worker/v1/jobs", headers=headers, json=_request("retry-me")).json()
+    # Restore the real runner because submit captured the monkeypatched no-op above.
+    real_execute_job(failed["job_id"])
+    result = client.get(f"/api/worker/v1/jobs/{failed['job_id']}", headers=headers).json()
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "stage_execution_failed"
+    assert result["error"]["retryable"] is True
+
+
+def test_resubmitting_a_failed_job_reruns_it_instead_of_replaying_the_failure(
+    monkeypatch, tmp_path
+):
+    import localplaud.remote.server as server
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+
+    monkeypatch.setattr(
+        server, "_execute", lambda request: (_ for _ in ()).throw(OSError("timed out"))
+    )
+    first = client.post("/api/worker/v1/jobs", headers=headers, json=_request("flaky")).json()
+    status = client.get(f"/api/worker/v1/jobs/{first['job_id']}", headers=headers).json()
+    assert status["status"] == "failed"
+
+    monkeypatch.setattr(
+        server,
+        "_execute",
+        lambda request: [
+            server._artifact(
+                "result.json",
+                "application/json",
+                b'{"ok":true,"coverage":{"note_prompt_version":"evidence-notes/v2"}}',
+            )
+        ],
+    )
+    second = client.post("/api/worker/v1/jobs", headers=headers, json=_request("flaky")).json()
+    assert second["job_id"] == first["job_id"]
+    result = client.get(f"/api/worker/v1/jobs/{first['job_id']}", headers=headers).json()
+    assert result["status"] == "succeeded"
+    assert result["error"] is None
+    assert result["artifacts"]
+
+    # Succeeded results stay cached: a third submit must not recompute.
+    monkeypatch.setattr(
+        server, "_execute", lambda request: (_ for _ in ()).throw(AssertionError("recomputed"))
+    )
+    third = client.post("/api/worker/v1/jobs", headers=headers, json=_request("flaky")).json()
+    assert third["status"] == "succeeded"
+
+
+def test_restart_recovery_resumes_durable_queued_job(monkeypatch, tmp_path):
+    import localplaud.remote.server as server
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import session_scope
+
+    _client(monkeypatch, tmp_path)
+    request = JobSubmitRequest.model_validate(_request("restart-job"))
+    with session_scope() as session:
+        session.add(
+            RemoteJob(
+                id="restart",
+                idempotency_key=request.idempotency_key,
+                stage=request.stage,
+                model=request.model,
+                input_manifest=request.model_dump(mode="json"),
+                status="queued",
+            )
+        )
+    monkeypatch.setattr(
+        server,
+        "_execute",
+        lambda request: [server._artifact("result.json", "application/json", b"{}")],
+    )
+    server.resume_pending_jobs()
+    with session_scope() as session:
+        assert session.get(RemoteJob, "restart").status == "succeeded"
+
+
+def test_protocol_rejects_credentials_recursively():
+    payload = _request("unsafe")
+    payload["options"] = {"nested": {"plaud_token": "do-not-send"}}
+    with pytest.raises(ValueError, match="credentials"):
+        JobSubmitRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_terminal_jobs_release_uploads_and_retry_restores_inputs(monkeypatch, tmp_path, fail_first):
+    import base64
+
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import session_scope
+    from localplaud.remote import server
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    payload = b"owned audio payload" * 1024
+    checksum = hashlib.sha256(payload).hexdigest()
+    request = _request("release-inputs")
+    request["inputs"].append(
+        {
+            "name": "audio",
+            "media_type": "audio/wav",
+            "kind": "inline_base64",
+            "value": base64.b64encode(payload).decode(),
+            "sha256": checksum,
+        }
+    )
+    calls = []
+
+    def execute(req):
+        assert base64.b64decode(req.inputs[1].value) == payload
+        calls.append(req)
+        if fail_first and len(calls) == 1:
+            raise OSError("temporary GPU failure")
+        return [
+            server._artifact(
+                "result.json",
+                "application/json",
+                b'{"ok":true,"coverage":{"note_prompt_version":"evidence-notes/v2"}}',
+            )
+        ]
+
+    monkeypatch.setattr(server, "_execute", execute)
+    first = client.post("/api/worker/v1/jobs", headers=headers, json=request).json()
+    with session_scope() as session:
+        row = session.get(RemoteJob, first["job_id"])
+        assert row.input_manifest["input_payloads_released"] is True
+        assert all("value" not in item for item in row.input_manifest["inputs"])
+        assert row.input_manifest["inputs"][1]["sha256"] == checksum
+        assert row.status == ("failed" if fail_first else "succeeded")
+    second = client.post("/api/worker/v1/jobs", headers=headers, json=request).json()
+    assert second["job_id"] == first["job_id"]
+    status = client.get(f"/api/worker/v1/jobs/{first['job_id']}", headers=headers).json()
+    assert status["status"] == "succeeded"
+    assert len(calls) == (2 if fail_first else 1)
+    assert (
+        client.get(status["artifacts"][0]["download_url"], headers=headers).content
+        == b'{"ok":true,"coverage":{"note_prompt_version":"evidence-notes/v2"}}'
+    )
+
+
+def test_queued_upload_retained_until_cancelled(monkeypatch, tmp_path):
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import session_scope
+    from localplaud.remote import server
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    monkeypatch.setattr(server, "execute_job", lambda _: None)
+    request = _request("cancel-release-inputs")
+    job = client.post("/api/worker/v1/jobs", headers=headers, json=request).json()
+    with session_scope() as session:
+        assert session.get(RemoteJob, job["job_id"]).input_manifest["inputs"][0]["value"] == {
+            "segments": []
+        }
+    client.post(f"/api/worker/v1/jobs/{job['job_id']}/cancel", headers=headers)
+    with session_scope() as session:
+        row = session.get(RemoteJob, job["job_id"])
+        assert row.status == "cancelled"
+        assert row.completed_at is not None
+        assert "value" not in row.input_manifest["inputs"][0]
+
+
+def test_remote_diarization_artifact_reports_its_model(monkeypatch):
+    import base64
+
+    import localplaud.remote.server as server
+    from localplaud.config import Settings
+
+    monkeypatch.setattr(server, "get_settings", lambda: Settings())
+    monkeypatch.setattr(
+        "localplaud.worker.diarize.diarize",
+        lambda _path, transcript, _config: transcript,
+    )
+    transcript = {"segments": [], "has_speakers": False}
+    request = JobSubmitRequest(
+        idempotency_key="diarize-model",
+        stage=JobStage.diarize,
+        model="pyannote-requested",
+        inputs=[
+            InputReference(
+                name="audio",
+                media_type="audio/wav",
+                kind="inline_base64",
+                value=base64.b64encode(b"RIFF").decode(),
+            ),
+            InputReference(
+                name="transcript",
+                media_type="application/json",
+                kind="inline_json",
+                value=transcript,
+            ),
+        ],
+    )
+
+    artifact = server._execute(request)[0]
+    payload = json.loads(base64.b64decode(artifact["data_base64"]))
+
+    assert payload["model"] == "pyannote-requested"
+
+
+@pytest.mark.parametrize("stage", [JobStage.summarize, JobStage.outline])
+def test_client_verifies_artifact_checksum(stage):
+    expected = hashlib.sha256(b"expected").hexdigest()
+    job = JobResponse(
+        job_id="job",
+        idempotency_key="key",
+        stage=stage,
+        status=JobStatus.succeeded,
+        progress=1,
+        artifacts=[
+            ArtifactDescriptor(
+                name="result.json",
+                media_type="application/json",
+                size=8,
+                sha256=expected,
+                download_url="/artifact",
+            )
+        ],
+    )
+
+    def handler(request):
+        return httpx.Response(200, content=b"corrupt")
+
+    client = RemoteWorkerClient("http://worker/", "token", transport=httpx.MockTransport(handler))
+    with pytest.raises(ArtifactChecksumError):
+        client.wait(job)
+    client.close()
+
+
+def test_wait_clamps_poll_and_artifact_requests_to_one_deadline(monkeypatch):
+    import localplaud.remote.client as client_module
+
+    now = 100.0
+
+    def monotonic():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(client_module.time, "monotonic", monotonic)
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+    observed: list[tuple[str, float]] = []
+    payload = b"done"
+    checksum = hashlib.sha256(payload).hexdigest()
+
+    def handler(request):
+        timeouts = request.extensions["timeout"]
+        observed.append((request.url.path, max(timeouts.values())))
+        if request.url.path.endswith("/artifact"):
+            return httpx.Response(200, content=payload)
+        return httpx.Response(
+            200,
+            json={
+                "job_id": "job",
+                "idempotency_key": "key",
+                "stage": "summarize",
+                "status": "succeeded",
+                "progress": 1,
+                "artifacts": [
+                    {
+                        "name": "result.json",
+                        "media_type": "application/json",
+                        "size": len(payload),
+                        "sha256": checksum,
+                        "download_url": "/artifact",
+                    }
+                ],
+            },
+        )
+
+    queued = JobResponse(
+        job_id="job",
+        idempotency_key="key",
+        stage=JobStage.summarize,
+        status=JobStatus.queued,
+        progress=0,
+    )
+    client = RemoteWorkerClient(
+        "http://worker/", "token", timeout=100, transport=httpx.MockTransport(handler)
+    )
+    result = client.wait(queued, timeout=10, initial_backoff=2)
+    assert result.artifacts == {"result.json": payload}
+    assert observed == [("/api/worker/v1/jobs/job", 8.0), ("/artifact", 8.0)]
+    client.close()
+
+
+def test_submit_and_wait_includes_submit_in_the_end_to_end_deadline(monkeypatch):
+    import localplaud.remote.client as client_module
+
+    now = 50.0
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: now)
+    payload = b"done"
+    checksum = hashlib.sha256(payload).hexdigest()
+    observed: list[tuple[str, float]] = []
+
+    def handler(request):
+        nonlocal now
+        timeouts = request.extensions["timeout"]
+        observed.append((request.url.path, max(timeouts.values())))
+        if request.method == "POST":
+            now += 4
+            return httpx.Response(
+                200,
+                json={
+                    "job_id": "job",
+                    "idempotency_key": "same-job",
+                    "stage": "summarize",
+                    "status": "succeeded",
+                    "progress": 1,
+                    "artifacts": [
+                        {
+                            "name": "result.json",
+                            "media_type": "application/json",
+                            "size": len(payload),
+                            "sha256": checksum,
+                            "download_url": "/artifact",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, content=payload)
+
+    client = RemoteWorkerClient(
+        "http://worker/", "token", timeout=100, transport=httpx.MockTransport(handler)
+    )
+    result = client.submit_and_wait(JobSubmitRequest.model_validate(_request()), timeout=10)
+    assert result.artifacts == {"result.json": payload}
+    assert observed == [("/api/worker/v1/jobs", 10.0), ("/artifact", 6.0)]
+    client.close()
+
+
+def test_submit_and_wait_rejects_a_submit_that_consumes_the_deadline(monkeypatch):
+    import localplaud.remote.client as client_module
+
+    now = 10.0
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: now)
+
+    def handler(_request):
+        nonlocal now
+        now += 10
+        return httpx.Response(
+            200,
+            json={
+                "job_id": "job",
+                "idempotency_key": "same-job",
+                "stage": "summarize",
+                "status": "succeeded",
+                "progress": 1,
+                "artifacts": [],
+            },
+        )
+
+    client = RemoteWorkerClient(
+        "http://worker/", "token", timeout=100, transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(RemoteWorkerError, match="timed out"):
+        client.submit_and_wait(JobSubmitRequest.model_validate(_request()), timeout=10)
+    client.close()
+
+
+def test_worker_registry_creates_remote_connection_and_persists_handshake(monkeypatch, tmp_path):
+    from localplaud.db.models import ModelCatalogEntry, ProviderConnection, RemoteWorker
+    from localplaud.db.session import session_scope
+    from localplaud.remote.protocol import HandshakeResponse, StageCapability
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+
+    class FakeClient:
+        def handshake(self):
+            return HandshakeResponse(
+                worker_id="gpu-1",
+                capabilities=[StageCapability(stage="transcribe", models=["turbo"])],
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "localplaud.remote.registry.RemoteWorkerClient.from_config",
+        lambda config: FakeClient(),
+    )
+    created = client.post(
+        "/api/providers/workers",
+        headers=headers,
+        json={
+            "key": "gpu-1",
+            "name": "GPU 1",
+            "base_url": "https://worker.example/",
+            "token_env": "LOCALPLAUD_WORKER_TOKEN",
+        },
+    )
+    assert created.status_code == 201
+    worker_id = created.json()["id"]
+    health = client.post(f"/api/providers/workers/{worker_id}/health", headers=headers)
+    assert health.json()["status"] == "healthy"
+    with session_scope() as session:
+        worker = session.get(RemoteWorker, worker_id)
+        assert worker.protocol_version == "1"
+        connection = session.query(ProviderConnection).filter_by(key="worker:gpu-1").one()
+        assert connection.execution_target == "remote_worker"
+        assert connection.secret_ref == "env:LOCALPLAUD_WORKER_TOKEN"
+        assert "worker-secret" not in str(connection.config)
+        model = session.query(ModelCatalogEntry).filter_by(connection_id=connection.id).one()
+        assert model.model_key == "turbo"
+        assert model.capabilities["execution_target"] == "remote_worker"
+        connection_id = connection.id
+        model_id = model.id
+
+    renamed = client.put(
+        f"/api/providers/workers/{worker_id}",
+        headers=headers,
+        json={
+            "key": "gpu-renamed",
+            "name": "GPU renamed",
+            "base_url": "https://renamed.example/",
+            "token_env": "LOCALPLAUD_WORKER_TOKEN",
+            "enabled": True,
+        },
+    )
+    assert renamed.status_code == 200
+    with session_scope() as session:
+        assert session.query(ProviderConnection).filter_by(key="worker:gpu-1").first() is None
+        connection = session.query(ProviderConnection).filter_by(key="worker:gpu-renamed").one()
+        model = session.get(ModelCatalogEntry, model_id)
+        assert connection.id == connection_id
+        assert model.connection_id == connection_id
+
+    disabled = client.put(
+        f"/api/providers/workers/{worker_id}",
+        headers=headers,
+        json={
+            "key": "gpu-renamed",
+            "name": "GPU renamed",
+            "base_url": "https://renamed.example/",
+            "token_env": "LOCALPLAUD_WORKER_TOKEN",
+            "enabled": False,
+        },
+    )
+    assert disabled.status_code == 200
+    from localplaud.providers.resolver import ResolutionError, resolve_profile
+    from localplaud.providers.service import _capability_catalog, _connection_catalog
+
+    with session_scope() as session:
+        with pytest.raises(ResolutionError, match="unknown provider/model"):
+            resolve_profile(
+                [
+                    {
+                        "key": "disabled-worker",
+                        "stages": {
+                            "transcribe": {
+                                "connection": "worker:gpu-renamed",
+                                "model": "turbo",
+                            }
+                        },
+                    }
+                ],
+                _capability_catalog(session),
+                _connection_catalog(session),
+            )
+    assert client.delete(f"/api/providers/workers/{worker_id}", headers=headers).status_code == 204
+
+
+def test_worker_rename_collision_preserves_existing_identity(monkeypatch, tmp_path):
+    from localplaud.db.models import ProviderConnection, RemoteWorker
+    from localplaud.db.session import session_scope
+    from localplaud.remote.registry import save_worker
+
+    client = _client(monkeypatch, tmp_path)
+    with session_scope() as session:
+        created = save_worker(
+            session,
+            {
+                "key": "source",
+                "name": "Source",
+                "base_url": "https://source.example/",
+                "token_env": "LOCALPLAUD_WORKER_TOKEN",
+            },
+        )
+        worker_id = created["id"]
+        original_connection_id = (
+            session.query(ProviderConnection).filter_by(key="worker:source").one().id
+        )
+        session.add(
+            ProviderConnection(
+                key="worker:taken",
+                name="Taken",
+                provider_type="localplaud-worker",
+            )
+        )
+
+    response = client.put(
+        f"/api/providers/workers/{worker_id}",
+        headers={"authorization": "Bearer worker-secret"},
+        json={
+            "key": "taken",
+            "name": "Changed",
+            "base_url": "https://changed.example/",
+            "token_env": "LOCALPLAUD_WORKER_TOKEN",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "provider connection key already exists" in response.json()["detail"]
+    with session_scope() as session:
+        assert session.get(RemoteWorker, worker_id).key == "source"
+        assert session.query(ProviderConnection).filter_by(key="worker:source").one().id == (
+            original_connection_id
+        )
+
+
+def test_worker_update_is_fenced_by_active_processing(monkeypatch, tmp_path):
+    from localplaud.db.models import PlaudFile, ProviderConnection, RemoteWorker
+    from localplaud.db.session import session_scope
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    created = client.post(
+        "/api/providers/workers",
+        headers=headers,
+        json={
+            "key": "gpu-1",
+            "name": "GPU 1",
+            "base_url": "https://worker.example/",
+            "token_env": "LOCALPLAUD_WORKER_TOKEN",
+        },
+    )
+    worker_id = created.json()["id"]
+    with session_scope() as session:
+        session.add(
+            PlaudFile(
+                id="busy",
+                processing_token="active-worker",
+                processing_lease_until=datetime.now(UTC) + timedelta(minutes=5),
+            )
+        )
+
+    response = client.put(
+        f"/api/providers/workers/{worker_id}",
+        headers=headers,
+        json={
+            "key": "gpu-1",
+            "name": "Changed GPU",
+            "base_url": "https://changed.example/",
+            "token_env": "CHANGED_WORKER_TOKEN",
+            "timeout": 15,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "processing" in response.json()["detail"]
+    with session_scope() as session:
+        worker = session.get(RemoteWorker, worker_id)
+        connection = session.query(ProviderConnection).filter_by(key="worker:gpu-1").one()
+        assert worker.name == "GPU 1"
+        assert worker.base_url == "https://worker.example/"
+        assert connection.name == "GPU 1"
+        assert connection.config["base_url"] == "https://worker.example/"
+        assert connection.secret_ref == "env:LOCALPLAUD_WORKER_TOKEN"
+
+
+def test_remote_dispatch_uses_resolved_non_secret_configuration(monkeypatch):
+    import localplaud.worker.pipeline as pipeline
+
+    observed = {}
+
+    class FakeClient:
+        def submit_and_wait(self, request, timeout):
+            observed["request"] = request
+            observed["timeout"] = timeout
+            return SimpleNamespace(
+                artifacts={"result.json": json.dumps({"model": "summary-model"}).encode()}
+            )
+
+        def close(self):
+            observed["closed"] = True
+
+    def from_config(config):
+        observed["config"] = config
+        return FakeClient()
+
+    monkeypatch.setattr(pipeline.RemoteWorkerClient, "from_config", from_config)
+    snapshot = {
+        "stages": {
+            "summarize": {
+                "connection": "worker:deleted-after-resolution",
+                "model": "summary-model",
+                "execution_target": "remote_worker",
+                "configuration": {
+                    "base_url": "https://snapshot.example/",
+                    "timeout": 9,
+                    "job_timeout": 27,
+                },
+                "secret_ref": "env:SNAPSHOT_WORKER_TOKEN",
+            }
+        }
+    }
+
+    result = pipeline._run_remote_stage(
+        "recording", snapshot, "summarize", [pipeline._remote_json_input("transcript", {})]
+    )
+
+    assert result["model"] == "summary-model"
+    assert observed["config"] == {
+        "base_url": "https://snapshot.example/",
+        "timeout": 9,
+        "job_timeout": 27,
+        "token_env": "SNAPSHOT_WORKER_TOKEN",
+    }
+    assert observed["timeout"] == 27
+    assert "worker-secret" not in str(observed["config"])
+    assert observed["closed"] is True
+
+
+@pytest.mark.parametrize("stage", ["transcribe", "diarize", "summarize", "mind_map", "embed"])
+@pytest.mark.parametrize(
+    ("returned_model", "message"),
+    [(None, "returned no model"), ("wrong-model", "different model")],
+)
+def test_remote_stage_requires_exact_returned_model(monkeypatch, stage, returned_model, message):
+    import localplaud.worker.pipeline as pipeline
+
+    class FakeClient:
+        def submit_and_wait(self, request, timeout):
+            payload = {} if returned_model is None else {"model": returned_model}
+            return SimpleNamespace(artifacts={"result.json": json.dumps(payload).encode()})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pipeline.RemoteWorkerClient, "from_config", lambda _config: FakeClient())
+    snapshot = {
+        "stages": {
+            stage: {
+                "connection": "worker:test",
+                "model": "requested-model",
+                "execution_target": "remote_worker",
+                "configuration": {"base_url": "https://worker.example/"},
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match=message):
+        pipeline._run_remote_stage(
+            "recording", snapshot, stage, [pipeline._remote_json_input("transcript", {})]
+        )
+
+
+def test_pipeline_uses_remote_transcribe_selection(monkeypatch, tmp_path):
+    import localplaud.db.session as db_session
+    import localplaud.worker.pipeline as pipeline
+    from localplaud.config import Settings, get_settings
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import init_db, session_scope
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path / 'pipeline.db'}")
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    init_db()
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFFremote")
+    with session_scope() as session:
+        session.add(PlaudFile(id="remote", status=FileStatus.downloaded, audio_path=str(audio)))
+
+    snapshot = {
+        "policy": {"no_egress": False, "fallback_policy": {}},
+        "stages": {
+            "transcribe": {
+                "connection": "asr:worker",
+                "model": "turbo",
+                "options": {},
+                "execution_target": "remote_worker",
+                "data_egress": True,
+            }
+        },
+        "layers": ["test"],
+    }
+
+    class Resolved:
+        def to_dict(self):
+            return snapshot
+
+    monkeypatch.setattr(
+        pipeline,
+        "resolve_recording_profile",
+        lambda session, file_id, **_kwargs: Resolved(),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_run_remote_stage",
+        lambda *args, **kwargs: {
+            "segments": [{"text": "remote transcript", "start": 0, "end": 1}],
+            "language": "en",
+            "model": "turbo",
+        },
+    )
+    settings = Settings(
+        pipeline={
+            "convert": False,
+            "diarize": False,
+            "summarize": False,
+            "mind_map": False,
+            "index": False,
+        }
+    )
+    pipeline.process_file("remote", settings)
+    with session_scope() as session:
+        file = session.get(PlaudFile, "remote")
+        transcript = file.local_transcript
+        assert transcript.text == "remote transcript"
+        assert transcript.provider == "remote-worker"
+        assert (
+            next(run for run in file.stage_runs if run.stage == "transcribe").provider
+            == "remote-worker"
+        )
+
+
+@pytest.mark.parametrize(
+    ("returned_model", "message"),
+    [(None, "returned no model"), ("wrong-space", "different model")],
+)
+def test_pipeline_remote_embedding_requires_exact_returned_model(
+    monkeypatch, tmp_path, returned_model, message
+):
+    import localplaud.db.session as db_session
+    import localplaud.worker.pipeline as pipeline
+    from localplaud.config import get_settings
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.session import init_db, session_scope
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path / 'embed.db'}")
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    init_db()
+    with session_scope() as session:
+        session.add(PlaudFile(id="remote-embed"))
+    snapshot = {
+        "stages": {
+            "embed": {
+                "connection": "worker:gpu",
+                "model": "requested-space",
+                "execution_target": "remote_worker",
+            }
+        }
+    }
+    token = pipeline._PROFILE_SNAPSHOT.set(snapshot)
+    try:
+        with pytest.raises(ValueError, match=message):
+            pipeline._persist_remote_chunks(
+                "remote-embed",
+                {"chunks": [], "vectors_base64": [], "model": returned_model, "dim": 1},
+            )
+    finally:
+        pipeline._PROFILE_SNAPSHOT.reset(token)
+
+
+def test_remote_provider_timeouts_are_bounded_below_dispatch_lease():
+    from localplaud.remote.client import (
+        MAX_PROVIDER_TIMEOUT_SECONDS,
+        validate_provider_timeout,
+    )
+
+    assert validate_provider_timeout(MAX_PROVIDER_TIMEOUT_SECONDS, field="job_timeout") == (
+        MAX_PROVIDER_TIMEOUT_SECONDS
+    )
+    with pytest.raises(ValueError, match="no more than"):
+        validate_provider_timeout(
+            MAX_PROVIDER_TIMEOUT_SECONDS + 1,
+            field="job_timeout",
+        )
+
+
+def test_worker_rejects_unsupported_note_policy_before_starting_job(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    request = _request("unsupported-note-policy")
+    request["options"] = {"note_prompt_version": "recording-notes/future"}
+    response = client.post(
+        "/api/worker/v1/jobs", json=request, headers={"Authorization": "Bearer worker-secret"}
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "note prompt version is unsupported"
+
+
+def test_unversioned_legacy_note_cache_is_rebuilt_then_reused(monkeypatch, tmp_path):
+    import base64
+
+    import localplaud.remote.server as server
+    from localplaud.db.models import RemoteJob
+    from localplaud.db.session import session_scope
+    from localplaud.worker.note_policy import NOTE_PROMPT_VERSION
+
+    client = _client(monkeypatch, tmp_path)
+    calls = []
+
+    def execute(request):
+        calls.append(request)
+        payload = {"coverage": {"note_prompt_version": NOTE_PROMPT_VERSION}, "content_md": "Valid"}
+        return [server._artifact("result.json", "application/json", json.dumps(payload).encode())]
+
+    monkeypatch.setattr(server, "_execute", execute)
+    headers = {"authorization": "Bearer worker-secret"}
+    first = client.post("/api/worker/v1/jobs", headers=headers, json=_request()).json()
+    with session_scope() as session:
+        row = session.get(RemoteJob, first["job_id"])
+        row.artifacts = [
+            server._artifact("result.json", "application/json", b'{"content_md":"old"}')
+        ]
+    for _ in range(2):
+        response = client.post("/api/worker/v1/jobs", headers=headers, json=_request())
+        assert response.status_code == 200
+        assert response.json()["job_id"] == first["job_id"]
+    assert len(calls) == 2
+    with session_scope() as session:
+        row = session.get(RemoteJob, first["job_id"])
+        payload = json.loads(base64.b64decode(row.artifacts[0]["data_base64"]))
+        assert payload["coverage"]["note_prompt_version"] == NOTE_PROMPT_VERSION
+
+
+@pytest.mark.parametrize("error_kind", ["input", "output"])
+def test_remote_invalid_model_output_allows_only_configured_fallback(
+    monkeypatch, tmp_path, error_kind
+):
+    import localplaud.remote.server as server
+    from localplaud.llm.base import LLMInputTooLarge, LLMOutputInvalid
+
+    client = _client(monkeypatch, tmp_path)
+    error = LLMInputTooLarge if error_kind == "input" else LLMOutputInvalid
+
+    def fail(request):
+        raise error("model could not return complete output")
+
+    monkeypatch.setattr(server, "_execute", fail)
+    headers = {"authorization": "Bearer worker-secret"}
+    submitted = client.post("/api/worker/v1/jobs", headers=headers, json=_request()).json()
+    result = client.get("/api/worker/v1/jobs/" + submitted["job_id"], headers=headers).json()
+    assert result["status"] == "failed"
+    assert result["error"]["retryable"] is True
+    assert not result["artifacts"]
+
+
+def test_handshake_runtime_is_optional_for_older_workers():
+    from localplaud.remote.protocol import HandshakeResponse
+
+    legacy = HandshakeResponse.model_validate(
+        {
+            "protocol": "localplaud-worker",
+            "version": "1",
+            "worker_id": "wsl-old",
+            "capabilities": [{"stage": "transcribe", "models": ["turbo"]}],
+        }
+    )
+    assert legacy.runtime is None
+    newer = HandshakeResponse.model_validate(
+        {
+            "worker_id": "wsl-new",
+            "capabilities": [],
+            "runtime": {"device": "RTX 5060", "queued_jobs": 2, "future_field": "ignored"},
+        }
+    )
+    assert newer.runtime.device == "RTX 5060"
+    assert newer.runtime.queued_jobs == 2
+    assert newer.runtime.memory_total_mb is None
+
+
+def test_worker_handshake_reports_runtime_queue_depth(monkeypatch, tmp_path):
+    import localplaud.remote.server as server
+
+    monkeypatch.setattr(
+        server,
+        "_static_runtime",
+        lambda: {"software_version": "9.9", "device": "Test GPU", "memory_total_mb": 8192},
+    )
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    runtime = client.get("/api/worker/v1/capabilities", headers=headers).json()["runtime"]
+    assert runtime == {
+        "software_version": "9.9",
+        "device": "Test GPU",
+        "memory_total_mb": 8192,
+        "memory_available_mb": None,
+        "queued_jobs": 0,
+        "running_jobs": 0,
+    }
+
+
+def test_settings_renders_worker_runtime_and_not_reported_for_legacy(monkeypatch, tmp_path):
+    from localplaud.remote.protocol import HandshakeResponse, StageCapability, WorkerRuntime
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    replies = iter(
+        [
+            HandshakeResponse(
+                worker_id="gpu-new",
+                capabilities=[StageCapability(stage="transcribe", models=["turbo"])],
+                runtime=WorkerRuntime(
+                    device="RTX 5060 (8151 MB)",
+                    memory_total_mb=32768,
+                    queued_jobs=3,
+                    running_jobs=1,
+                    software_version="0.9.0",
+                ),
+            ),
+            HandshakeResponse(
+                worker_id="gpu-old",
+                capabilities=[StageCapability(stage="diarize", models=["pyannote"])],
+            ),
+        ]
+    )
+
+    class FakeClient:
+        def handshake(self):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "localplaud.remote.registry.RemoteWorkerClient.from_config",
+        lambda config: FakeClient(),
+    )
+    ids = []
+    for key in ("gpu-new", "gpu-old"):
+        created = client.post(
+            "/api/providers/workers",
+            headers=headers,
+            json={"key": key, "name": key.upper(), "base_url": f"https://{key}.example/"},
+        )
+        assert created.status_code == 201
+        ids.append(created.json()["id"])
+        health = client.post(f"/api/providers/workers/{ids[-1]}/health", headers=headers)
+        assert health.json()["status"] == "healthy"
+        assert health.json()["checked_at"]
+
+    workers = client.get("/api/providers/workers", headers=headers).json()["workers"]
+    assert workers[0]["health"]["runtime"]["queued_jobs"] == 3
+    assert workers[1]["health"]["runtime"] is None
+
+    # A failed check keeps the last reported runtime and last healthy time.
+    replies = iter([RuntimeError("connection refused")])
+    failed = client.post(f"/api/providers/workers/{ids[0]}/health", headers=headers).json()
+    assert failed["status"] == "unavailable"
+    assert failed["runtime"]["device"] == "RTX 5060 (8151 MB)"
+    assert failed["last_healthy_at"]
+
+    page = client.get("/settings", headers=headers)
+    assert page.status_code == 200
+    assert "RTX 5060 (8151 MB)" in page.text
+    assert "32.0 GB" in page.text
+    assert "3 queued · 1 running" in page.text
+    assert "not reported" in page.text
+    assert f'id="worker-checked-{ids[0]}"><time datetime=' in page.text
+    assert "transcribe · turbo" in page.text
+
+
+@pytest.mark.parametrize("advertised", [False, True])
+def test_outline_dispatch_requires_capability_and_has_stable_job_id(monkeypatch, advertised):
+    from localplaud.remote.protocol import HandshakeResponse, StageCapability
+    from localplaud.worker import pipeline
+
+    requests = []
+
+    class Client:
+        def handshake(self):
+            return HandshakeResponse(
+                worker_id="old-or-new",
+                capabilities=[
+                    StageCapability(stage="outline" if advertised else "mind_map", models=["model"])
+                ],
+            )
+
+        def submit_and_wait(self, request, **kwargs):
+            requests.append(request)
+            return SimpleNamespace(artifacts={"result.json": b'{"model":"model"}'})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pipeline.RemoteWorkerClient, "from_config", lambda cfg: Client())
+    snapshot = {
+        "stages": {
+            "outline": {"execution_target": "remote_worker", "model": "model", "configuration": {}}
+        }
+    }
+    inputs = [pipeline._remote_json_input("transcript", {"segments": []})]
+    if not advertised:
+        with pytest.raises(RemoteWorkerError, match="outline capability unavailable") as error:
+            pipeline._run_remote_stage("owned", snapshot, "outline", inputs)
+        assert error.value.retryable and requests == []
+    else:
+        for _ in range(2):
+            assert (
+                pipeline._run_remote_stage("owned", snapshot, "outline", inputs)["model"] == "model"
+            )
+        assert requests[0].idempotency_key == requests[1].idempotency_key
+        assert requests[0].stage == JobStage.outline
+
+
+def test_outline_worker_handler_and_checksums(monkeypatch, tmp_path):
+    from localplaud.worker import outline
+
+    client = _client(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        outline,
+        "generate_outline",
+        lambda transcript, settings, **kw: {
+            "chapters": [{"start_ms": 0, "end_ms": kw["duration_ms"], "title": "Tail"}],
+            "model": "test",
+            "provider": "test-provider",
+            "method": "llm",
+            "prompt_version": outline.PROMPT_VERSION,
+        },
+    )
+    request = _request("outline-idempotent") | {
+        "stage": "outline",
+        "options": {"duration_ms": 1000, "prompt_version": outline.PROMPT_VERSION},
+    }
+    headers = {"authorization": "Bearer worker-secret"}
+    response = client.post("/api/worker/v1/jobs", json=request, headers=headers)
+    assert response.status_code == 200
+    job = client.get("/api/worker/v1/jobs/" + response.json()["job_id"], headers=headers).json()
+    assert job["status"] == "succeeded"
+    artifact = job["artifacts"][0]
+    result = client.get(artifact["download_url"], headers=headers).content
+    assert hashlib.sha256(result).hexdigest() == artifact["sha256"]
+    assert json.loads(result)["chapters"][-1]["end_ms"] == 1000
+    repeat = client.post("/api/worker/v1/jobs", json=request, headers=headers).json()
+    assert repeat["job_id"] == job["job_id"]
+    assert any(
+        c["stage"] == "outline"
+        for c in client.get("/api/worker/v1/capabilities", headers=headers).json()["capabilities"]
+    )
+    request["options"]["prompt_version"] = "future"
+    assert client.post("/api/worker/v1/jobs", json=request, headers=headers).status_code == 409
+
+
+def test_killed_speech_process_is_reported_as_resource_exhaustion(monkeypatch, tmp_path):
+    import localplaud.remote.server as server
+    from localplaud.asr.base import AsrError, AsrResourceError
+
+    client = _client(monkeypatch, tmp_path)
+    headers = {"authorization": "Bearer worker-secret"}
+    real_execute_job = server.execute_job
+    monkeypatch.setattr(server, "execute_job", lambda job_id: None)
+    outcomes = {}
+    for key, error in (
+        ("killed", AsrResourceError("nemotron GPU process failed (exit -9)")),
+        ("broken", AsrError("nemotron GPU process failed (exit 1)")),
+    ):
+        monkeypatch.setattr(
+            server, "_execute", lambda request, error=error: (_ for _ in ()).throw(error)
+        )
+        job = client.post("/api/worker/v1/jobs", headers=headers, json=_request(key)).json()
+        real_execute_job(job["job_id"])
+        outcomes[key] = client.get(f"/api/worker/v1/jobs/{job['job_id']}", headers=headers).json()[
+            "error"
+        ]
+
+    assert outcomes["killed"]["code"] == "worker_resource_exhausted"
+    assert outcomes["killed"]["retryable"] is True
+    # A deterministic failure keeps its old classification and is not retried.
+    assert outcomes["broken"]["code"] == "stage_execution_failed"
+    assert outcomes["broken"]["retryable"] is False
+
+
+def test_client_error_carries_the_worker_failure_code():
+    error = RemoteWorkerError("x", retryable=True, code="worker_resource_exhausted")
+    assert error.code == "worker_resource_exhausted"
+    assert RemoteWorkerError("y").code is None

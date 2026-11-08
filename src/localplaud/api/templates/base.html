@@ -1,0 +1,307 @@
+{%- set show_tabbar = active in ('home', 'recordings', 'discover', 'explore') and request.url.path in ('/', '/home', '/discover', '/explore') -%}
+{% if not partial_response %}
+<!doctype html>
+<html lang="{{ workspace_preferences.locale }}" data-density="{{ workspace_preferences.density }}" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{% block title %}localplaud{% endblock %}</title>
+  <meta name="application-name" content="localplaud">
+  <meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="localplaud">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+  <script>/* Apply persisted appearance and panel state before first paint. */
+    try{const root=document.documentElement,mode=localStorage.getItem('localplaud:appearance')||'system';
+    root.dataset.appearanceMode=mode;root.dataset.appearance=mode==='system'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):mode;
+    if(localStorage.getItem('localplaud:nav-collapsed')==='1')root.classList.add('lp-nav-collapsed');
+    if(localStorage.getItem('localplaud:list-collapsed')==='1')root.classList.add('lp-list-collapsed');}catch(_e){}</script>
+  <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/css/workspace.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/css/surfaces.css?v={{ asset_version }}">
+  <script src="/static/htmx-1.9.12.min.js"></script>
+  <script>
+    window.localplaudT = message => ({{ translations|tojson }})[message] || message;
+    window.spkColor = (() => { const m={}, n=8; let i=0;
+      return s => { if(!s) return null; if(!(s in m)) m[s]=i++%n; return m[s]; }; })();
+    window.localplaudModal = ({backdrop,background=[],cleanupSignal,dirtyMessage}) => {
+      let opener=null,inertState=new Map();
+      const focusables=()=>[...backdrop.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(item=>!item.closest('[hidden]'));
+      const close=({restoreFocus=true,force=false}={})=>{
+        if(backdrop.hidden)return true;
+        if(!force&&backdrop.dataset.busy==='true')return false;
+        if(!force&&backdrop.dataset.dirty==='true'&&dirtyMessage&&!confirm(dirtyMessage))return false;
+        backdrop.hidden=true;backdrop.dataset.dirty='false';backdrop.dataset.busy='false';backdrop.removeAttribute('aria-busy');
+        inertState.forEach((wasInert,region)=>{region.inert=wasInert;});inertState.clear();
+        document.body.classList.remove('dialog-open');
+        backdrop.dispatchEvent(new CustomEvent('localplaud:modal-close'));
+        if(restoreFocus)opener?.focus();opener=null;return true;
+      };
+      const open=(trigger,preferredFocus)=>{
+        if(!backdrop.hidden)return;
+        opener=trigger||document.activeElement;backdrop.dataset.busy='false';backdrop.removeAttribute('aria-busy');
+        const regions=[...new Set((typeof background==='function'?background():background).filter(Boolean))];
+        inertState=new Map(regions.map(region=>[region,region.inert]));
+        regions.forEach(region=>{region.inert=true;});
+        backdrop.hidden=false;document.body.classList.add('dialog-open');
+        requestAnimationFrame(()=>{(preferredFocus||focusables()[0])?.focus();});
+      };
+      backdrop.addEventListener('click',event=>{if(event.target===backdrop)close();});
+      document.addEventListener('keydown',event=>{
+        if(backdrop.hidden)return;
+        if(event.key==='Escape'){event.preventDefault();close();return;}
+        if(event.key!=='Tab')return;
+        const items=focusables();if(!items.length){event.preventDefault();return;}
+        const first=items[0],last=items.at(-1);
+        if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}
+        else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
+      },cleanupSignal?{signal:cleanupSignal}:undefined);
+      cleanupSignal?.addEventListener('abort',()=>close({restoreFocus:false,force:true}),{once:true});
+      return {open,close,setDirty:value=>{backdrop.dataset.dirty=String(Boolean(value));},setBusy:value=>{backdrop.dataset.busy=String(Boolean(value));if(value)backdrop.setAttribute('aria-busy','true');else backdrop.removeAttribute('aria-busy');}};
+    };
+  </script>
+  <script src="/static/js/app.js?v={{ asset_version }}"></script>
+  {% block page_head %}{% endblock %}
+</head>
+<body class="app{% if show_tabbar %} has-tabbar{% endif %}"{% if ask_enabled|default(false) %} data-ask-enabled{% endif %}{% if account_user|default(None) %} hx-history="false"{% endif %}>
+  {% include "_icons.html" %}
+  <a class="skip-link" href="#app-view">{{ t('Skip to content') }}</a>
+  <aside class="sidebar" id="workspace-sidebar">
+    <div class="sidebar-brand">
+      <a class="brand" href="/home" aria-label="{{ t('localplaud home') }}"><img class="brand-mark" src="/static/logo.svg" alt=""><span class="brand-word">local<b>plaud</b></span></a>
+      <button class="icon-btn icon-btn-sm sidebar-collapse" type="button" data-collapse-toggle="nav" aria-label="{{ t('Collapse sidebar') }}" data-tooltip="{{ t('Collapse sidebar') }} ([)" aria-expanded="true" aria-controls="workspace-sidebar">{{ icon('sidebar-close', 'sm') }}</button>
+      <button class="icon-btn nav-close" type="button" data-nav-close aria-label="{{ t('Close menu') }}">{{ icon('x') }}</button>
+    </div>
+    <div class="menu-wrap" style="display:block">
+      <button class="ws-switch" id="workspace-menu-button" type="button" data-menu="workspace-menu" aria-haspopup="menu" aria-expanded="false" aria-controls="workspace-menu"><span class="ws-avatar" aria-hidden="true">{{ workspace_preferences.workspace_name | initials }}</span><span class="ws-name">{{ workspace_preferences.workspace_name }}</span>{{ icon('chevron-down', 'sm') }}</button>
+      <div class="menu ws-menu" id="workspace-menu" role="menu" aria-labelledby="workspace-menu-button" hidden>
+        <div class="ws-menu-head"><span class="ws-avatar" aria-hidden="true">{{ workspace_preferences.workspace_name | initials }}</span><span class="truncate"><strong class="t-strong">{{ workspace_preferences.workspace_name }}</strong><br><span class="t-meta">{{ t('Self-hosted workspace') }}</span></span></div>
+        <div class="menu-sep"></div>
+        {% if account_user|default(None) %}
+        <div class="menu-label">{{ account_user.username }} · {{ '擁有者' if account_user.role == 'owner' else '成員' }}</div>
+        <a class="menu-item" role="menuitem" href="/account">{{ icon('user') }}我的帳號</a>
+        {% if account_user.role == 'owner' %}<a class="menu-item" role="menuitem" href="/admin/users">{{ icon('users') }}帳號管理</a>{% endif %}
+        {% endif %}
+        <a class="menu-item" role="menuitem" href="/settings">{{ icon('settings') }}{{ t('Settings') }}</a>
+        <a class="menu-item" role="menuitem" href="/status">{{ icon('activity') }}{{ t('System status') }}</a>
+        <a class="menu-item" role="menuitem" href="/notes">{{ icon('note') }}{{ t('Saved notes') }}</a>
+        <a class="menu-item" role="menuitem" href="/notifications">{{ icon('bell') }}{{ t('Notifications') }}{% if unread_notifications %}<span class="badge" style="margin-left:auto">{{ unread_notifications if unread_notifications < 100 else '99+' }}</span>{% endif %}</a>
+        <div class="menu-sep"></div>
+        <div class="menu-label" id="appearance-label">{{ t('Appearance') }}</div>
+        <div class="appearance-row"><div class="segmented" role="group" aria-labelledby="appearance-label">
+          <button type="button" data-appearance-set="light" aria-pressed="false">{{ icon('sun', 'xs') }}{{ t('Light') }}</button>
+          <button type="button" data-appearance-set="dark" aria-pressed="false">{{ icon('moon', 'xs') }}{{ t('Dark') }}</button>
+          <button type="button" data-appearance-set="system" aria-pressed="false">{{ icon('monitor', 'xs') }}{{ t('Auto') }}</button>
+        </div></div>
+        <button class="menu-item" role="menuitem" type="button" data-dialog-open="shortcuts-dialog">{{ icon('keyboard') }}{{ t('Keyboard shortcuts') }}<span class="menu-hint">?</span></button>
+        {% if web_login_configured %}<div class="menu-sep"></div><form method="post" action="/logout"><button class="menu-item" role="menuitem" type="submit">{{ icon('log-out') }}{{ t('Log out') }}</button></form>{% endif %}
+      </div>
+    </div>
+    <div class="add-wrap">
+      <button class="add-audio" id="add-audio-button" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="add-audio-menu">{{ icon('plus', 'sm') }}<span class="add-label">{{ t('Add audio') }}</span></button>
+      <div class="menu add-menu" id="add-audio-menu" role="menu" hidden>
+        <button class="menu-item" type="button" role="menuitem" data-import-mode="device">{{ icon('upload') }}<span>{{ t('Import audio') }}<small>{{ t('From this device') }}</small></span></button>
+        <button class="menu-item" type="button" role="menuitem" data-import-mode="plaud">{{ icon('cloud') }}<span>{{ t('Import from Plaud') }}<small>{{ t('Metadata first · audio on demand') }}</small></span></button>
+      </div>
+    </div>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-scroll">
+      <nav aria-label="{{ t('Personal') }}"><ul class="nav-list">
+        <li><a class="nav-item {% if active=='search' %}on{% endif %}" href="/search" data-shortcut-hint="Ctrl K">{{ icon('search') }}<span class="nav-label">{{ t('Search') }}</span></a></li>
+        <li><a class="nav-item {% if active=='home' %}on{% endif %}" href="/home">{{ icon('home') }}<span class="nav-label">{{ t('Home') }}</span></a></li>
+        {% if ask_enabled|default(false) %}<li><a class="nav-item {% if active=='ask' %}on{% endif %}" href="/ask">{{ icon('sparkles') }}<span class="nav-label">{{ t('Ask') }}</span></a></li>{% endif %}
+        <li><a class="nav-item {% if active=='templates' %}on{% endif %}" href="/templates">{{ icon('template') }}<span class="nav-label">{{ t('Templates') }}</span></a></li>
+        <li><a class="nav-item {% if active=='discover' %}on{% endif %}" href="/discover">{{ icon('grid') }}<span class="nav-label">{{ t('Discover') }}</span></a></li>
+      </ul></nav>
+      <div class="sidebar-divider" style="margin:16px 0"></div>
+      <nav aria-label="{{ t('Library') }}"><ul class="nav-list">
+        <li><a class="nav-item {% if active=='recordings' and request.query_params.get('view','all')=='all' and not request.query_params.get('folder') and not request.query_params.get('tag') and not request.query_params.get('origin') and not request.query_params.get('scene') %}on{% endif %}" href="/">{{ icon('files') }}<span class="nav-label">{{ t('All files') }}</span><span class="nav-count">({{ sidebar.counts.all }})</span></a></li>
+        <li><a class="nav-item {% if active=='recordings' and request.query_params.get('view')=='uncategorized' %}on{% endif %}" href="/?view=uncategorized" title="{{ t('Recordings without a folder or tag') }}">{{ icon('inbox') }}<span class="nav-label">{{ t('Unfiled') }}</span><span class="nav-count">({{ sidebar.counts.uncategorized }})</span></a></li>
+        <li><a class="nav-item {% if active=='recordings' and request.query_params.get('view')=='trash' %}on{% endif %}" href="/?view=trash">{{ icon('trash') }}<span class="nav-label">{{ t('Trash') }}</span><span class="nav-count">({{ sidebar.counts.trash }})</span></a></li>
+      </ul></nav>
+      <nav class="nav-group" aria-label="{{ t('Folders') }}">
+        <div class="nav-group-head">
+          <button class="nav-group-toggle" type="button" data-collapse-group="folders" aria-expanded="true" aria-controls="sidebar-folders">{{ t('Folders') }}{{ icon('chevron-down', 'sm') }}</button>
+          <button class="icon-btn icon-btn-sm" type="button" data-folder-create aria-label="{{ t('New folder') }}" data-tooltip="{{ t('New folder') }}">{{ icon('plus', 'sm') }}</button>
+        </div>
+        <ul class="nav-list" id="sidebar-folders">
+          {% for folder in sidebar.folders %}<li><a class="nav-item {% if active=='recordings' and request.query_params.get('folder')==(folder.id|string) %}on{% endif %}" href="/?folder={{ folder.id }}" title="{{ folder.name }}"><span class="folder-glyph" style="--folder-color:{{ folder.color or 'var(--c-text-2)' }}">{{ icon('folder') }}</span><span class="nav-label">{{ folder.name }}</span><span class="nav-count">({{ folder.count }})</span></a></li>
+          {% else %}<li><button class="nav-item" type="button" data-folder-create style="width:100%;border:0;background:transparent;text-align:left;color:var(--c-text-2)">{{ icon('folder-plus') }}<span class="nav-label">{{ t('Create a folder') }}</span></button></li>{% endfor %}
+        </ul>
+      </nav>
+      {%- set stags = sidebar.tags or {} -%}
+      {% if stags.total %}<nav class="nav-group" aria-label="{{ t('Tags') }}" data-testid="sidebar-tags">
+        <div class="nav-group-head"><button class="nav-group-toggle" type="button" data-collapse-group="tags" aria-expanded="true" aria-controls="sidebar-tags">{{ t('Tags') }}{{ icon('chevron-down', 'sm') }}</button></div>
+        <ul class="nav-list" id="sidebar-tags">
+          {% for tag in stags['items'] %}<li><a class="nav-item {% if active=='recordings' and request.query_params.get('tag')==(tag.id|string) %}on{% endif %}" href="/?tag={{ tag.id }}" title="{{ tag.name }}"><span class="tag-glyph"{% if tag.color %} style="--tag-color:{{ tag.color }}"{% endif %}>{{ icon('tag') }}</span><span class="nav-label">{{ tag.name }}</span><span class="nav-count">({{ tag.count }})</span></a></li>{% endfor %}
+          {% if stags.active_extra %}<li data-transient-tag><a class="nav-item {% if active=='recordings' %}on{% endif %}" href="/?tag={{ stags.active_extra.id }}" title="{{ stags.active_extra.name }}"><span class="tag-glyph">{{ icon('tag') }}</span><span class="nav-label">{{ stags.active_extra.name }}</span></a></li>{% endif %}
+          {% if stags.total > stags['items']|length %}<li class="nav-tags-more"><button class="nav-item nav-more" type="button" hx-get="/ui/sidebar-tags" hx-target="closest li" hx-swap="outerHTML">{{ icon('more') }}<span class="nav-label">{{ t('All tags') }}</span><span class="nav-count">({{ stags.total }})</span></button></li>{% endif %}
+        </ul>
+      </nav>{% endif %}
+      <nav class="nav-group" aria-label="{{ t('Comes from') }}">
+        <div class="nav-group-head"><button class="nav-group-toggle" type="button" data-collapse-group="sources" aria-expanded="true" aria-controls="sidebar-sources">{{ t('Comes from') }}{{ icon('chevron-down', 'sm') }}</button></div>
+        <ul class="nav-list" id="sidebar-sources">
+          {% for source in sidebar.scenes %}<li><a class="nav-item {% if active=='recordings' and request.query_params.get('scene')==(source.value|string) %}on{% endif %}" href="/?scene={{ source.value }}" title="{{ t(source.label) }}">{{ icon('smartphone' if source.value == 101 else ('upload' if source.value == 102 else ('mic' if source.value in (1, 7) else 'waveform'))) }}<span class="nav-label">{{ t(source.label_short or source.label) }}</span><span class="nav-count">({{ source.count }})</span></a></li>{% endfor %}
+          <li><a class="nav-item {% if active=='recordings' and request.query_params.get('origin')=='plaud' %}on{% endif %}" href="/?origin=plaud">{{ icon('cloud') }}<span class="nav-label">{{ t('Plaud recordings') }}</span><span class="nav-count">({{ sidebar.counts.plaud }})</span></a></li>
+          <li><a class="nav-item {% if active=='recordings' and request.query_params.get('origin')=='local' %}on{% endif %}" href="/?origin=local">{{ icon('drive') }}<span class="nav-label">{{ t('Local uploads') }}</span><span class="nav-count">({{ sidebar.counts.local }})</span></a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="sidebar-foot">
+      {%- set ops = sidebar.ops -%}
+      {%- set ops_total = ops.ready + ops.processing + ops.attention + ops.queued + ops.cloud -%}
+      <div class="status-card ops-card" data-testid="ops-card">
+        <a class="status-card-top" href="/status"><span class="status-pulse{% if ops.attention %} attn{% elif ops.processing %} busy{% endif %}" aria-hidden="true"></span><span class="ops-title">{{ t('Workspace status') }}</span>{{ icon('chevron-right') }}</a>
+        {% if ops_total %}<span class="status-meter" aria-hidden="true"><span class="m-ready" style="width:{{ (ops.ready * 100 / ops_total) | round(1) }}%"></span><span class="m-processing" style="width:{{ (ops.processing * 100 / ops_total) | round(1) }}%"></span><span class="m-attention" style="width:{{ (ops.attention * 100 / ops_total) | round(1) }}%"></span><span class="m-other" style="width:{{ ((ops.queued + ops.cloud) * 100 / ops_total) | round(1) }}%"></span></span>{% endif %}
+        <span class="status-line ops-line">{% if ops.processing %}<a class="ops-stat" href="/?state=active"><strong>{{ ops.processing }}</strong> {{ t('generating') }}</a>{% endif %}{% if ops.queued %}<a class="ops-stat" href="/?state=queued"><strong>{{ ops.queued }}</strong> {{ t('awaiting processing') }}</a>{% endif %}{% if ops.attention %}<a class="ops-stat" href="/?state=attention"><strong class="ops-attn">{{ ops.attention }}</strong> {{ t('need attention') }}</a>{% endif %}{% if ops.cloud %}<a class="ops-stat" href="/?state=cloud"><strong>{{ ops.cloud }}</strong> {{ t('in cloud') }}</a>{% endif %}<a class="ops-stat" href="/?state=done"><strong>{{ ops.ready }}</strong> {{ t('ready') }}</a></span>
+        <a class="ops-sub" href="/status">{% if ops.attention or ops.processing or ops.queued %}{{ t('View system status') }}{% elif ops.cloud %}{{ t('Cloud-only recordings await import') }}{% else %}{{ t('All caught up') }}{% endif %}</a>
+      </div>
+      <a class="nav-item {% if active=='notifications' %}on{% endif %}" href="/notifications">{{ icon('bell') }}<span class="nav-label">{{ t('Notifications') }}</span>{% if unread_notifications %}<span class="badge">{{ unread_notifications if unread_notifications < 100 else '99+' }}</span>{% endif %}</a>
+      <a class="nav-item {% if active=='settings' %}on{% endif %}" href="/settings">{{ icon('settings') }}<span class="nav-label">{{ t('Settings') }}</span></a>
+    </div>
+  </aside>
+  <button class="nav-expand" type="button" data-collapse-toggle="nav" aria-label="{{ t('Expand sidebar') }}" data-tooltip="{{ t('Expand sidebar') }} ([)" aria-controls="workspace-sidebar" aria-expanded="false"><img src="/static/logo.svg" alt=""></button>
+  <button class="nav-scrim" type="button" data-nav-close aria-label="{{ t('Close menu') }}" hidden></button>
+{% else %}
+  <title>{{ self.title() }}</title>
+{% endif %}
+  <div id="app-view" hx-history-elt data-tabbar="{{ 'on' if show_tabbar else 'off' }}">
+    {% block mobile_topbar %}
+    <header class="m-topbar">
+      <button class="icon-btn" type="button" data-nav-open aria-label="{{ t('Open menu') }}" aria-controls="workspace-sidebar" aria-expanded="false">{{ icon('menu') }}</button>
+      <a class="m-title" href="/home"><img src="/static/logo.svg" alt=""><span>{% block mobile_title %}localplaud{% endblock %}</span></a>
+      <a class="icon-btn" href="/search" aria-label="{{ t('Search') }}">{{ icon('search') }}</a>
+      <button class="icon-btn" type="button" data-open-import="device" aria-label="{{ t('Add audio') }}">{{ icon('plus') }}</button>
+    </header>
+    {% endblock %}
+    {% block body %}{% endblock %}
+    {% if show_tabbar %}{% include "_tabbar.html" %}{% endif %}
+    {% block scripts %}{% endblock %}
+  </div>
+{% if not partial_response %}
+  <div class="import-backdrop" id="import-backdrop" hidden>
+    <section class="import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title">
+      <div class="import-head"><span id="import-title">{{ t('Import audio') }}</span><button class="import-close" id="import-close" type="button" aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+      <div class="import-body">
+        <div class="import-tabs" role="tablist" aria-label="{{ t('Audio source') }}"><button id="device-import-tab" type="button" role="tab" aria-selected="true" aria-controls="device-import-panel" data-import-tab="device">{{ t('From this device') }}</button><button id="plaud-import-tab" type="button" role="tab" aria-selected="false" aria-controls="plaud-import-panel" tabindex="-1" data-import-tab="plaud">{{ t('Import from Plaud') }}</button></div>
+        <div id="device-import-panel" role="tabpanel" aria-labelledby="device-import-tab">
+          <label class="drop-zone" id="audio-drop-zone" role="button" tabindex="0" aria-describedby="local-import-status">
+            <span class="import-icon">{{ icon('upload') }}</span><strong>{{ t('Click or drag an audio file to import') }}</strong>
+            <span class="sub" style="margin-top:7px">{{ t('MP3, MP4, M4A, WAV, OGG, Opus, WebM, FLAC or AAC · up to 2 GB') }}</span>
+            <input id="audio-file-input" type="file" accept="audio/*,video/mp4,video/webm,.opus,.m4a,.flac,.aac,.amr" hidden>
+          </label>
+          <div class="sub local-import-status" id="local-import-status" role="status" aria-live="polite" style="text-align:center;margin-top:10px"></div>
+        </div>
+        <div class="plaud-import-card" id="plaud-import-panel" role="tabpanel" aria-labelledby="plaud-import-tab" hidden>
+          <span class="import-icon">{{ icon('cloud') }}</span><strong>{{ t('Check Plaud for new recordings') }}</strong>
+          <p class="sub" style="max-width:440px;margin:8px 0 0">{{ t('Looks for recordings uploaded to Plaud since the last check. New ones download and process automatically. localplaud also checks on its own every few minutes.') }}</p>
+          <button class="btn" id="start-plaud-import" type="button" style="margin-top:17px">{{ t('Check now') }}</button>
+          <div id="plaud-import-progress" role="status" aria-live="polite" hidden style="width:100%;max-width:440px">
+            <div class="sub" id="plaud-import-progress-label" data-progress-label style="margin-top:12px;text-align:center"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <dialog class="dialog" id="folder-dialog" aria-labelledby="folder-dialog-title">
+    <form method="dialog" data-folder-form>
+      <div class="sheet-grabber" aria-hidden="true"></div>
+      <div class="dialog-head"><h2 class="dialog-title" id="folder-dialog-title" data-create-title="{{ t('New folder') }}" data-rename-title="{{ t('Edit folder') }}">{{ t('New folder') }}</h2><button class="icon-btn" type="button" data-dialog-close aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+      <div class="dialog-body" style="display:grid;gap:14px">
+        <label class="field"><span>{{ t('Folder name') }}</span><input class="input" name="name" maxlength="80" required autocomplete="off"></label>
+        <fieldset class="field" style="border:0;margin:0;padding:0"><legend style="padding:0;margin-bottom:6px;color:var(--c-text-body);font-weight:500">{{ t('Color') }}</legend>
+          <div class="swatches" style="display:flex;gap:8px;flex-wrap:wrap">{% for color in ['#3DC8C8','#4C8EFF','#FB5C5C','#C149EB','#F9A251','#22A06B','#8C8C8C','#191919'] %}<label style="position:relative;cursor:pointer"><input type="radio" name="color" value="{{ color }}" {% if loop.first %}checked{% endif %} class="visually-hidden"><span class="swatch" style="--sw:{{ color }}" aria-hidden="true"></span><span class="visually-hidden">{{ color }}</span></label>{% endfor %}</div>
+        </fieldset>
+        <p class="t-meta" data-folder-error role="alert" style="margin:0;color:var(--c-danger)"></p>
+      </div>
+      <div class="dialog-foot"><button class="btn sec" type="button" data-dialog-close>{{ t('Cancel') }}</button><button class="btn" type="submit" data-folder-submit>{{ t('Save') }}</button></div>
+    </form>
+  </dialog>
+  <dialog class="dialog" id="shortcuts-dialog" aria-labelledby="shortcuts-title">
+    <div class="sheet-grabber" aria-hidden="true"></div>
+    <div class="dialog-head"><h2 class="dialog-title" id="shortcuts-title">{{ t('Keyboard shortcuts') }}</h2><button class="icon-btn" type="button" data-dialog-close aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+    <div class="dialog-body"><dl class="shortcut-list">
+      <div><dt><kbd>Ctrl</kbd> <kbd>K</kbd> · <kbd>/</kbd></dt><dd>{{ t('Search') }}</dd></div>
+      <div><dt><kbd>[</kbd></dt><dd>{{ t('Collapse or expand the sidebar') }}</dd></div>
+      <div><dt><kbd>g</kbd> <kbd>h</kbd></dt><dd>{{ t('Go to Home') }}</dd></div>
+      <div><dt><kbd>g</kbd> <kbd>f</kbd></dt><dd>{{ t('Go to All files') }}</dd></div>
+      {% if ask_enabled|default(false) %}<div><dt><kbd>g</kbd> <kbd>a</kbd></dt><dd>{{ t('Go to Ask') }}</dd></div>{% endif %}
+      <div><dt><kbd>g</kbd> <kbd>t</kbd></dt><dd>{{ t('Go to Templates') }}</dd></div>
+      <div><dt><kbd>g</kbd> <kbd>s</kbd></dt><dd>{{ t('Go to Settings') }}</dd></div>
+      <div><dt><kbd>?</kbd></dt><dd>{{ t('Show keyboard shortcuts') }}</dd></div>
+      <div><dt><kbd>Esc</kbd></dt><dd>{{ t('Close the top menu or dialog') }}</dd></div>
+    </dl></div>
+  </dialog>
+  <div class="menu row-menu" id="row-menu" role="menu" aria-label="{{ t('Recording actions') }}" hidden>
+    <a class="menu-item" role="menuitem" href="#" data-row-action="open">{{ icon('external-link') }}{{ t('Open recording') }}</a>
+    <a class="menu-item" role="menuitem" href="#" data-row-action="notes">{{ icon('note') }}{{ t('Notes') }}</a>
+    <div class="menu-sep"></div>
+    <button class="menu-item" role="menuitem" type="button" data-row-action="rename">{{ icon('pencil') }}{{ t('Rename') }}</button>
+    <button class="menu-item" role="menuitem" type="button" data-row-action="move">{{ icon('folder-input') }}{{ t('Move to folder') }}</button>
+    <a class="menu-item" role="menuitem" href="#" data-row-action="export" data-no-partial download>{{ icon('download') }}{{ t('Export Markdown') }}</a>
+  </div>
+  <dialog class="dialog sheet-on-phone" id="rename-dialog" aria-labelledby="rename-dialog-title">
+    <form data-rename-form>
+      <div class="sheet-grabber" aria-hidden="true"></div>
+      <div class="dialog-head"><h2 class="dialog-title" id="rename-dialog-title">{{ t('Rename recording') }}</h2><button class="icon-btn" type="button" data-dialog-close aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+      <div class="dialog-body" style="display:grid;gap:10px">
+        <label class="field"><span>{{ t('Title') }}</span><input class="input" name="title" maxlength="512" autocomplete="off"></label>
+        <p class="t-meta" style="margin:0">{{ t('Leave empty to use the generated or Plaud title again.') }}</p>
+        <p class="t-meta" data-rename-error role="alert" style="margin:0;color:var(--c-danger)"></p>
+      </div>
+      <div class="dialog-foot"><button class="btn sec" type="button" data-dialog-close>{{ t('Cancel') }}</button><button class="btn" type="submit">{{ t('Save') }}</button></div>
+    </form>
+  </dialog>
+  <dialog class="dialog sheet-on-phone" id="move-dialog" aria-labelledby="move-dialog-title">
+    <form data-move-form>
+      <div class="sheet-grabber" aria-hidden="true"></div>
+      <div class="dialog-head"><h2 class="dialog-title" id="move-dialog-title">{{ t('Move to folder') }}</h2><button class="icon-btn" type="button" data-dialog-close aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+      <div class="dialog-body" style="padding:8px 0">
+        <fieldset style="border:0;margin:0;padding:0"><legend class="visually-hidden">{{ t('Folder') }}</legend><ul class="sheet-list">
+          <li><label class="sheet-row"><input class="checkbox" type="radio" name="folder_id" value="">{{ icon('inbox') }}<span>{{ t('No folder') }}</span></label></li>
+          {% for folder in sidebar.folders %}<li><label class="sheet-row"><input class="checkbox" type="radio" name="folder_id" value="{{ folder.id }}"><span class="folder-glyph" style="--folder-color:{{ folder.color or 'var(--c-text-2)' }}">{{ icon('folder') }}</span><span class="truncate">{{ folder.name }}</span><span class="count">{{ folder.count }}</span></label></li>{% endfor %}
+        </ul></fieldset>
+        <p class="t-meta" data-move-error role="alert" style="margin:0 20px;color:var(--c-danger)"></p>
+      </div>
+      <div class="dialog-foot"><button class="btn-ghost btn" type="button" data-folder-create>{{ icon('folder-plus', 'sm') }}{{ t('New folder') }}</button><span style="flex:1"></span><button class="btn sec" type="button" data-dialog-close>{{ t('Cancel') }}</button><button class="btn" type="submit">{{ t('Move') }}</button></div>
+    </form>
+  </dialog>
+  <dialog class="sheet" id="add-sheet" aria-labelledby="add-sheet-title">
+    <div class="sheet-grabber" aria-hidden="true"></div>
+    <div class="dialog-head"><h2 class="dialog-title" id="add-sheet-title">{{ t('Add audio') }}</h2><button class="icon-btn" type="button" data-dialog-close aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+    <div class="dialog-body add-sheet-body">
+      <label class="add-option" data-add-upload>
+        <span class="add-option-icon">{{ icon('upload') }}</span>
+        <span class="add-option-text"><strong>{{ t('Import audio') }}</strong><small>{{ t('MP3, MP4, M4A, WAV, OGG, Opus, WebM, FLAC or AAC · up to 2 GB') }}</small></span>
+        <input class="visually-hidden" type="file" accept="audio/*,video/mp4,video/webm,.opus,.m4a,.flac,.aac,.amr" data-add-file>
+      </label>
+      <button class="add-option" type="button" data-add-sync>
+        <span class="add-option-icon">{{ icon('refresh') }}</span>
+        <span class="add-option-text"><strong>{{ t('Check Plaud now') }}</strong><small>{{ t('New uploads download and process automatically') }}</small></span>
+      </button>
+      <div class="add-progress" data-add-progress hidden>
+        <div class="import-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-labelledby="add-progress-label"><span style="width:0%"></span></div>
+        <p class="t-meta" id="add-progress-label" data-add-progress-label role="status" aria-live="polite"></p>
+      </div>
+    </div>
+  </dialog>
+  <div id="lp-audio-host" hidden></div>
+  <section class="mini-player" id="lp-mini-player" aria-label="{{ t('Now playing') }}" hidden>
+    <span class="mini-progress" aria-hidden="true"><span></span></span>
+    <button class="icon-btn mini-toggle" type="button" data-mini-toggle aria-label="{{ t('Play') }}" data-label-play="{{ t('Play') }}" data-label-pause="{{ t('Pause') }}"><svg class="i" aria-hidden="true"><use href="#i-play"></use></svg></button>
+    <a class="mini-title" href="/" data-mini-link><span class="mini-name truncate"></span><span class="mini-time t-meta t-num"></span></a>
+    <button class="icon-btn" type="button" data-mini-skip="-15" aria-label="{{ t('Back 15 seconds') }}">{{ icon('undo') }}</button>
+    <button class="icon-btn" type="button" data-mini-skip="15" aria-label="{{ t('Forward 15 seconds') }}">{{ icon('redo') }}</button>
+    <button class="icon-btn" type="button" data-mini-close aria-label="{{ t('Close player') }}">{{ icon('x') }}</button>
+  </section>
+  <div class="offline-banner" id="lp-offline-banner" role="status" hidden>{{ icon('cloud', 'sm') }}<span>{{ t('You are offline. Reconnect to load recordings or save changes.') }}</span></div>
+  <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="false"></div>
+  <script src="/static/js/surfaces.js?v={{ asset_version }}" defer></script>
+</body>
+</html>
+{% endif %}

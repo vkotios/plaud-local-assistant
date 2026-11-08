@@ -1,0 +1,111 @@
+/* Account surfaces share app.css tokens, controls, typography and appearance. */
+.auth-shell { min-height:100dvh; display:flex; flex-direction:column; }
+.auth-shell .account-header { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:24px 32px; flex-wrap:wrap; }
+.auth-shell .brand { display:inline-flex; align-items:center; gap:8px; color:var(--c-text); font-size:20px; font-weight:600; letter-spacing:-.5px; }
+.auth-shell .brand img { width:28px; height:28px; }
+.auth-shell .account-header nav { display:flex; gap:20px; align-items:center; flex-wrap:wrap; font-size:13px; }
+.auth-shell .account-header nav a { color:var(--c-text-2); }
+.auth-shell .account-header nav a[aria-current] { color:var(--c-text); font-weight:600; }
+.auth-shell .link-button { border:0; padding:0; background:none; color:var(--c-text-2); }
+.auth-shell .auth-main { width:100%; max-width:420px; padding:32px 24px 56px; margin:auto; }
+.auth-shell .auth-card { padding:0; }
+.auth-shell h1 { font-size:28px; font-weight:400; line-height:1.4; margin:0 0 8px; }
+.auth-shell .eyebrow { color:var(--c-text-2); font-size:12px; margin-bottom:12px; }
+.auth-shell .sub { margin:0 0 24px; }
+.auth-shell .auth-card>.btn, .auth-shell .stack>.btn { width:100%; min-height:42px; }
+.auth-shell .google { margin-top:4px; gap:10px; }
+.auth-shell .google span { font:600 18px Arial,sans-serif; }
+.auth-shell .divider { display:flex; align-items:center; gap:14px; color:var(--c-text-2); font-size:12px; margin:24px 0; }
+.auth-shell .divider::before, .auth-shell .divider::after { content:""; height:1px; background:var(--c-border); flex:1; }
+.auth-shell .auth-switch { text-align:center; font-size:13px; margin:24px 0 0; }
+.auth-shell .auth-switch a, .auth-shell .help a { color:var(--c-accent); }
+.auth-shell .fine-print { font-size:12px; color:var(--c-text-2); text-align:center; margin:24px 0 0; }
+.auth-shell .help { margin-top:20px; color:var(--c-text-2); font-size:12px; }
+.auth-shell .help summary { cursor:pointer; width:fit-content; }
+.auth-shell .account-footer { padding:20px; text-align:center; color:var(--c-text-2); font-size:12px; }
+.auth-shell .account-footer span { display:block; font-size:11px; margin-top:4px; }
+.auth-shell .account-main { width:100%; max-width:960px; margin:24px auto; padding:0 32px; flex:1; }
+
+/* Only account content is scoped here; the workspace shell remains shared. */
+.content .pane-inner.account-page { max-width:1040px; }
+.account-page .account-back { display:inline-flex; align-items:center; gap:4px; color:var(--c-text-2); font-size:13px; margin-bottom:20px; }
+.account-page .account-back:hover { color:var(--c-text); }
+.account-page .account-tabs { display:flex; gap:24px; border-bottom:1px solid var(--c-border); margin-bottom:28px; }
+.account-page .account-tabs a { padding:0 0 12px; color:var(--c-text-2); border-bottom:2px solid transparent; margin-bottom:-1px; }
+.account-page .account-tabs a[aria-current] { color:var(--c-text); border-bottom-color:var(--c-primary); font-weight:500; }
+.account-page .page-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:24px; }
+.account-page .page-heading .sub { margin:4px 0 0; }
+.account-page .account-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:20px; }
+.account-page .panel { min-width:0; padding:20px; }
+.account-page h2 { font-size:15px; font-weight:600; line-height:1.5; margin:0 0 16px; }
+.account-page .sub.small { font-size:13px; margin:-8px 0 20px; }
+.account-page .identity { margin:0 0 20px; }
+.account-page .identity>div { display:grid; grid-template-columns:100px minmax(0,1fr); gap:12px; padding:14px 0; border-bottom:1px solid var(--c-border); }
+.account-page .identity dt { font-size:13px; color:var(--c-text-2); }
+.account-page .identity dd { margin:0; overflow-wrap:anywhere; }
+:is(.account-page,.auth-shell) .stack { display:grid; gap:16px; }
+:is(.account-page,.auth-shell) .stack label, .account-page .user-controls label { display:block; font-size:13px; margin-bottom:6px; font-weight:500; }
+:is(.account-page,.auth-shell) .input { width:100%; min-width:0; }
+:is(.account-page,.auth-shell) .field-help { color:var(--c-text-2); font-size:12px; margin:8px 0 0; overflow-wrap:anywhere; }
+:is(.account-page,.auth-shell) .alert { padding:12px 14px; background:var(--c-surface-2); border:1px solid var(--c-border); border-radius:var(--radius-md); font-size:13px; margin-bottom:20px; overflow-wrap:anywhere; }
+:is(.account-page,.auth-shell) .alert.error { background:var(--c-danger-soft); color:var(--c-danger); border-color:transparent; }
+:is(.account-page,.auth-shell) .alert.success { background:var(--c-ok-soft); color:var(--c-ok); border-color:transparent; }
+.account-page .pending-panel { display:flex; align-items:flex-start; gap:12px; padding:20px; background:var(--c-warn-soft); border-radius:var(--radius-md); margin-bottom:20px; }
+.account-page .pending-panel p { margin:0 0 12px; }
+.account-page .status-dot { width:8px; height:8px; flex:none; margin-top:7px; border-radius:50%; background:var(--c-warn); }
+.account-page .sessions-panel { grid-column:1/-1; }
+.account-page .session { display:flex; justify-content:space-between; align-items:center; gap:20px; padding:16px 0; border-top:1px solid var(--c-border); }
+.account-page .session:last-child { padding-bottom:0; }
+.account-page .session-detail { min-width:0; }
+.account-page .session strong { font-weight:500; }
+.account-page .agent-label { font-size:12px; color:var(--c-text-2); overflow-wrap:anywhere; margin:4px 0; }
+.account-page .create-user { margin-bottom:20px; padding:0; }
+.account-page .create-user summary { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; padding:16px 20px; cursor:pointer; list-style:none; }
+.account-page .create-user summary::-webkit-details-marker { display:none; }
+.account-page .create-user summary::before { content:"+"; font-size:16px; line-height:1; color:var(--c-text-2); }
+.account-page .create-user[open] summary::before { content:"−"; }
+.account-page .create-user summary .field-help { margin:0; }
+.account-page .create-user-title { font-weight:600; }
+.account-page .create-user-form { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px; padding:20px; border-top:1px solid var(--c-border); }
+.account-page .create-user-form label { display:block; font-size:13px; margin-bottom:6px; font-weight:500; }
+.account-page .create-user-form .alert, .account-page .create-user-actions { grid-column:1/-1; margin:0; }
+.account-page .user-list { padding:0 20px; }
+.account-page .user-row { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:20px 0; }
+.account-page .user-row+.user-row { border-top:1px solid var(--c-border); }
+.account-page .user-info { min-width:0; flex:1; }
+.account-page .user-info p { font-size:13px; color:var(--c-text-2); margin:6px 0; overflow-wrap:anywhere; }
+.account-page .user-name { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.account-page .user-name strong { font-weight:600; overflow-wrap:anywhere; }
+.account-page .user-controls { display:flex; align-items:flex-end; gap:10px; flex:none; }
+.account-page .user-controls select { min-width:100px; }
+.account-page .you { font-size:12px; color:var(--c-text-2); }
+.account-page .chip.status-pending { background:var(--c-warn-soft); color:var(--c-warn); border-color:transparent; }
+.account-page .chip.status-disabled { background:var(--c-danger-soft); color:var(--c-danger); border-color:transparent; }
+.account-page .chip.status-active { background:var(--c-ok-soft); color:var(--c-ok); border-color:transparent; }
+.account-page .empty-state { text-align:center; padding:40px 12px; }
+@media(max-width:820px) {
+  .account-page .account-grid { grid-template-columns:minmax(0,1fr); gap:16px; }
+  .account-page .user-row { display:block; }
+  .account-page .user-controls { margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .account-page .user-controls button { grid-column:1/-1; }
+  .account-page .user-row>.chip { display:inline-flex; margin-top:10px; }
+  .account-page .create-user-form { grid-template-columns:minmax(0,1fr); }
+}
+@media(max-width:600px) {
+  .auth-shell .account-header { padding:20px; }
+  .auth-shell .account-header nav { width:100%; gap:16px; }
+  .auth-shell .auth-main { padding:24px 24px 40px; }
+  .auth-shell .account-main { margin:16px auto; padding:0 20px; }
+  .content .pane-inner.account-page { padding:20px 20px 48px; }
+  .account-page .account-back { margin-bottom:16px; }
+  .account-page .account-tabs { margin-bottom:24px; }
+  .account-page .page-heading { align-items:flex-start; }
+  .account-page .page-heading>.chip { margin-top:8px; }
+  .account-page .panel { padding:16px; }
+  .account-page .user-list { padding:0 16px; }
+  .account-page .create-user summary { padding:14px 16px; }
+  .account-page .create-user-form { padding:16px; }
+  .account-page .session { gap:12px; }
+  :is(.account-page,.auth-shell) .input { font-size:16px; }
+  :is(.account-page,.auth-shell) .btn { min-height:42px; }
+}

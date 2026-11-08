@@ -1,0 +1,544 @@
+"""Product-gate acceptance for a clean raw-audio recording."""
+
+from __future__ import annotations
+
+import json
+from contextlib import contextmanager
+
+from sqlalchemy import select
+from typer.testing import CliRunner
+
+
+def _setup(monkeypatch, tmp_path):
+    import localplaud.db.session as db_session
+    from localplaud.config import get_settings
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path / 'gate.db'}")
+    monkeypatch.setenv("LOCALPLAUD_PIPELINE__CONVERT", "false")
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    return get_settings(reload=True)
+
+
+def _providers(monkeypatch):
+    from localplaud.asr.base import Segment, Transcript, Word
+    from localplaud.worker.align import AlignmentResult
+
+    monkeypatch.setattr(
+        "localplaud.worker.pipeline.transcribe.run_asr",
+        lambda *_args: Transcript(
+            segments=[
+                Segment(
+                    text="今天確認本機處理流程。",
+                    start=0.0,
+                    end=2.0,
+                    speaker="SPEAKER_00",
+                    words=[
+                        Word(
+                            text="今天確認本機處理流程。",
+                            start=0.0,
+                            end=2.0,
+                            speaker="SPEAKER_00",
+                        )
+                    ],
+                )
+            ],
+            language="zh",
+            provider="acceptance-fake",
+            model="large-v3-turbo",
+            has_speakers=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "localplaud.worker.pipeline.summarize.summarize",
+        lambda transcript, settings, *, context=None, checkpoint_dir=None, progress=None: {
+            "title": "本機筆記",
+            "content_md": "# 本機筆記\n\n- 完整涵蓋",
+            "provider": "acceptance-fake",
+            "model": "local-llm",
+            "template": settings.pipeline.summary_template,
+            "template_snapshot": {"execution": {"version": "evidence-notes/v2", "note_quality": "evidence"}},
+        },
+    )
+    monkeypatch.setattr(
+        "localplaud.worker.pipeline.align.run_alignment",
+        lambda _audio, transcript, **_kwargs: AlignmentResult(
+            transcript=transcript,
+            provider="whisperx",
+            model="wav2vec2-auto",
+            detail={
+                "strategy": "whisperx-wav2vec2",
+                "forced_alignment": True,
+                "word_count": 1,
+                "timed_segments": 1,
+                "segment_count": 1,
+                "segment_coverage": 1.0,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "localplaud.worker.pipeline.mindmap.generate_mind_map",
+        lambda *_args, **_kwargs: {
+            "template": "mind_map",
+            "title": None,
+            "content_md": "# 心智圖\n- 本機流程",
+            "provider": "acceptance-fake",
+            "model": "local-llm",
+            "detail": {"outline_nodes": 2},
+        },
+    )
+    monkeypatch.setattr(
+        "localplaud.worker.pipeline.index.embed_chunks",
+        lambda chunks, settings: ([b"\x00\x00\x80?" for _ in chunks], "local-test", 1),
+    )
+    monkeypatch.setattr(
+        "localplaud.worker.pipeline.polish.polish_transcript",
+        lambda transcript, settings, progress=None, dispatch_guard=None: {
+            "transcript": transcript,
+            "provider": settings.llm.provider,
+            "model": getattr(settings.llm, settings.llm.provider.replace("-", "_")).model,
+            "prompt_version": "transcript-polish/v4",
+            "detail": {
+                "chunks": 1,
+                "attempts": 3,
+                "segments": len(transcript.segments),
+                "input_chars": len(transcript.text),
+                "output_chars": len(transcript.text),
+                "request_input_chars": 333,
+                "response_output_chars": 222,
+            },
+        },
+    )
+
+
+def test_clean_raw_audio_passes_subscription_independence_gate(monkeypatch, tmp_path):
+    settings = _setup(monkeypatch, tmp_path)
+    from types import SimpleNamespace
+
+    from localplaud.acceptance import subscription_independence_report
+    from localplaud.cli import app
+    from localplaud.db.models import (
+        AutomationRule,
+        FileStatus,
+        PlaudFile,
+        StageAttempt,
+        StageName,
+        StageStatus,
+    )
+    from localplaud.db.session import init_db, session_scope
+    from localplaud.plaud.models import PlaudFileDTO
+    from localplaud.worker.daemon import DaemonJobs
+
+    init_db()
+    with session_scope() as session:
+        session.add(AutomationRule(
+            name="Choose notes before processing", enabled=True, priority=10,
+            trigger={"origin": "plaud"}, actions={"note_template_key": "plaud-meeting-minutes"},
+        ))
+
+    class FakePlaudClient:
+        files = [PlaudFileDTO(id="historical", filename="Historical recording")]
+        downloads: list[str] = []
+
+        def iter_files(self, include_trash=False):
+            yield from self.files
+
+        def download_audio(self, dto, destination):
+            with session_scope() as session:
+                assert session.get(PlaudFile, dto.id).note_template_key == "plaud-meeting-minutes"
+            self.downloads.append(dto.id)
+            path = destination / "audio.wav"
+            path.write_bytes(b"RIFF-local-user-owned-audio")
+            return path
+
+    cloud = FakePlaudClient()
+
+    @contextmanager
+    def fake_client_factory(_settings):
+        yield cloud
+
+    monkeypatch.setattr("localplaud.poller.poll.make_plaud_client", fake_client_factory)
+    jobs = DaemonJobs(settings, "acceptance-owner", SimpleNamespace(modify_job=lambda *a, **k: None))
+    monkeypatch.setattr("localplaud.worker.reindex.process_pending_reindexes", lambda *a, **k: 0)
+    monkeypatch.setattr("localplaud.worker.knowledge_index.process_pending_documents", lambda *a, **k: 0)
+    baseline = jobs.sync()
+    assert baseline["new"] == 1 and baseline["downloaded"] == 0
+    cloud.files.append(
+        PlaudFileDTO(id="clean", filename="Clean raw recording", start_time=1_750_000_000_000)
+    )
+    incremental = jobs.sync()
+    assert incremental["new"] == 1 and incremental["downloaded"] == 1
+    assert cloud.downloads == ["clean"]
+
+    _providers(monkeypatch)
+    assert jobs.work() == 1
+    with session_scope() as session:
+        assert session.get(PlaudFile, "historical").status == FileStatus.metadata_only
+        row = session.get(PlaudFile, "clean")
+        assert row.audio_path and row.status == FileStatus.done
+        polished = row.corrected_transcript
+        assert polished.kind == "ai_polish"
+        assert polished.provider == "ollama"
+        assert polished.model == polished.resolved_profile_snapshot["stages"]["correct"]["model"]
+        assert polished.prompt_version == "transcript-polish/v4"
+        assert polished.resolved_profile_snapshot["stages"]["correct"]["provider_type"] == "ollama"
+        assert all(summary.input_transcript_revision == 1 for summary in row.summaries)
+        alignment = next(stage for stage in row.stage_runs if stage.stage == StageName.align)
+        assert alignment.status == StageStatus.completed
+        assert alignment.provider == "whisperx"
+        assert alignment.model == "wav2vec2-auto"
+        assert alignment.detail["strategy"] == "whisperx-wav2vec2"
+        assert alignment.detail["forced_alignment"] is True
+        correct = next(stage for stage in row.stage_runs if stage.stage.value == "correct")
+        assert correct.status.value == "completed"
+        assert correct.provider == "ollama"
+        correct_attempt = session.scalar(
+            select(StageAttempt).where(
+                StageAttempt.file_id == "clean", StageAttempt.stage == StageName.correct
+            )
+        )
+        assert correct_attempt.usage["requests"] == 3
+        assert correct_attempt.usage["input_chars"] == 333
+        assert correct_attempt.usage["output_chars"] == 222
+
+    report = subscription_independence_report("clean")
+    assert report["schema"] == "localplaud-subscription-independence/v1"
+    assert report["passed"] is True
+    assert {item["name"] for item in report["checks"]} == {
+        "raw_audio_local",
+        "local_transcript",
+        "ai_title",
+        "transcript_polish",
+        "timestamped_segments",
+        "word_alignment",
+        "speaker_assignment",
+        "speaker_diarization",
+        "local_notes",
+        "local_mind_map",
+        "ask_index",
+        "durable_stages",
+        "required_exports",
+    }
+    assert all(item["passed"] for item in report["checks"])
+
+    with session_scope() as session:
+        row = session.get(PlaudFile, "clean")
+        generated_title = (
+            row.generated_title,
+            row.generated_title_provider,
+            row.generated_title_model,
+            row.generated_title_at,
+        )
+        row.generated_title = None
+        row.generated_title_provider = None
+        row.generated_title_model = None
+        row.generated_title_at = None
+    missing_title_report = subscription_independence_report("clean")
+    title_check = next(
+        item for item in missing_title_report["checks"] if item["name"] == "ai_title"
+    )
+    assert title_check == {
+        "name": "ai_title",
+        "passed": False,
+        "detail": "no generated AI title for the local transcript",
+    }
+    with session_scope() as session:
+        row = session.get(PlaudFile, "clean")
+        (
+            row.generated_title,
+            row.generated_title_provider,
+            row.generated_title_model,
+            row.generated_title_at,
+        ) = generated_title
+
+    with session_scope() as session:
+        row = session.get(PlaudFile, "clean")
+        row.generated_title = "以下是根據您提供的內容整理出的智能總結"
+    boilerplate_title_report = subscription_independence_report("clean")
+    assert next(
+        item for item in boilerplate_title_report["checks"] if item["name"] == "ai_title"
+    )["passed"] is False
+    with session_scope() as session:
+        session.get(PlaudFile, "clean").generated_title = generated_title[0]
+
+    # Whisper-native word timestamps are useful evidence, but they are not a
+    # substitute for the forced-alignment requirement in the product gate.
+    with session_scope() as session:
+        row = session.get(PlaudFile, "clean")
+        alignment = next(stage for stage in row.stage_runs if stage.stage == StageName.align)
+        alignment.detail = dict(alignment.detail) | {
+            "strategy": "provider-word-timestamps",
+            "forced_alignment": False,
+        }
+    native_timing_report = subscription_independence_report("clean")
+    native_alignment = next(
+        item for item in native_timing_report["checks"] if item["name"] == "word_alignment"
+    )
+    assert native_alignment["passed"] is False
+    assert native_alignment["detail"] == "no completed forced-alignment evidence"
+    with session_scope() as session:
+        row = session.get(PlaudFile, "clean")
+        alignment = next(stage for stage in row.stage_runs if stage.stage == StageName.align)
+        alignment.detail = dict(alignment.detail) | {
+            "strategy": "whisperx-wav2vec2",
+            "forced_alignment": True,
+        }
+
+    # Exercise the user-facing grounded Ask path from the locally indexed recording.
+    class LocalAskModel:
+        def complete(self, *_args, **_kwargs):
+            return "本機流程已確認。"
+
+    monkeypatch.setattr(
+        "localplaud.worker.qa.retrieve",
+        lambda *_args, **_kwargs: [
+            {
+                "file_id": "clean",
+                "filename": "Clean raw recording",
+                "start": 0.0,
+                "end": 2.0,
+                "speaker": "SPEAKER_00",
+                "text": "今天確認本機處理流程。",
+                "score": 1.0,
+            }
+        ],
+    )
+    monkeypatch.setattr("localplaud.worker.qa.build_llm", lambda *_args: LocalAskModel())
+    from localplaud.ask_threads import ask_in_thread
+
+    thread = ask_in_thread("確認了什麼？", file_id="clean")
+    answer = thread["messages"][-1]
+    assert answer["content"] == "本機流程已確認。"
+    assert answer["sources"][0]["file_id"] == "clean"
+    assert answer["sources"][0]["start"] == 0.0
+
+    result = CliRunner().invoke(app, ["acceptance-check", "clean", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["passed"] is True
+
+    # Local provenance alone is not enough: a stale note from raw revision 0
+    # must not satisfy a gate whose canonical input is AI-polished revision 1.
+    with session_scope() as session:
+        row = session.get(PlaudFile, "clean")
+        note = next(item for item in row.summaries if item.template != "mind_map")
+        note.input_transcript_revision = 0
+    stale_report = subscription_independence_report("clean")
+    stale_checks = {item["name"]: item["passed"] for item in stale_report["checks"]}
+    assert stale_checks["local_notes"] is False
+    assert stale_checks["local_mind_map"] is True
+    assert stale_checks["ask_index"] is True
+
+
+def test_cloud_only_recording_fails_gate_with_actionable_checks(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    from localplaud.acceptance import subscription_independence_report
+    from localplaud.db.models import FileStatus, PlaudFile, Summary, Transcript
+    from localplaud.db.session import init_db, session_scope
+    from localplaud.poller.poll import refresh_cloud_artifacts_for
+
+    init_db()
+    with session_scope() as session:
+        session.add(
+            PlaudFile(
+                id="cloud-only",
+                status=FileStatus.metadata_only,
+                transcripts=[
+                    Transcript(
+                        provider="plaud",
+                        source="cloud",
+                        text="paid artifact",
+                        segments=[{"text": "paid artifact", "start": 0.0, "end": 1.0}],
+                    )
+                ],
+            )
+        )
+
+    class CloudClient:
+        def get_detail(self, file_id):
+            return {"id": file_id}
+
+        def get_cloud_notes(self, file_id, detail):
+            return [
+                {
+                    "key": "auto_sum_note",
+                    "title": "Paid note",
+                    "markdown": "# Paid note",
+                }
+            ]
+
+        def get_cloud_transcript_segments(self, file_id, detail):
+            return [{"text": "paid artifact", "start": 0.0, "end": 1.0}]
+
+    assert refresh_cloud_artifacts_for(CloudClient(), "cloud-only") == (True, True)
+    report = subscription_independence_report("cloud-only")
+    with session_scope() as session:
+        notes = session.query(Summary).filter_by(file_id="cloud-only").all()
+        assert len(notes) == 1 and notes[0].source == "cloud"
+    failed = {item["name"] for item in report["checks"] if not item["passed"]}
+    assert report["passed"] is False
+    assert {"raw_audio_local", "local_transcript", "local_notes", "required_exports"} <= failed
+
+
+def test_polish_failure_then_gateway_profile_resume_rebuilds_downstream(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    from localplaud.acceptance import subscription_independence_report
+    from localplaud.db.models import FileStatus, PlaudFile, StageName, StageStatus
+    from localplaud.db.session import init_db, session_scope
+    from localplaud.providers.contracts import ProviderStage
+    from localplaud.providers.service import (
+        _capability,
+        create_profile_version,
+        list_profiles,
+        save_connection,
+        save_model,
+        select_recording_override,
+    )
+    from localplaud.worker.pipeline import process_file
+
+    init_db()
+    audio = tmp_path / "polish-failure.wav"
+    audio.write_bytes(b"RIFF-local-user-owned-audio")
+    with session_scope() as session:
+        session.add(
+            PlaudFile(
+                id="polish-failure",
+                status=FileStatus.downloaded,
+                audio_path=str(audio),
+            )
+        )
+    _providers(monkeypatch)
+    monkeypatch.setattr(
+        "localplaud.worker.pipeline.polish.polish_transcript",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("provider down")),
+    )
+
+    process_file("polish-failure")
+    with session_scope() as session:
+        row = session.get(PlaudFile, "polish-failure")
+        assert row.status == FileStatus.partial
+        assert row.local_transcript is not None
+        assert row.corrected_transcript is None
+        assert not row.summaries
+        assert not row.chunks
+        correct = next(stage for stage in row.stage_runs if stage.stage == StageName.correct)
+        assert correct.status == StageStatus.failed
+        assert "provider down" in correct.error
+        assert not any(stage.stage in {StageName.summarize, StageName.mind_map, StageName.index}
+                       and stage.status == StageStatus.completed for stage in row.stage_runs)
+
+    report = subscription_independence_report("polish-failure")
+    polish_check = next(item for item in report["checks"] if item["name"] == "transcript_polish")
+    assert polish_check == {
+        "name": "transcript_polish",
+        "passed": False,
+        "detail": "no local AI-polished transcript revision",
+    }
+
+    with session_scope() as session:
+        current = next(
+            profile for profile in list_profiles(session) if profile["is_system_default"]
+        )
+        gateway = save_connection(
+            session,
+            {
+                "key": "llm:ai-gateway",
+                "name": "AI gateway",
+                "provider_type": "ai-gateway",
+                "execution_target": "cloud",
+                "data_egress": True,
+                "config": {"base_url": "http://127.0.0.1:8317/v1"},
+            },
+        )
+        save_model(
+            session,
+            {
+                "connection_id": gateway["id"],
+                "model_key": "sky-quality",
+                "display_name": "sky-quality",
+                "capabilities": _capability([ProviderStage.correct], cloud=True),
+            },
+        )
+        stages = dict(current["stages"])
+        stages["correct"] = {
+            "connection": "llm:ai-gateway",
+            "model": "sky-quality",
+            "options": {},
+        }
+        codex_profile = create_profile_version(
+            session,
+            {
+                "key": "gateway-correction",
+                "name": "Gateway correction",
+                "privacy_policy": "allow-egress",
+                "no_egress": False,
+                "fallback_policy": {},
+                "stages": stages,
+            },
+        )
+        select_recording_override(session, "polish-failure", codex_profile["id"])
+
+    _providers(monkeypatch)
+    from localplaud.worker.pipeline import process_derived_artifacts
+    process_derived_artifacts("polish-failure")
+    with session_scope() as session:
+        row = session.get(PlaudFile, "polish-failure")
+        assert row.status == FileStatus.done
+        assert row.corrected_transcript is not None
+        assert row.corrected_transcript.revision == 1
+        assert row.corrected_transcript.provider == "ai-gateway"
+        assert row.corrected_transcript.model == "sky-quality"
+        assert (
+            row.corrected_transcript.resolved_profile_snapshot["stages"]["correct"]["connection"]
+            == "llm:ai-gateway"
+        )
+        assert {summary.input_transcript_revision for summary in row.summaries} == {1}
+        assert row.chunks and {chunk.input_transcript_revision for chunk in row.chunks} == {1}
+        stage_runs = {stage.stage: stage for stage in row.stage_runs}
+        assert stage_runs[StageName.transcribe].attempts == 1
+        assert stage_runs[StageName.correct].attempts == 2
+
+
+def test_acceptance_check_json_stays_ansi_free_under_force_color(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    from localplaud.cli import app
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import init_db, session_scope
+
+    init_db()
+    with session_scope() as session:
+        session.add(
+            PlaudFile(
+                id="bare",
+                filename="Bare recording",
+                status=FileStatus.downloaded,
+                duration_ms=1000,
+                start_time_ms=0,
+                audio_path=str(tmp_path / "a.wav"),
+            )
+        )
+
+    # Automation environments commonly force color; --json must remain plain
+    # machine-readable stdout regardless (Rich would inject ANSI sequences).
+    monkeypatch.setenv("FORCE_COLOR", "3")
+    result = CliRunner().invoke(app, ["acceptance-check", "bare", "--json"])
+    assert result.exit_code == 1  # bare recording cannot pass the gate
+    assert "\x1b" not in result.stdout
+    report = json.loads(result.stdout)
+    assert report["passed"] is False
+    assert report["schema"].startswith("localplaud-subscription-independence/")
+
+
+def test_acceptance_check_json_reports_missing_recording_as_json(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    from localplaud.cli import app
+    from localplaud.db.session import init_db
+
+    init_db()
+    monkeypatch.setenv("FORCE_COLOR", "3")
+    result = CliRunner().invoke(app, ["acceptance-check", "does-not-exist", "--json"])
+    assert result.exit_code == 1
+    assert "\x1b" not in result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["passed"] is False
+    assert payload["file_id"] == "does-not-exist"
+    assert payload["error"]
