@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install application and provider test dependencies
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev --extra cloud
+      - name: Install CPU tensor test dependency
+        run: uv pip install "torch>=2.8" --index-url https://download.pytorch.org/whl/cpu
+      - name: Lint
+        run: uv run --no-sync ruff check src tests
+      # Full suite (upstream parity). Focused IGM/gateway smoke while iterating:
+      #   uv run pytest -q tests/test_ai_gateway.py tests/test_config.py
+      # Extras guidance (AMD/CPU, no CUDA assumption): docs/extras-matrix.md
+      - name: Test
+        run: uv run --no-sync pytest -q

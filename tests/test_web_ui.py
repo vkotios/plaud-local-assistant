@@ -1,0 +1,2181 @@
+"""Tests for the web UI pages render (dashboard, search, status, detail)."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import zipfile
+from io import BytesIO
+from pathlib import Path
+
+import pytest
+
+from tests.assets import with_assets
+from tests.workspace import set_ask_enabled
+
+WORKSPACE_JS = (
+    Path(__file__).parents[1] / "src/localplaud/api/static/js/workspace.js"
+).read_text()
+
+
+def _client(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    import localplaud.db.session as db_session
+    from localplaud.config import get_settings
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path/'ui.db'}")
+    monkeypatch.setenv("LOCALPLAUD_PLAUD__PROVIDER", "official")
+    monkeypatch.setenv(
+        "LOCALPLAUD_PLAUD__OFFICIAL__TOKENS_PATH", str(tmp_path / "plaud-tokens.json")
+    )
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    from localplaud.api.app import app
+    from localplaud.db.session import init_db
+
+    init_db()
+    return TestClient(app)
+
+
+def _seed(audio_path: str | None = None):
+    from localplaud.db.models import (
+        FileStatus,
+        PlaudFile,
+        StageName,
+        StageRun,
+        StageStatus,
+        Summary,
+        Transcript,
+    )
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r1", filename="Weekly Sync", status=FileStatus.done,
+                        duration_ms=600000, start_time_ms=1783582737000, scene=1,
+                        audio_path=audio_path))
+        s.add(Transcript(file_id="r1", provider="faster-whisper", language="en", has_speakers=True,
+                         text="hi", segments=[{"text": "hello team", "start": 1.0, "end": 2.0, "speaker": "SPEAKER_00"}]))
+        s.add(Summary(file_id="r1", template="meeting", title="Sync", content_md="# Sync\n\n- point"))
+        s.add(
+            StageRun(
+                file_id="r1",
+                stage=StageName.index,
+                status=StageStatus.failed,
+                attempts=1,
+                error="embedding model unavailable",
+            )
+        )
+        s.add(
+            StageRun(
+                file_id="r1",
+                stage=StageName.correct,
+                status=StageStatus.completed,
+                attempts=1,
+                provider="opencode-go",
+                model="qwen3.7-plus",
+                detail={
+                    "strategy": "contextual-segment-map",
+                    "revision": 2,
+                    "segments": 107,
+                    "chunks": 3,
+                    "prompt_version": "transcript-polish/v1",
+                },
+            )
+        )
+        s.add(
+            StageRun(
+                file_id="r1",
+                stage=StageName.align,
+                status=StageStatus.completed,
+                attempts=1,
+                provider="faster-whisper",
+                detail={
+                    "strategy": "provider-word-timestamps",
+                    "forced_alignment": False,
+                    "word_count": 42,
+                },
+            )
+        )
+
+
+def test_dashboard_renders(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    r = c.get("/")
+    assert r.status_code == 200
+    assert "Weekly Sync" in r.text
+    assert "All files" in r.text
+    assert 'class="file-list"' in r.text and 'class="file-table-head"' in r.text
+    assert "Total audio" not in r.text  # one dense library surface, not a dashboard
+
+
+def test_library_bulk_export_modal_has_accessible_dialog_contract(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    page = c.get("/")
+
+    assert 'id="bulk-export-open"' in page.text
+    assert 'role="dialog" aria-modal="true" aria-labelledby="bulk-export-title"' in page.text
+    assert 'id="bulk-export-transcript" type="checkbox" checked' in page.text
+    assert 'id="bulk-export-notes" type="checkbox" checked' in page.text
+    assert "setExportBackgroundInert(true)" in page.text
+    assert "if (event.key === 'Escape')" in page.text
+    assert "if (event.shiftKey && document.activeElement === first)" in page.text
+    assert "if (restoreFocus) exportOpener?.focus()" in page.text
+    assert "fetch('/api/files/export'" in page.text
+    assert "signal:cleanupController.signal" in page.text
+    assert "if (error.name === 'AbortError') return" in page.text
+    assert "response.status === 409 ? tr('No selected recording has an available transcript or note')" in page.text
+
+
+def test_real_browser_navigation_gets_progressive_library_and_recording_shells(
+    monkeypatch, tmp_path
+):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    headers = {"Sec-Fetch-Dest": "document"}
+
+    library = c.get("/", headers=headers)
+    assert library.status_code == 200
+    assert 'class="library-page progressive-shell"' in library.text
+    assert 'data-progressive-loader' in library.text
+    assert 'id="recording-file-list" hx-preserve' not in library.text
+    assert "Weekly Sync" not in library.text
+    library_workspace = c.get("/?workspace=true", headers=headers)
+    assert "Weekly Sync" in library_workspace.text
+    assert 'id="recording-file-list" hx-preserve' not in library_workspace.text
+
+    detail = c.get("/file/r1", headers=headers)
+    assert detail.status_code == 200
+    assert "Weekly Sync" in detail.text
+    assert 'class="skeleton-player"' in detail.text
+    assert 'id="recording-file-list" hx-preserve' not in detail.text
+    assert "SPEAKER_00" not in detail.text
+    workspace = c.get("/file/r1?workspace=true", headers=headers)
+    assert "SPEAKER_00" in workspace.text
+    assert 'id="recording-file-list" hx-preserve' not in workspace.text
+    assert 'hx-get="/file/r1/acceptance-panel"' in workspace.text
+
+    htmx_navigation = c.get(
+        "/file/r1",
+        headers={
+            "HX-Request": "true",
+            "HX-Target": "app-view",
+            "X-Localplaud-Preserve-Filelist": "true",
+        },
+    )
+    assert 'class="skeleton-player"' in htmx_navigation.text
+    assert "SPEAKER_00" not in htmx_navigation.text
+    assert 'id="recording-file-list" hx-preserve' in htmx_navigation.text
+    assert "skeleton-recording" not in htmx_navigation.text
+    assert "workspace=true" in htmx_navigation.text
+    assert "preserve_filelist=true" in htmx_navigation.text
+    assert "<!doctype html>" not in htmx_navigation.text
+    assert '<aside class="sidebar">' not in htmx_navigation.text
+    assert htmx_navigation.text.count('<div id="app-view" hx-history-elt') == 1
+    assert "<title>Weekly Sync — localplaud</title>" in htmx_navigation.text
+
+    htmx_workspace = c.get(
+        "/file/r1?workspace=true&preserve_filelist=true",
+        headers={"HX-Request": "true", "HX-Target": "app-view"},
+    )
+    assert 'class="skeleton-player"' not in htmx_workspace.text
+    assert "SPEAKER_00" in htmx_workspace.text
+    assert 'id="recording-file-list" hx-preserve' in htmx_workspace.text
+    assert "const cleanupController=new AbortController()" in htmx_workspace.text
+
+    history_restore = c.get(
+        "/file/r1",
+        headers={"HX-Request": "true", "HX-History-Restore-Request": "true"},
+    )
+    assert "<!doctype html>" not in history_restore.text
+    assert '<div id="app-view" hx-history-elt data-tabbar="off">' in history_restore.text
+
+
+def test_long_transcript_is_loaded_in_bounded_pages(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        recording = session.get(PlaudFile, "r1")
+        recording.local_transcript.segments = [
+            {"text": f"segment-{index}", "start": float(index), "end": float(index + 1)}
+            for index in range(250)
+        ]
+
+    workspace = c.get("/file/r1")
+    assert "segment-249" not in workspace.text
+    first = c.get("/file/r1/transcript-page?view=raw")
+    pinned_id = int(re.search(r"page_transcript_id=(\d+)", first.text).group(1))
+    pinned_token = re.search(r"page_transcript_token=([0-9a-f]+)", first.text).group(1)
+    assert first.text.count('<div class="seg ') == 120
+    assert "offset=120" in first.text
+    assert "limit=120" in first.text
+    assert "load-all-transcript" not in first.text
+    second = c.get(
+        f"/file/r1/transcript-page?view=raw&page_transcript_id={pinned_id}"
+        f"&page_transcript_token={pinned_token}&offset=120"
+    )
+    assert second.text.count('<div class="seg ') == 120
+    assert "offset=240" in second.text
+    final = c.get(
+        f"/file/r1/transcript-page?view=raw&page_transcript_id={pinned_id}"
+        f"&page_transcript_token={pinned_token}&offset=240"
+    )
+    assert final.text.count('<div class="seg ') == 10
+    assert "segment-249" in final.text
+    assert "transcript-page-loader" not in final.text
+
+    from sqlalchemy import delete
+
+    from localplaud.db.models import Transcript
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.execute(delete(Transcript).where(Transcript.id == pinned_id))
+        session.add(
+            Transcript(
+                file_id="r1",
+                provider="replacement",
+                language="en",
+                has_speakers=False,
+                source="local",
+                text="replacement",
+                segments=[{"text": "replacement", "start": 0, "end": 1}],
+            )
+        )
+    stale = c.get(
+        f"/file/r1/transcript-page?view=raw&page_transcript_id={pinned_id}"
+        f"&page_transcript_token={pinned_token}&offset=120"
+    )
+    assert stale.status_code == 404
+
+
+def test_corrected_transcript_pagination_pins_the_revision(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import PlaudFile, TranscriptRevision
+    from localplaud.db.session import session_scope
+
+    segments = [
+        {"text": f"corrected-{index}", "start": float(index), "end": float(index + 1)}
+        for index in range(130)
+    ]
+    with session_scope() as session:
+        recording = session.get(PlaudFile, "r1")
+        session.add(
+            TranscriptRevision(
+                file_id="r1",
+                base_transcript_id=recording.local_transcript.id,
+                revision=2,
+                source="local",
+                segments=segments,
+                text=" ".join(segment["text"] for segment in segments),
+            )
+        )
+    first = c.get("/file/r1/transcript-page?view=corrected")
+    assert "page_revision=2" in first.text
+    pinned = c.get("/file/r1/transcript-page?view=corrected&page_revision=2&offset=120")
+    assert pinned.status_code == 200
+    unpinned = c.get("/file/r1/transcript-page?view=corrected&offset=120")
+    assert unpinned.status_code == 409
+    missing = c.get("/file/r1/transcript-page?view=corrected&page_revision=999&offset=120")
+    assert missing.status_code == 404
+
+
+def test_transcript_pagination_rejects_empty_and_unknown_continuations(
+    monkeypatch, tmp_path
+):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(PlaudFile(id="empty", filename="Empty", status=FileStatus.downloaded))
+
+    assert c.get("/file/empty/transcript-page?offset=120").status_code == 409
+    assert c.get("/file/empty/transcript-page?source=unexpected").status_code == 422
+
+
+def test_import_dialog_is_hidden_until_explicitly_opened(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    response = c.get("/")
+    response_assets = with_assets(c, response)
+    assert response.status_code == 200
+    assert '[hidden] { display: none !important; }' in response_assets
+    assert 'id="import-backdrop" hidden' in response_assets
+    assert 'aria-expanded="false" aria-haspopup="menu" aria-controls="add-audio-menu"' in response_assets
+    assert 'id="add-audio-menu" role="menu" hidden' in response_assets
+    assert 'role="tablist" aria-label="Audio source"' in response_assets
+    assert 'role="tab" aria-selected="true" aria-controls="device-import-panel"' in response_assets
+    assert 'role="tabpanel" aria-labelledby="device-import-tab"' in response_assets
+    assert 'id="audio-drop-zone" role="button" tabindex="0"' in response_assets
+    assert 'id="local-import-status" role="status" aria-live="polite"' in response_assets
+    assert 'id="plaud-import-progress" role="status" aria-live="polite"' in response_assets
+    assert "/api/imports/plaud/check" in response_assets
+    assert "const importModal=window.localplaudModal" in response_assets
+    assert "typeof background==='function'?background():background" in response_assets
+    assert "background:()=>[document.getElementById('app-view')" in response_assets
+    assert "importModal.open(trigger,tabs.find" in response_assets
+    assert "event.key==='Enter'||event.key===' '" in response_assets
+    assert "event.key==='ArrowRight'" in response_assets
+    assert "else if(event.key==='Home')" in response_assets
+    assert "menuItems[0]?.focus()" in response_assets
+    assert "['ArrowDown','Enter',' '].includes(event.key)" in response_assets
+    assert "menu.addEventListener('focusout'" in response_assets
+    assert "choose(item.dataset.importMode,button)" in response_assets
+    assert "requestController?.abort()" in response_assets
+    assert "if(error.name==='AbortError')throw error" in response_assets
+    assert "requestJson('/api/imports/plaud/check',{method:'POST'},'Could not reach Plaud')" in response_assets
+    assert "setDialogBusy(true)" in response_assets
+    assert "input.value=''" in response_assets
+    assert "event.stopPropagation();if(!busy)closeImport()" in response_assets
+    assert "if(busy)return false" in response_assets
+    assert "closeButton.disabled=value" in response_assets
+    assert "event.target===backdrop&&!backdrop.hidden&&!busy" in response_assets
+    assert "setMenu(false,{restoreFocus:true})" in response_assets
+    assert "showCheckResult(lp.plaudCheckMessage(data))" in response_assets
+
+    from localplaud.i18n import catalog
+
+    messages = catalog("zh-Hant-TW")
+    assert messages["Audio source"] == "音訊來源"
+    assert messages["Could not upload audio"] == "無法上傳音訊"
+    assert messages["Could not reach Plaud"] == "無法連線至 Plaud"
+    assert messages["No new recordings"] == "沒有新錄音"
+    assert messages["unsupported audio/video format"] == "不支援的音訊或影片格式"
+    assert messages["file exceeds 2 GB limit"] == "檔案超過 2 GB 上限"
+
+
+def test_product_pages_use_centered_responsive_layout(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    home = c.get("/home")
+    assert '<div class="library-page home-page"><div class="page-frame">' in home.text
+    for path in ("/templates", "/discover", "/notifications"):
+        response = c.get(path)
+        assert response.status_code == 200
+        assert '<main class="main"><div class="content"' in response.text
+        page = with_assets(c, response)
+        assert ".main { flex: 1; min-width: 0; overflow-y: auto; background: var(--c-bg); }" in page
+        assert ".main > .content { width: 100%; margin: 0 auto; padding: 48px 40px 80px; }" in page
+        assert ".main > .content, .page-frame, .library-inner { padding: 20px 16px 40px; }" in page
+
+
+def test_browser_runtime_is_vendored_and_checksum_pinned(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    page = c.get("/")
+    assert '<script src="/static/htmx-1.9.12.min.js"></script>' in page.text
+    assert "unpkg.com" not in page.text
+    runtime = c.get("/static/htmx-1.9.12.min.js")
+    assert runtime.status_code == 200
+    assert hashlib.sha256(runtime.content).hexdigest() == (
+        "449317ade7881e949510db614991e195c3a099c4c791c24dacec55f9f4a2a452"
+    )
+    license_response = c.get("/static/HTMX-LICENSE.txt")
+    assert license_response.status_code == 200
+    assert b"Zero-Clause BSD" in license_response.content
+
+    menu_icon = c.get("/static/lucide/menu.svg")
+    assert menu_icon.status_code == 200
+    assert menu_icon.headers["content-type"].startswith("image/svg+xml")
+    assert b"lucide-menu" in menu_icon.content
+
+
+def test_home_renders_recent_recordings_and_operational_cards(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import ImportRun
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(
+            ImportRun(
+                id="home-import",
+                source="plaud",
+                status="completed",
+                total=754,
+                processed=754,
+                transcript_count=280,
+                summary_count=281,
+            )
+        )
+    response = c.get("/home")
+    assert response.status_code == 200
+    assert "Recent files" in response.text and "Weekly Sync" in response.text
+    assert "Plaud mirror" in response.text and "754 / 754" in response.text
+    assert "AutoFlow activity" in response.text
+    # Add audio (device upload and Plaud import) stays one click away.
+    assert 'data-import-mode="plaud"' in response.text and 'data-import-mode="device"' in response.text
+    assert 'href="/home"' in response.text and 'href="/"' in response.text
+
+
+def test_transcript_page_wraps_speaker_name_for_one_line_clamp(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import Speaker
+    from localplaud.db.session import session_scope
+
+    long_name = "陳品妤（產品營運與跨部門協調負責人 Product Operations Lead, Taipei HQ）"
+    with session_scope() as s:
+        s.add(Speaker(file_id="r1", key="SPEAKER_00", display_name=long_name))
+
+    page = c.get("/file/r1/transcript-page?view=raw")
+    assert page.status_code == 200
+    # The name is wrapped in .who-name (CSS clamps it to one ellipsized line)
+    # and duplicated into title= so the full identity stays reachable.
+    assert (
+        f'<button class="who" type="button" title="{long_name}" data-speaker-menu'
+        in page.text
+    )
+    assert f'<span class="who-name">{long_name}</span>' in page.text
+
+
+def test_ready_to_generate_empty_state_offers_method_dialog(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r2", filename="Fresh recording", status=FileStatus.downloaded,
+                        duration_ms=120000, start_time_ms=1783582737000, scene=1,
+                        audio_path=str(audio)))
+
+    r = c.get("/file/r2")
+    assert r.status_code == 200
+    # Guided empty state leads the reading flow instead of a bare status line.
+    assert "Ready to generate" in r.text
+    assert "The transcript, notes, and mind map will appear here after generation." in r.text
+    assert "data-open-generate" in r.text
+    assert "Transcript is not available yet." not in r.text
+    # Select-generation-method dialog: accessible, method radios, custom rows.
+    assert 'id="generate-backdrop"' in r.text
+    assert 'role="dialog" aria-modal="true" aria-labelledby="generate-title"' in r.text
+    assert "Select generation method" in r.text
+    assert "Auto generation" in r.text and "Custom generation" in r.text
+    assert 'name="generate-method" value="auto" checked' in r.text
+    assert 'id="generate-template"' in r.text
+    assert 'id="generate-start"' in r.text and "Start generation" in r.text
+    assert 'id="generate-cancel"' in r.text and 'id="generate-close"' in r.text
+    assert "The original audio and your edits are never replaced." in r.text
+    # The guided empty state stays free of technical pipeline vocabulary.
+    empty_block = r.text.split('class="empty generate-empty"', 1)[1].split("</div>", 1)[0]
+    for term in ("diarize", "align", "embed", "ASR", "pipeline"):
+        assert term not in empty_block
+    # Without a transcript there is nothing to generate notes from, and blank
+    # notes are no longer offered.
+    assert "Notes can be generated after a local transcript exists." in r.text
+    assert 'data-open-manual-note' not in r.text
+    assert 'class="note-tab note-add-tab" data-open-note-generation' not in r.text
+    assert 'id="generate-notes" disabled' in r.text
+
+
+def test_metadata_only_recording_guides_audio_import(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r3", filename="Cloud only", status=FileStatus.metadata_only,
+                        duration_ms=90000, start_time_ms=1783582737000, scene=1,
+                        audio_path=None))
+
+    r = c.get("/file/r3")
+    assert r.status_code == 200
+    assert "Audio not imported yet" in r.text
+    # Primary reading hierarchy stays free of technical provider language.
+    assert "Import the original audio from Plaud first — everything else is generated here afterwards." in r.text
+    assert "configured providers" not in r.text.split("Audio not imported yet", 1)[1].split("</div>", 2)[0]
+    assert "data-import-audio" in r.text
+    # Without local audio there is nothing to generate from yet.
+    assert 'id="generate-backdrop"' not in r.text
+
+
+def test_notes_empty_state_guides_template_generation(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    from localplaud.db.models import FileStatus, PlaudFile, Transcript
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r4", filename="Transcribed only", status=FileStatus.partial,
+                        duration_ms=90000, start_time_ms=1783582737000, scene=1,
+                        audio_path=str(audio)))
+        s.add(Transcript(file_id="r4", provider="mlx-whisper", language="zh", text="你好",
+                         segments=[{"text": "你好", "start": 0.0, "end": 1.0}]))
+
+    r = c.get("/file/r4?tab=notes")
+    assert r.status_code == 200
+    assert "No notes yet." in r.text
+    assert "Choose a template to generate a note from the transcript." in r.text
+    assert 'data-open-manual-note' not in r.text
+    # A local transcript already exists, so the pre-generation dialog is gone.
+    assert 'id="generate-backdrop"' not in r.text
+
+
+def test_note_tabs_scan_outputs_and_mark_editable_copies(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    _seed(str(audio))
+    from localplaud.db.models import Summary, UserNote
+    from localplaud.db.session import session_scope
+
+    long_title = "跨部門季度回顧與客戶成功追蹤 — extended saved answer about renewals and onboarding blockers"
+    with session_scope() as s:
+        # A second template output coexists with the seeded meeting note; the
+        # data model keeps exactly one current generated output per template.
+        s.add(Summary(file_id="r1", template="insights", title="Insights",
+                      content_md="# Insights", template_version=3))
+        s.add(UserNote(file_id="r1", title=long_title, content_md="body",
+                       source_type="ask_answer"))
+
+    r = c.get("/file/r1?tab=notes")
+    assert r.status_code == 200
+    # One tab per generated template output, keyed by summary id (not index),
+    # with version and generation time preserved in the tab title.
+    assert r.text.count('class="note-tab ') >= 3  # two generated + one saved
+    assert "Insights · v3" in r.text
+    import re as _re
+
+    panel_keys = _re.findall(r'data-note-panel="(sum-\d+)"', r.text)
+    assert len(panel_keys) == 2 and len(set(panel_keys)) == 2
+    for key in panel_keys:
+        assert f'data-note-target="{key}"' in r.text
+    hidden_panels = _re.findall(r'data-note-panel="sum-\d+" hidden', r.text)
+    assert len(hidden_panels) == 1  # only the active output is shown
+    # Editable copies are visually distinct (pencil icon, Editable note title)
+    # and long titles stay inside the clamped tab with full text on the title.
+    assert 'class="note-tab saved-note-tab' in r.text
+    assert f'title="Editable note · {long_title}"' in r.text
+    saved_tab = r.text.split('class="note-tab saved-note-tab', 1)[1].split("</button>", 1)[0]
+    assert "#i-pencil" in saved_tab
+    # The "+" affordance opens AI note generation directly; blank notes are gone.
+    assert "data-open-manual-note" not in r.text
+    assert "Blank note" not in r.text
+    assert 'data-open-note-generation aria-label="Generate AI note"' in r.text
+    assert 'id="manual-note-backdrop"' not in r.text
+    assert 'id="note-profile-select"' in r.text
+    assert 'name="profile_id"' in r.text
+    # Generated notes are edited in place; the first edit creates the copy.
+    assert "data-summary-editable=" in r.text
+    # Editing a generated note opens its editable copy for in-place editing.
+    assert "focus_note=${data.id}" in r.text
+    assert "base_version:Number(data.get('base_version'))" in r.text
+    assert "workspaceNoteDirty" in r.text and "beforeunload" in r.text
+    assert "Discard unsaved note changes?" in r.text
+    # Generated-note provenance now carries version and creation time.
+    assert _re.search(
+        r" · v3</span>(?:<span[^>]*>.*?</span>)?<span>[A-Z][a-z]{2} \d{2}, \d{4} · \d{2}:\d{2}"
+        r"</span><span>Generated from",
+        r.text,
+    )
+    # Lockstep invariant: the highlighted tab's target is exactly the one
+    # panel rendered visible, independent of either list's ordering.
+    active_target = _re.search(
+        r'data-note-target="((?:sum|saved)-\d+)" class="note-tab on"', r.text
+    ).group(1)
+    assert f'data-note-panel="{active_target}" hidden' not in r.text
+    assert f'data-note-panel="{active_target}"' in r.text
+    for other in set(panel_keys) - {active_target}:
+        assert f'data-note-panel="{other}" hidden' in r.text
+    # Note tabs are durable navigation state: exact Search links survive reload,
+    # and browser Back restores both the workspace tab and selected note.
+    assert "const activateNoteTarget=(target,push=false)" in r.text
+
+
+def test_workspace_inline_manual_note_edit_uses_optimistic_version_api(
+    monkeypatch, tmp_path
+):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import UserNote
+    from localplaud.db.session import session_scope
+
+    # A manual note created before blank-note creation was removed.
+    with session_scope() as s:
+        note = UserNote(file_id="r1", title="Draft", content_md="First version",
+                        source_type="manual", citations=[])
+        s.add(note)
+        s.flush()
+        created = {"id": note.id}
+    page = c.get(f"/file/r1?tab=notes&note_id={created['id']}")
+    assert f'data-workspace-note-form="{created["id"]}"' in page.text
+    assert 'name="base_version" value="1"' in page.text
+    assert f'data-note-edit="{created["id"]}"' in page.text
+
+    saved = c.put(
+        f"/api/notes/{created['id']}",
+        json={"title": "Draft", "content_md": "Second version", "base_version": 1},
+    )
+    assert saved.status_code == 200 and saved.json()["version"] == 2
+    stale = c.put(
+        f"/api/notes/{created['id']}",
+        json={"title": "Draft", "content_md": "Stale", "base_version": 1},
+    )
+    assert stale.status_code == 409
+
+
+def test_find_and_replace_covers_transcript_and_every_note(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import Summary
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        summary_id = session.query(Summary.id).filter_by(file_id="r1").scalar()
+    copy = c.post(f"/api/files/r1/summaries/{summary_id}/editable-copy").json()
+
+    page = c.get("/file/r1?tab=transcript")
+    assets = with_assets(c, page)
+    popover = page.text.split('class="transcript-popover search-popover"', 1)[1].split("</details>", 1)[0]
+    assert 'placeholder="Find in transcript and notes"' in popover
+    assert 'id="find-scopes"' in popover
+    assert 'data-transcript-editable="true"' in popover
+    assert "Replaces in the transcript and every editable note." in popover
+    # An editable copy is searched and replaced through its own panel only.
+    assert f'data-source-summary="{summary_id}"' in page.text
+    assert copy["source_summary_id"] == summary_id
+    # One action: notes are replaced in place and saved, then the transcript.
+    assert "window.localplaudNoteSearch.replaceAll(query,replacement,caseSensitive)" in page.text
+    assert "fetch('/file/r1/transcript/replace'" in page.text
+    assert "window.localplaudNoteSearch = noteSearch" in assets
+
+    # Viewing the raw transcript behind a correction keeps note replacement.
+    with session_scope() as session:
+        from localplaud.db.models import Transcript, TranscriptRevision
+
+        raw = session.query(Transcript).filter_by(file_id="r1").one()
+        session.add(TranscriptRevision(file_id="r1", base_transcript_id=raw.id, revision=1,
+                                       source=raw.source, segments=raw.segments, text=raw.text,
+                                       has_speakers=raw.has_speakers, note="edited"))
+    raw_view = c.get("/file/r1?tab=transcript&view=raw")
+    popover = raw_view.text.split('class="transcript-popover search-popover"', 1)[1].split("</details>", 1)[0]
+    assert 'data-transcript-editable="false"' in popover
+    assert "Only notes are replaced while an older or raw transcript is shown." in popover
+
+
+def test_workspace_generated_note_edit_reuses_copy_and_opens_inline_editor(
+    monkeypatch, tmp_path
+):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import Summary
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        summary_id = session.query(Summary.id).filter_by(file_id="r1").scalar()
+    first = c.post(f"/api/files/r1/summaries/{summary_id}/editable-copy").json()
+    second = c.post(f"/api/files/r1/summaries/{summary_id}/editable-copy").json()
+    assert second["id"] == first["id"]
+
+    page = c.get(f"/file/r1?tab=notes&note_id={first['id']}&edit_note={first['id']}")
+    r = page
+    assert f'data-note-edit="{first["id"]}"' in page.text
+    assert "new URLSearchParams(location.search).get('edit_note')" in page.text
+    assert 'form.elements.content_md.focus()' in page.text
+    # The rendered copy is itself the editor; blocks carry their source lines.
+    body = page.text.split("data-workspace-note-body", 1)[1].split("</div>", 1)[0]
+    assert f'data-note-editable="{first["id"]}"' in body
+    assert 'data-md="0:' in body
+    assert "/static/js/note-editor.js?v=" in page.text
+    assert "data-note-find" in page.text
+    assert "url.searchParams.set('note',target)" in r.text
+    assert "url.searchParams.set('note_id',target.slice(6))" in r.text
+    assert "window.addEventListener('popstate',syncWorkspaceLocation" in r.text
+    assert "const syncFilelistTab=name=>" in r.text
+    assert "for(const attribute of ['href','hx-get'])" in r.text
+    assert "syncFilelistTab(name);if(push)" in r.text
+    assert "document.addEventListener('htmx:configRequest'" in r.text
+    assert "event.detail.path=workspacePathForTab(event.detail.path,activePanelName())" in r.text
+    assert "if(next!==current)history.pushState(state,'',url)" in r.text
+    assert (
+        "if(requested!=='notes'){url.searchParams.delete('note');"
+        "url.searchParams.delete('note_id');}" in r.text
+    )
+
+
+def test_saved_only_recording_activates_saved_tab_and_panel(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile, UserNote
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r6", filename="Saved only", status=FileStatus.metadata_only,
+                        duration_ms=30000, start_time_ms=1783582737000, scene=1,
+                        audio_path=None))
+        s.add(UserNote(file_id="r6", title="Kept answer", content_md="body",
+                       source_type="ask_answer"))
+
+    r = c.get("/file/r6?tab=notes")
+    assert r.status_code == 200
+    import re as _re
+
+    saved_id = _re.search(r'data-note-target="(saved-\d+)"', r.text).group(1)
+    # With no generated notes, the saved tab is active and its panel visible.
+    assert f'data-note-target="{saved_id}" class="note-tab saved-note-tab on"' in r.text
+    assert f'data-note-panel="{saved_id}" hidden' not in r.text
+    assert f'data-note-panel="{saved_id}"' in r.text
+
+
+def test_generate_dialog_auto_persists_auto_template_choice(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r5", filename="Untranscribed", status=FileStatus.downloaded,
+                        duration_ms=60000, start_time_ms=1783582737000, scene=1,
+                        audio_path=str(audio)))
+
+    r = c.get("/file/r5")
+    # Auto must persist note-template key "auto" before queueing, so a prior
+    # per-recording custom template cannot be silently reused under the Auto
+    # label; Custom persists the picked key through the same call.
+    assert "const key=custom?document.getElementById('generate-template').value:'auto';" in r.text
+    assert r.text.index("const key=custom?") < r.text.index("/reprocess',{method:'POST'}")
+
+
+def test_processing_recording_shows_friendly_progress(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r7", filename="Being generated", status=FileStatus.processing,
+                        duration_ms=60000, start_time_ms=1783582737000, scene=1,
+                        audio_path=str(audio)))
+
+    r = c.get("/file/r7")
+    r_assets = with_assets(c, r)
+    assert r.status_code == 200
+    # Friendly in-progress state without stage jargon, updating politely.
+    assert '<div class="empty generate-empty" data-generation-progress>' in r_assets
+    assert 'id="generation-progress-title">Generating…' in r_assets
+    assert 'aria-live="polite" id="generation-progress-note"' in r_assets
+    assert "This page updates automatically when results are ready." in r_assets
+    progress_block = r.text.split(
+        '<div class="empty generate-empty" data-generation-progress>', 1
+    )[1].split("</div>", 1)[0]
+    for term in ("diarize", "align", "embed", "ASR", "pipeline", "stage"):
+        assert term not in progress_block
+    # No Generate CTA while work is pending, and the header label is live.
+    assert 'data-open-generate><svg' not in r.text
+    assert 'id="recording-state-label" aria-live="polite">Generating…' in r_assets
+    # The poller reuses the existing read-only status endpoint with cleanup.
+    assert "/api/imports/plaud/files/r7/audio/status" in r_assets
+    assert "if(statusTimer)clearTimeout(statusTimer)" in r_assets
+    # Hardened terminal detection: only a 2xx body with a recognized string
+    # status may refresh the view; anything else retries calmly, never reloads.
+    assert "if(response.ok)data=await response.json();" in r_assets
+    assert "if(cleanupController.signal.aborted)return;" in r_assets
+    assert "const status=typeof data?.status==='string'?data.status:null;" in r_assets
+    assert "const terminalStates=['done','partial','error'];" in r_assets
+    assert "statusTimer=setTimeout(tick,7000);" in r_assets
+    # Terminal refresh is a one-time hard reload issued only after the abort
+    # re-check: it cannot race an HTMX navigation that detached #app-view the
+    # way an in-flight htmx.ajax swap could, and the URL keeps tab context.
+    assert "htmx.ajax" not in r.text.split("terminalStates.includes(status)", 1)[1].split("}", 3)[0]
+    assert r.text.index("if(cleanupController.signal.aborted)return;") < r.text.index("terminalStates.includes(status)")
+    assert "location.reload();" in r.text.split("terminalStates.includes(status)", 1)[1][:400]
+    assert ".generate-progress-icon { animation: generate-spin" in r_assets
+    assert "@media (prefers-reduced-motion: no-preference)" in r_assets
+
+
+def test_queued_flag_shows_queued_state_only_when_pending(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r8", filename="Just queued", status=FileStatus.downloaded,
+                        duration_ms=60000, start_time_ms=1783582737000, scene=1,
+                        audio_path=str(audio)))
+
+    queued = c.get("/file/r8?queued=1")
+    assert "Queued for generation" in queued.text
+    assert '<div class="empty generate-empty" data-generation-progress>' in queued.text
+    plain = c.get("/file/r8")
+    assert '<div class="empty generate-empty" data-generation-progress>' not in plain.text
+    assert "Ready to generate" in plain.text
+    assert 'data-open-generate><svg' in plain.text
+
+
+def test_error_recording_keeps_usable_content_visible(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    from localplaud.db.models import FileStatus, PlaudFile, Transcript
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="r9", filename="Failed later stage", status=FileStatus.error,
+                        duration_ms=60000, start_time_ms=1783582737000, scene=1,
+                        audio_path=str(audio), error="embedding model unavailable"))
+        s.add(Transcript(file_id="r9", provider="mlx-whisper", language="zh", text="内容",
+                         segments=[{"text": "内容", "start": 0.0, "end": 1.0}]))
+
+    r = c.get("/file/r9")
+    # The transcript stays first-class; the failure shows as the existing
+    # actionable alert, never as a progress state that hides content.
+    assert '<div class="empty generate-empty" data-generation-progress>' not in r.text
+    assert "Processing paused" in r.text
+    assert 'id="transcript"' in r.text and "/file/r9/transcript-page" in r.text
+
+
+def test_sidebar_ops_card_summarizes_workspace(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    _seed(str(audio))  # r1 done
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="ra", filename="Working", status=FileStatus.processing,
+                        duration_ms=1000, start_time_ms=0, audio_path=str(audio)))
+        s.add(PlaudFile(id="rb", filename="Broken", status=FileStatus.error,
+                        duration_ms=1000, start_time_ms=0, audio_path=str(audio)))
+
+    r = c.get("/")
+    r_assets = with_assets(c, r)
+    assert "Workspace status" in r_assets
+    card = r.text.split('data-testid="ops-card"', 1)[1].split("</div>", 1)[0]
+    # Each count is an individually reachable link into the Library filters,
+    # plus a single System status destination.
+    assert '<a class="ops-stat" href="/?state=active"><strong>1</strong> generating</a>' in card
+    assert '<a class="ops-stat" href="/?state=attention"><strong class="ops-attn">1</strong> need attention</a>' in card
+    assert '<a class="ops-stat" href="/?state=done"><strong>1</strong> ready</a>' in card
+    assert '<a class="ops-sub" href="/status">View system status</a>' in card
+    # Status links rely on the global visible focus ring.
+    assert ":focus-visible { outline: 2px solid var(--c-focus); outline-offset: 2px;" in r_assets
+
+
+def test_sidebar_folder_link_exposes_full_name_via_title(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import Folder, PlaudFile
+    from localplaud.db.session import session_scope
+
+    long_name = "跨部門產品營運與客戶成功長期追蹤資料夾"
+    with session_scope() as s:
+        folder = Folder(name=long_name)
+        s.add(folder)
+        s.flush()
+        s.get(PlaudFile, "r1").folder_id = folder.id
+
+    r = c.get("/")
+    assert r.status_code == 200
+    # The sidebar folder name is ellipsized, so the full name must remain
+    # reachable as a tooltip. The title sits on the folder anchor itself.
+    after_href = r.text.split(f'href="/?folder={folder.id}"', 1)[1]
+    assert after_href.startswith(f' title="{long_name}">')
+
+
+def test_sidebar_ops_card_all_caught_up(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    _seed(str(audio))  # only r1, status done
+
+    r = c.get("/")
+    card = r.text.split('data-testid="ops-card"', 1)[1].split("</div>", 1)[0]
+    assert "All caught up" in card
+    assert "generating" not in card and "need attention" not in card and "in cloud" not in card
+
+
+def test_detail_page_renders(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    set_ask_enabled(c)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    _seed(str(audio))
+    from localplaud.db.models import PlaudFile, TranscriptRevision
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        recording = session.get(PlaudFile, "r1")
+        session.add(
+            TranscriptRevision(
+                file_id="r1",
+                base_transcript_id=recording.local_transcript.id,
+                revision=2,
+                source="local",
+                segments=recording.local_transcript.segments,
+                text=recording.local_transcript.text,
+                has_speakers=True,
+            )
+        )
+    r = c.get("/file/r1")
+    r_assets = with_assets(c, r)
+    assert r.status_code == 200
+    assert (
+        'id="recording-tab-notes" role="tab" aria-controls="recording-panel-notes" '
+        'aria-selected="true"'
+    ) in r_assets
+    # Flat Plaud tab row: each note output is its own workspace tab, labelled
+    # with its template; the first carries the stable notes-tab id.
+    assert 'data-panel="notes" data-note-target="sum-' in r_assets
+    assert '<div class="ws-tab-add"><button type="button" class="note-tab note-add-tab" data-open-note-generation' in r_assets
+    assert 'id="recording-panel-notes" role="tabpanel"' in r_assets
+    assert (
+        'id="recording-panel-notes" role="tabpanel" '
+        'aria-labelledby="recording-tab-notes" data-panel="notes" hidden'
+    ) not in r.text
+    transcript_view = c.get("/file/r1", params={"tab": "transcript"})
+    assert (
+        'id="recording-tab-transcript" role="tab" '
+        'aria-controls="recording-panel-transcript" aria-selected="true"'
+    ) in transcript_view.text
+    assert "SPEAKER_00" in r_assets
+    assert 'id="app-view" hx-history-elt' in r_assets
+    assert '<aside class="sidebar" id="workspace-sidebar">' in r_assets
+    assert "product-rail" not in r.text
+    assert "data-sidebar-toggle" not in r.text
+    assert "localplaud:sidebar-collapsed" not in r.text
+    assert ".mm-label" in r_assets and "overflow-wrap:anywhere" in r_assets
+    assert "body.app.nav-open, body.app.dialog-open { overflow: hidden; }" in r_assets
+    assert ".title-edit { width:36px;height:36px;opacity:1; }" in r_assets
+    assert ".seg .editbtn { min-width:36px;min-height:36px;opacity:1; }" in r_assets
+    # Desktop pencil keeps a 28px hit area; double-clicking segment text opens
+    # the same editor because the hover pencil alone is hard to discover.
+    assert "min-width:28px;min-height:28px" in r_assets
+    assert "on(document, 'dblclick'" in WORKSPACE_JS
+    assert "max-height: calc(100dvh - 24px); overflow: hidden" in r_assets
+    assert ".import-body { min-height: 0;" in r_assets and "overflow-y:auto" in r_assets
+    assert ".ask-user-message" in r_assets and ".saved-note-actions" in r_assets
+    assert ".sidebar{display:none}" not in r.text
+    assert r.text.index('<aside class="sidebar"') < r.text.index('id="app-view"')
+    sidebar_nav = r.text.split('<div class="sidebar-scroll">', 1)[1].split("</aside>", 1)[0]
+    assert sidebar_nav.index('href="/search"') < sidebar_nav.index('href="/home"')
+    assert sidebar_nav.index('href="/home"') < sidebar_nav.index(
+        'href="/ask"'
+    )
+    assert sidebar_nav.index('href="/ask"') < sidebar_nav.index(
+        'href="/templates"'
+    )
+    assert 'aria-controls="workspace-sidebar" aria-expanded="false"' in r_assets
+    assert 'class="nav-scrim" type="button" data-nav-close aria-label="Close menu" hidden' in r_assets
+    assert "event.target.closest('a.nav-item[href]" in r_assets
+    assert "document.activeElement===last" in r_assets
+    # The recording is a pushed screen on phones (no app top bar); Add audio stays in the shell.
+    assert 'data-import-mode="device"' in r_assets
+    assert "event.target.closest('[data-open-import]')" in r_assets
+    assert "getElementById('add-audio-button')?.click()" not in r.text
+    assert 'id="recording-file-list" hx-preserve' in r_assets
+    assert 'class="recording-crumb-link" href="/" hx-get="/" hx-target="#app-view"' in r_assets
+    assert "link.setAttribute('hx-target','#app-view')" in r_assets
+    assert "(?:api|audio|static|login|logout|register|oauth|auth|account|admin)" in r_assets
+    assert "link.setAttribute('hx-boost','false')" in r_assets
+    assert "sessionStorage.setItem(storageKey()" in r_assets
+    assert "if(event.target===appView)cleanupController.abort()" in r_assets
+    assert "const drainTranscript=()=>" in r_assets
+    assert ".tabs::-webkit-scrollbar { display:none; }" in r_assets
+    assert ".sidebar-scroll" in r_assets
+    assert 'data-start' in c.get("/file/r1/transcript-page").text  # seekable segments
+    assert "meeting" in r_assets.lower()  # summary tab
+    assert "Processing details" in r_assets
+    assert ".recording-advanced:not([open]) { display:none; }" in r_assets
+    assert "event.currentTarget.closest('details')?.removeAttribute('open')" in r_assets
+    assert "details.open=true;details.scrollIntoView" in r_assets
+    assert "#reprocess-msg:empty { display:none; }" in r_assets
+    assert 'id="reprocess-msg" class="sub" aria-live="polite"' in r_assets
+    assert 'class="pane recording-pane has-player"' in r_assets
+    assert ".recording-pane.has-player .tabs { top:0; }" in r_assets
+    assert ".tabs { position:sticky;top:0;" in r_assets
+    assert "Provider word timestamps validated" in r_assets
+    assert "42 timed words" in r_assets
+    assert "Forced alignment was not used" in r_assets
+    assert "AI-polished transcript" in r_assets
+    assert "revision 2" in r_assets
+    assert "107 segments / 3 chunks" in r_assets
+    assert "prompt transcript-polish/v1" in r_assets
+    assert "embedding model unavailable" in r_assets
+    assert "Resume" in r_assets and "Rebuild all" in r_assets
+    assert "Execution profile" in r_assets and "Current Settings" in r_assets
+    assert "Find in transcript" in r_assets and "Replace all" in r_assets
+    assert 'id="persistent-player"' in r_assets and 'id="waveform"' in r_assets
+    assert r.text.index('class="tabs" role="tablist"') < r.text.index('id="persistent-player"')
+    assert 'aria-label="Back 15 seconds" title="Back 15 seconds"' in r_assets
+    assert 'aria-label="Forward 15 seconds" title="Forward 15 seconds"' in r_assets
+    assert "skip(-15)" in WORKSPACE_JS and "skip(15)" in WORKSPACE_JS
+    assert 'id="open-share" type="button" data-recording-share aria-label="Share" title="Share"' in r_assets
+    # Share opens the one share sheet (link, copy, exports): no separate Export.
+    assert 'id="open-export"' not in r.text
+    # Plaud Web order: Share · Find · More · | · Ask.
+    header = r.text.split('<div class="recording-actions">', 1)[1].split("</header>", 1)[0]
+    assert header.index('id="open-share"') < header.index('id="open-find"')
+    assert header.index('id="open-find"') < header.index('class="recording-more"')
+    assert header.index('class="recording-more"') < header.index('id="open-ask-dock"')
+    assert 'class="tabs" role="tablist"' in r_assets
+    assert 'id="recording-tab-transcript" role="tab"' in r_assets
+    assert 'id="recording-panel-transcript" role="tabpanel"' in r_assets
+    assert 'class="tabpanel ask-dock" id="recording-panel-ask"' in r_assets
+    assert 'id="open-ask-dock" type="button" aria-controls="recording-panel-ask"' in r_assets
+    assert "localplaud:recording-ask-dock" in r_assets
+    assert "window.matchMedia('(min-width:1200px)')" in r_assets
+    assert ".recording-workspace-layout.ask-dock-open { grid-template-columns:minmax(0,1fr) minmax(280px,360px); }" in r_assets
+    assert "if(dockRequest)setAskDock(true)" in r_assets
+    assert "params.get('tab')||'notes'" in r_assets
+    assert "get('tab')||'transcript'" not in r.text
+    assert "item.setAttribute('aria-selected',String(active))" in r_assets
+    assert "item.tabIndex=active?0:-1" in r_assets
+    assert "function openDialog(backdrop,opener)" in r_assets
+    assert "recordingShell.inert=true" in r_assets
+    assert "dialogChromeRegions.forEach(region=>{region.inert=true;})" in r_assets
+    assert "event.key==='Escape'" in r_assets
+    assert "event.key!=='Tab'" in r_assets
+    assert "dialogOpener?.focus()" in r_assets
+    assert "body.dialog-open { overflow: hidden; }" in r_assets
+    assert 'data-close-popover aria-label="Close"' in r_assets
+    assert "const workspacePopovers=" in r_assets
+    assert "closeWorkspacePopover(open)" in r_assets
+    assert ".md table { display: block; width: 100%; max-width: 100%; margin: .8em 0; border-collapse: collapse; font-size: 13px; overflow-x: auto; }" in r_assets
+    # Mirrored note images must never exceed the note column or the viewport.
+    assert ".md img { display: block; max-width: min(100%, 560px); height: auto;" in r_assets
+    # Cells must opt out of the .md overflow-wrap:anywhere default: anywhere
+    # collapses every column's min-content width to one character on narrow
+    # viewports, so wide tables squeeze into vertical letter stacks instead of
+    # engaging the horizontal table scroll asserted above.
+    assert "vertical-align: top; overflow-wrap: break-word; }" in r_assets
+    # The clock shows the recording's stored duration before the browser has
+    # loaded audio metadata; playback sync falls back to the same value.
+    assert ">0:00 / 10:00</span>" in r_assets
+    assert '"durationSeconds": 600.0' in r_assets
+    assert "const knownDuration = Number(cfg.durationSeconds || 0);" in WORKSPACE_JS
+    assert "player.duration > 0 ? player.duration : knownDuration" in WORKSPACE_JS
+    # Speaker labels clamp to one visual line; the full name stays in the
+    # legend, hover title, and exports.
+    assert (
+        ".seg .who .who-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }"
+        in r_assets
+    )
+    assert ".speaker-pill>summary{max-width:min(200px,58vw)}" in r_assets
+    assert "((viewport.clientHeight - 24) / natural.height) * 100" in WORKSPACE_JS
+    assert "zoom:var(--mm-scale)" in r_assets
+    assert 'id="subscription-independence"' in r_assets
+    assert "Subscription independence" in r_assets
+    assert 'data-summary-editable=' in r_assets
+    assert 'id="open-share"' in r_assets and 'id="share-backdrop" data-file-id="r1" hidden' in r_assets
+    assert 'id="generate-notes"' in r_assets
+    assert "Choose a template, then generate notes and mind map." not in r.text
+    assert 'id="generate-backdrop"' not in r.text  # transcript exists — no pre-generation dialog
+    assert '<details class="speaker-pill">' in r_assets
+    assert '<form class="speaker-editor" method="post" action="/file/r1/speakers">' in r_assets
+    assert '<h1 id="recording-title-display" class="title-editable" title="Weekly Sync" contenteditable="plaintext-only" role="textbox" aria-label="Recording title" spellcheck="false" data-title-saved="Weekly Sync">Weekly Sync</h1>' in r_assets
+    # The title is edited in place; there is no separate edit button or form.
+    assert 'id="edit-recording-title"' not in r_assets and 'id="recording-title-form"' not in r_assets
+    assert "Transcript polished." in r_assets and "View raw transcript" in r_assets
+    assert '<p class="seg-text">' in c.get("/file/r1/transcript-page").text
+    raw = c.get("/file/r1?view=raw")
+    assert "Viewing the raw transcript." in raw.text and "Back to polished view" in raw.text
+    assert 'id="benchmark-backdrop"' not in r.text
+    assert 'id="open-benchmark"' not in r.text
+
+    filtered = c.get(
+        "/file/r1",
+        params={"return_to": "/?view=uncategorized&page=2&folder=7"},
+    )
+    assert (
+        'class="recording-crumb-link" href="/?view=uncategorized&amp;page=2&amp;folder=7" '
+        'hx-get="/?view=uncategorized&amp;page=2&amp;folder=7"'
+    ) in filtered.text
+    external = c.get("/file/r1", params={"return_to": "https://example.com/"})
+    assert 'class="recording-crumb-link" href="/" hx-get="/"' in external.text
+    searched = c.get(
+        "/file/r1",
+        params={"return_to": "/?q=Weekly&sort=name&dir=asc&page=1", "tab": "notes"},
+    )
+    assert '<div class="fl-title">Search results</div>' in searched.text
+    assert '<input class="fl-search" name="q" value="Weekly"' in searched.text
+    assert re.search(r'data-panel="notes" data-note-target="sum-\d+" class="note-tab on"', searched.text)
+    assert 'data-panel="notes" >' in searched.text
+    notes_workspace = c.get("/file/r1?tab=notes")
+    assert '/file/r1?return_to=%2F&amp;tab=notes' in notes_workspace.text
+    assert notes_workspace.text.index('class="ask"') < notes_workspace.text.index(
+        'id="ask-chips"'
+    )
+    evidence = c.get("/api/files/r1/acceptance")
+    assert evidence.status_code == 200
+    assert evidence.json()["schema"] == "localplaud-subscription-independence/v1"
+    assert {item["name"] for item in evidence.json()["checks"]} >= {
+        "local_transcript",
+        "transcript_polish",
+        "word_alignment",
+        "speaker_diarization",
+        "local_notes",
+        "ask_index",
+        "required_exports",
+    }
+
+
+def test_detail_auto_refreshes_and_shows_live_correction_progress(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from sqlalchemy import select
+
+    from localplaud.db.models import StageName, StageRun, StageStatus
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        run = session.scalar(
+            select(StageRun).where(
+                StageRun.file_id == "r1", StageRun.stage == StageName.correct
+            )
+        )
+        run.status = StageStatus.running
+        run.detail = {
+            "strategy": "contextual-segment-map",
+            "progress": {
+                "chunks_completed": 3,
+                "chunks_total": 8,
+                "target_segments_completed": 42,
+                "target_segments_total": 107,
+            },
+        }
+
+    page = c.get("/file/r1")
+
+    assert 'id="processing-details"' in page.text
+    assert 'hx-trigger="every 5s"' in page.text
+    assert 'hx-select="#processing-details"' in page.text
+    assert 'aria-live="polite">3 / 8 chunks · 42 / 107 segments' in page.text
+
+
+def test_detail_workspace_uses_traditional_chinese_locale(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    _seed(str(audio))
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        recording = session.get(PlaudFile, "r1")
+        recording.status = FileStatus.error
+        recording.error = "provider unavailable"
+        recording.pipeline_retry_count = 99
+    with c:
+        preferences = c.get("/api/preferences/workspace").json()
+        assert c.put(
+            "/api/preferences/workspace",
+            json=preferences | {"locale": "zh-Hant-TW"},
+        ).status_code == 200
+        page = c.get("/file/r1")
+        acceptance_panel = c.get("/file/r1/acceptance-panel")
+    assert page.status_code == 200
+    assert '<html lang="zh-Hant-TW"' in page.text
+    assert "const tr=window.localplaudT" in page.text
+    assert "output.textContent=tr('Removing local data…')" in page.text
+    assert "output.textContent=tr('Replacing…')" in page.text
+    assert "if(label)label.textContent=tr('Importing…')" in page.text
+    assert "out.textContent=tr('Checking recording signals…')" in page.text
+    for text in (
+        "繼續處理",
+        "全部重建",
+        "本機資料",
+        "執行設定檔",
+        "筆記範本",
+        "講者名稱",
+        "處理詳情",
+        "建立索引",
+        "已驗證供應商提供的逐字時間戳記",
+        "42 個具時間戳記的詞",
+        "未使用 forced alignment",
+        "AI 潤飾逐字稿",
+        "修訂 2",
+        "107 個段落 / 3 個區塊",
+        "提示詞 transcript-polish/v1",
+        "失敗",
+        "逐字稿",
+        "在逐字稿與筆記中尋找",
+        "分享",
+        "時間戳記",
+        "訂閱獨立性",
+            "處理已暫停",
+            "使用目前的 AI 設定檔繼續，並重新開始重試次數",
+            "技術詳情",
+    ):
+        assert text in page.text
+    assert acceptance_panel.status_code == 200
+    assert "尚未通過" in acceptance_panel.text
+    assert "JSON 證據" in acceptance_panel.text
+
+
+def test_safe_markdown_renderer_supports_notes_without_html_or_unsafe_links():
+    from localplaud.api.app import _render_markdown
+
+    rendered = str(
+        _render_markdown(
+            "# Heading\n\n"
+            "- outer\n  - inner\n\n"
+            "| Name | Value |\n| --- | --- |\n| A | ~~B~~ |\n\n"
+            "<script>alert('x')</script>\n\n"
+            "[unsafe](javascript:alert(1)) [safe](https://example.com/path)\n\n"
+            "![tracking pixel](https://tracker.example/pixel.gif)\n\n"
+            "![mirrored](/api/files/f/note-assets/0123456789abcdef.png)\n\n"
+            "- [ ] Open\n- [x] Done"
+        )
+    )
+    assert "<h1>Heading</h1>" in rendered
+    assert rendered.count("<ul>") == 2
+    assert "<table>" in rendered and "<s>B</s>" in rendered
+    assert "&lt;script&gt;" in rendered and "<script>" not in rendered
+    assert 'href="javascript:' not in rendered
+    assert 'href="https://example.com/path"' in rendered
+    assert 'src="https://tracker.example' not in rendered and "tracking pixel" in rendered
+    assert '<img src="/api/files/f/note-assets/0123456789abcdef.png"' in rendered
+    assert '<input class="task-list-item-checkbox" disabled="disabled" type="checkbox">' in rendered
+    assert (
+        '<input class="task-list-item-checkbox" checked="checked" '
+        'disabled="disabled" type="checkbox">'
+    ) in rendered
+
+
+def test_cloud_rule_normalization_prevents_setext_headings():
+    from localplaud.markdown import render_markdown
+    from localplaud.plaud.official import _normalize_cloud_markdown
+
+    normalized = _normalize_cloud_markdown("  text\n---   \n## H  ")
+    assert normalized == "text\n\n---   \n## H"
+    rendered = str(render_markdown(normalized))
+    assert "<p>text</p>" in rendered
+    assert "<hr" in rendered
+    assert "<h2>H</h2>" in rendered
+    assert "<h2>text</h2>" not in rendered
+
+
+def test_metadata_only_plaud_recording_offers_audio_import(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    r = c.get("/file/r1")
+    assert r.status_code == 200
+    assert "Import audio" in r.text
+    assert 'hx-post="/api/files/r1/reprocess"' not in r.text
+    assert 'hx-post="/api/files/r1/reprocess?force=true"' not in r.text
+    button = re.search(r'<button class="btn" type="button" id="generate-notes"([^>]*)>', r.text)
+    assert button and "disabled" not in button.group(1)
+
+
+def test_imported_only_recording_disables_local_generation(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALPLAUD_PIPELINE__ARTIFACT_MODE", "migration")
+    monkeypatch.setenv("LOCALPLAUD_PIPELINE__PREFER_CLOUD_ARTIFACTS", "true")
+    c = _client(monkeypatch, tmp_path)
+    set_ask_enabled(c)
+    from localplaud.db.models import FileStatus, PlaudFile, Transcript
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(
+            PlaudFile(
+                id="cloud-only-ui",
+                filename="Imported transcript",
+                status=FileStatus.done,
+                transcripts=[
+                    Transcript(
+                        provider="plaud",
+                        source="cloud",
+                        text="Imported only",
+                        segments=[{"text": "Imported only", "start": 0.0, "end": 1.0}],
+                    )
+                ],
+            )
+        )
+
+    page = c.get("/file/cloud-only-ui?tab=notes")
+    assert 'class="pane recording-pane"' in page.text
+    assert 'class="pane recording-pane has-player"' not in page.text
+    button = re.search(
+        r'<button class="btn" type="button" id="generate-notes"([^>]*)>', page.text
+    )
+    assert button and "disabled" in button.group(1)
+    assert "A local transcript is required first." in page.text
+    assert re.search(r'id="ask-q"[^>]*disabled', page.text)
+    assert re.search(r'class="btn sec ask-chip"[^>]*disabled', page.text)
+    assert c.post("/file/cloud-only-ui/generate-notes").status_code == 409
+
+
+def test_speaker_rename_preserves_library_context(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+
+    class DeferredThread:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("threading.Thread", DeferredThread)
+    response = c.post(
+        "/file/r1/speakers",
+        data={
+            "key": "SPEAKER_00",
+            "name": "Alex",
+            "return_to": "/?view=uncategorized&page=2",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "/file/r1?return_to=%2F%3Fview%3Duncategorized%26page%3D2&tab=transcript"
+    )
+
+
+def test_recording_profile_picker_persists_override(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import (
+        ExecutionProfile,
+        ModelCatalogEntry,
+        ProfileStageSelection,
+        ProviderConnection,
+        RecordingProfileOverride,
+    )
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        profile_id = session.query(ExecutionProfile.id).filter_by(is_system_default=True).scalar()
+    response = c.post("/file/r1/profile", data={"profile_id": profile_id}, follow_redirects=False)
+    assert response.status_code == 303
+    with session_scope() as session:
+        assert session.get(RecordingProfileOverride, "r1").profile_id == profile_id
+    page = c.get("/file/r1")
+    assert "Automatic" in page.text and "Resolved layers" in page.text
+    resolution = c.get("/api/providers/recordings/r1/resolution")
+    assert resolution.status_code == 200
+    assert resolution.json()["resolved"]["schema"] == "localplaud-resolved-profile/v2"
+
+    cleared = c.post(
+        "/file/r1/profile", data={"profile_id": ""}, follow_redirects=False
+    )
+    assert cleared.status_code == 303
+    with session_scope() as session:
+        assert session.get(RecordingProfileOverride, "r1") is None
+
+    with session_scope() as session:
+        connection = ProviderConnection(
+            key="invalid:test",
+            name="Invalid",
+            provider_type="test",
+            execution_target="local",
+            data_egress=False,
+        )
+        session.add(connection)
+        session.flush()
+        model = ModelCatalogEntry(
+            connection_id=connection.id,
+            model_key="invalid",
+            display_name="Invalid",
+            capabilities={"execution_target": "local", "data_egress": False, "stages": []},
+        )
+        profile = ExecutionProfile(key="invalid", name="Invalid", version=1)
+        session.add_all([model, profile])
+        session.flush()
+        session.add(
+            ProfileStageSelection(
+                profile_id=profile.id,
+                stage="summarize",
+                connection_id=connection.id,
+                model_id=model.id,
+            )
+        )
+        session.add(RecordingProfileOverride(file_id="r1", profile_id=profile.id))
+    invalid = c.get("/api/providers/recordings/r1/resolution")
+    assert invalid.status_code == 422
+    degraded = c.get("/file/r1")
+    assert degraded.status_code == 200
+    assert "Profile resolution needs attention" in degraded.text
+
+
+def test_status_page_renders(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    r = c.get("/status")
+    assert r.status_code == 200
+    assert "Environment" in r.text and "Pipeline" in r.text and "Configuration" in r.text
+    assert "Needs attention" in r.text and "embedding model unavailable" in r.text
+
+
+def test_settings_editor_renders_models_and_profile_builder(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import ExecutionProfile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        profile = session.query(ExecutionProfile).filter_by(is_system_default=True).one()
+        profile.cost_ceiling = 12.34
+    r = c.get("/settings")
+    assert r.status_code == 200
+    assert "Model catalog" in r.text
+    assert "Add model" in r.text
+    assert "Create execution profile" in r.text
+    assert "Local only / no egress" in r.text
+    assert "New version" in r.text and "Edit" in r.text and "Delete" in r.text
+    assert "Cost ceiling · US$12.34" in r.text
+    assert "Remote workers" in r.text and "Register worker" in r.text
+    assert 'href="/templates"' in r.text
+    assert "Plaud account" in r.text
+    assert "Native S256 PKCE · no Node.js" in r.text
+    assert "localplaud auth login" in r.text
+    assert 'class="settings-nav" aria-label="Settings sections"' in r.text
+    for target in (
+        "plaud-account",
+        "hardware-profiles",
+        "vocabulary",
+        "note-templates",
+        "connections",
+        "remote-workers",
+        "webhook-integrations",
+        "email-integrations",
+    ):
+        assert f'href="#{target}"' in r.text
+        assert f'id="{target}"' in r.text
+    assert ".settings-page{max-width:1180px!important}" in r.text
+    assert "grid-template-columns:180px minmax(0,1fr)" in r.text
+    assert "@media(max-width:820px)" in r.text
+    assert "<script>\n(()=>{\nconst CONNECTIONS=" in r.text
+    assert "form.reset();form.elements.name.value=p.name" in r.text
+    assert "form.elements.is_system_default.checked=p.is_system_default" in r.text
+    assert "form.elements.cost_ceiling.value=p.policy.cost_ceiling??''" in r.text
+    assert "Object.assign(window,{editVocabulary" in r.text
+    templates = c.get("/templates")
+    assert templates.status_code == 200
+    assert 'data-surface="templates"' in templates.text
+    assert 'id="sf-template-data"' in templates.text
+    status = c.get("/api/plaud/auth/status").json()
+    assert status == {
+        "ok": False,
+        "detail": f"no session at {tmp_path / 'plaud-tokens.json'}",
+        "provider": "official",
+        "login_method": "native-pkce-loopback",
+        "web_connect": True,
+        "pending": False,
+        "connected_at": None,
+    }
+
+
+def test_export_markdown_endpoint(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    r = c.get("/file/r1/export.md")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/markdown")
+    assert "Weekly Sync" in r.text and "## Transcript" in r.text
+    assert c.get("/file/missing/export.md").status_code == 404
+
+
+def test_export_menu_and_format_endpoints(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+    _seed(str(audio))
+    page = c.get("/file/r1")
+    assert 'data-share-panel="menu"' in page.text
+    assert 'id="export-backdrop"' not in page.text
+    assert "Speaker labels" in page.text and "Original audio" in page.text
+    assert 'id="copy-transcript"' in page.text and 'id="copy-notes"' in page.text
+    assert "navigator.clipboard.writeText(text)" in page.text
+    assert "document.execCommand('copy')" in page.text
+    assert "priorFocus?.focus()" in page.text
+    assert "export/transcript.txt?timestamps=true&amp;speakers=true" in page.text
+    assert 'href="/file/r1/export/notes.md"' in page.text
+    assert 'data-fmt="docx"' in page.text and 'data-fmt="pdf"' in page.text
+    txt = c.get("/file/r1/export/transcript.txt?timestamps=false&speakers=false")
+    assert txt.status_code == 200 and "hello team" in txt.text
+    assert "SPEAKER_00" not in txt.text and "[00:01]" not in txt.text
+    assert c.get("/file/r1/export/transcript.srt").status_code == 200
+    vtt = c.get("/file/r1/export/transcript.vtt")
+    assert vtt.status_code == 200 and vtt.text.startswith("WEBVTT")
+    docx = c.get("/file/r1/export/transcript.docx")
+    assert docx.status_code == 200 and docx.content.startswith(b"PK")
+    assert "wordprocessingml.document" in docx.headers["content-type"]
+    pdf = c.get("/file/r1/export/transcript.pdf")
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF-")
+    assert pdf.headers["content-type"].startswith("application/pdf")
+    notes_docx = c.get("/file/r1/export/notes.docx")
+    assert notes_docx.status_code == 200 and notes_docx.content.startswith(b"PK")
+    notes_pdf = c.get("/file/r1/export/notes.pdf")
+    assert notes_pdf.status_code == 200 and notes_pdf.content.startswith(b"%PDF-")
+    assert c.get("/file/r1/export/transcript.json").status_code == 404
+    assert c.get("/file/r1/export/notes.txt").status_code == 200
+    assert c.get("/file/r1/export/audio").content == b"audio"
+
+
+def test_bulk_export_route_streams_zip_and_reports_partial_availability(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(PlaudFile(id="bare", filename="No derived content"))
+
+    response = c.post(
+        "/api/files/export",
+        json={
+            "file_ids": ["r1", "bare"],
+            "transcript_format": "txt",
+            "notes_format": "md",
+            "timestamps": False,
+            "speakers": False,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/zip")
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="localplaud-recordings.zip"'
+    )
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-localplaud-export-emitted"] == "2"
+    assert response.headers["x-localplaud-export-skipped"] == "2"
+    assert int(response.headers["content-length"]) == len(response.content)
+    with zipfile.ZipFile(BytesIO(response.content)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        transcript_name = next(name for name in archive.namelist() if name.endswith("transcript.txt"))
+        transcript = archive.read(transcript_name).decode()
+    assert "hello team" in transcript
+    assert "SPEAKER_00" not in transcript and "[00:01]" not in transcript
+    assert [row["id"] for row in manifest["recordings"]] == ["r1", "bare"]
+    assert c.post(
+        "/api/files/export", json={"file_ids": ["missing"], "transcript_format": "txt"}
+    ).status_code == 404
+    assert c.post(
+        "/api/files/export", json={"file_ids": ["bare"], "notes_format": "md"}
+    ).status_code == 409
+    assert c.post("/api/files/export", json={"file_ids": ["r1"]}).status_code == 422
+
+
+def test_bulk_export_stream_closes_on_client_disconnect(monkeypatch):
+    from starlette.requests import ClientDisconnect
+
+    from localplaud.api.app import BulkExportBody, bulk_export_files
+    from localplaud.bulk_export import BulkExportResult
+
+    stream = BytesIO(b"archive")
+    result = BulkExportResult(
+        stream=stream,
+        size_bytes=7,
+        manifest={
+            "recordings": [
+                {"outputs": [{"status": "emitted"}]},
+            ]
+        },
+    )
+    monkeypatch.setattr("localplaud.bulk_export.build_bulk_export", lambda _request: result)
+    response = bulk_export_files(
+        BulkExportBody(file_ids=["r1"], transcript_format="txt")
+    )
+
+    async def disconnect():
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise OSError("client disconnected")
+
+        await response(
+            {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}},
+            receive,
+            send,
+        )
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(disconnect())
+    assert stream.closed
+
+
+def test_saved_note_only_recording_can_open_export_and_copy_notes(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import PlaudFile, UserNote
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(PlaudFile(id="notes-only", filename="Notes only"))
+        session.add(
+            UserNote(
+                file_id="notes-only",
+                title="Durable note",
+                content_md="Local content",
+                source_type="manual",
+            )
+        )
+
+    page = c.get("/file/notes-only")
+    assert page.status_code == 200
+    assert 'data-recording-share' in page.text
+    assert 'data-share-view="notes"' in page.text
+    assert 'id="copy-notes"' in page.text
+    assert re.search(r'<button[^>]+id="copy-transcript"[^>]+disabled', page.text)
+    assert 'href="/file/notes-only/export.md"' in page.text
+    exported = c.get("/file/notes-only/export/notes.md")
+    assert exported.status_code == 200 and "Local content" in exported.text
+
+
+def test_reprocess_missing_audio_restores_plaud_cache(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()  # r1 has no audio_path
+    audio = tmp_path / "restored.opus"
+    audio.write_bytes(b"audio")
+
+    def restore(file_id):
+        from localplaud.db.models import PlaudFile
+        from localplaud.db.session import session_scope
+
+        with session_scope() as session:
+            session.get(PlaudFile, file_id).audio_path = str(audio)
+        return audio
+
+    monkeypatch.setattr("localplaud.imports.ensure_plaud_audio", restore)
+    started = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args=(), kwargs=None, daemon=None):
+            self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+        def start(self):
+            started.append((self.target, self.args, self.kwargs))
+
+    monkeypatch.setattr("threading.Thread", DeferredThread)
+    response = c.post("/file/r1/reprocess")
+    assert response.status_code == 200
+    assert started
+
+
+def test_completed_remote_audio_renders_player_and_lazy_audio(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    audio = tmp_path / "lazy.mp3"
+    audio.write_bytes(b"lazy-audio")
+    monkeypatch.setattr("localplaud.imports.ensure_plaud_audio", lambda _file_id, *args, **kwargs: audio)
+
+    library = c.get("/")
+    assert "Audio on demand" in library.text
+    page = c.get("/file/r1")
+    assert page.status_code == 200
+    assert 'id="persistent-player"' in page.text
+    assert "audio on demand" in page.text.lower()
+    assert "Audio is stored in Plaud and downloads automatically" in page.text
+    assert 'id="import-recording-audio"' not in page.text
+    assert c.get("/audio/r1").content == b"lazy-audio"
+    assert c.get("/file/r1/export/audio").content == b"lazy-audio"
+
+
+def test_generate_notes_only_queues_derived_stages(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()  # the derived-only path deliberately works after local audio removal
+    started = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args=(), kwargs=None, daemon=None):
+            self.target = target
+            self.args = args
+            self.kwargs = kwargs or {}
+
+        def start(self):
+            started.append((self.target, self.args, self.kwargs))
+
+    monkeypatch.setattr("threading.Thread", DeferredThread)
+    monkeypatch.setattr(
+        "localplaud.poller.poll.current_daemon_owner", lambda: "web-daemon-owner"
+    )
+    assert c.post(
+        "/file/r1/generate-notes", data={"profile_id": "999999"}
+    ).status_code == 422
+    from localplaud.db.models import (
+        ExecutionProfile,
+        FileStatus,
+        PlaudFile,
+        StageName,
+        StageStatus,
+    )
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        profile_id = session.query(ExecutionProfile.id).first()[0]
+
+    response = c.post("/file/r1/generate-notes", data={"profile_id": profile_id})
+    assert response.status_code == 200
+    assert response.text == "notes and mind map queued"
+    assert started and started[0][1] == ("r1",)
+    assert started[0][0].__wrapped__.__name__ == "process_derived_artifacts"
+
+    with session_scope() as session:
+        recording = session.get(PlaudFile, "r1")
+        stages = {run.stage: run for run in recording.stage_runs}
+        assert recording.status == FileStatus.processing
+        assert recording.processing_token.startswith("daemon:web-daemon-owner:")
+        assert started[0][2]["claim_token"] == recording.processing_token
+        assert started[0][2]["profile_id"] == profile_id
+        for stage in (StageName.summarize, StageName.mind_map, StageName.index):
+            assert stages[stage].status == StageStatus.pending
+            assert stages[stage].detail["stale"] is True
+            assert stages[stage].detail["derived_only"] is True
+        assert stages[StageName.correct].status == StageStatus.completed
+        assert stages[StageName.align].status == StageStatus.completed
+
+
+def test_search_page_renders_empty(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    r = c.get("/search")
+    assert r.status_code == 200
+    # a query with no index / provider shouldn't 500
+    assert c.get("/search?q=anything").status_code == 200
+
+
+def test_independent_ui_labels_imported_transcript_without_treating_it_as_local(
+    monkeypatch, tmp_path
+):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile, Summary, Transcript
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        file = PlaudFile(id="cloud", filename="Cloud import", status=FileStatus.downloaded)
+        file.transcripts = [
+            Transcript(
+                provider="plaud",
+                source="cloud",
+                text=" ".join(f"imported-{index}" for index in range(130)),
+                segments=[
+                    {
+                        "text": f"imported-{index}",
+                        "start": float(index),
+                        "end": float(index + 1),
+                    }
+                    for index in range(130)
+                ],
+            )
+        ]
+        file.summaries = [Summary(template="plaud", source="cloud", content_md="note")]
+        s.add(file)
+
+    listing = c.get("/api/files").json()["files"][0]
+    assert listing["has_transcript"] is False
+    assert listing["has_imported_transcript"] is True
+    assert listing["has_summary"] is False
+    assert listing["has_imported_summary"] is True
+
+    detail = c.get("/file/cloud")
+    assert detail.status_code == 200
+    assert "Plaud import" in detail.text
+    assert "canonical result" in detail.text
+    assert 'hx-get="/file/cloud/transcript-page?source=imported"' in detail.text
+    assert 'class="chip plaud-note-chip">Plaud</span>' in detail.text
+    assert "Read-only" in detail.text
+    assert 'data-summary-copy=' not in detail.text
+    first = c.get("/file/cloud/transcript-page?source=imported")
+    assert "imported-0" in first.text and "offset=120" in first.text
+    transcript_id = int(re.search(r"page_transcript_id=(\d+)", first.text).group(1))
+    transcript_token = re.search(
+        r"page_transcript_token=([0-9a-f]+)", first.text
+    ).group(1)
+    continuation = c.get(
+        f"/file/cloud/transcript-page?source=imported&page_transcript_id={transcript_id}"
+        f"&page_transcript_token={transcript_token}&offset=120"
+    )
+    assert continuation.status_code == 200 and "imported-129" in continuation.text
+
+    with session_scope() as session:
+        local_row = Transcript(
+            file_id="cloud",
+            provider="local-asr",
+            source="local",
+            text="local raw",
+            segments=[{"text": "local raw", "start": 0.0, "end": 1.0}],
+        )
+        other = PlaudFile(id="other", filename="Other", status=FileStatus.downloaded)
+        other_imported = Transcript(
+            provider="plaud",
+            source="cloud",
+            text="other imported",
+            segments=[{"text": "other imported", "start": 0.0, "end": 1.0}],
+        )
+        other.transcripts = [other_imported]
+        session.add_all([local_row, other])
+        session.flush()
+        local_row_id = local_row.id
+        other_imported_id = other_imported.id
+
+    wrong_file = c.get(
+        f"/file/cloud/transcript-page?source=imported&page_transcript_id={other_imported_id}"
+        f"&page_transcript_token={transcript_token}&offset=120"
+    )
+    assert wrong_file.status_code == 404
+    wrong_source = c.get(
+        f"/file/cloud/transcript-page?source=imported&page_transcript_id={local_row_id}"
+        f"&page_transcript_token={transcript_token}&offset=120"
+    )
+    assert wrong_source.status_code == 404
+    assert c.get(
+        "/file/cloud/transcript-page?source=imported&offset=120"
+    ).status_code == 409
+    assert c.get(
+        f"/file/cloud/transcript-page?source=imported&page_transcript_id={transcript_id}"
+        "&page_transcript_token=deadbeef&offset=120"
+    ).status_code == 404
+
+    with session_scope() as session:
+        imported = session.get(Transcript, transcript_id)
+        imported.segments = [
+            {"text": "refreshed imported", "start": 0.0, "end": 1.0}
+        ]
+    mutated = c.get(
+        f"/file/cloud/transcript-page?source=imported&page_transcript_id={transcript_id}"
+        f"&page_transcript_token={transcript_token}&offset=120"
+    )
+    assert mutated.status_code == 404
+
+
+def test_home_modules_use_shell_language_and_direct_routes(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()  # r1 done
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    long_title = "二○二六 Q3 跨部門客戶訪談與後續追蹤決議（含負責人與驗收條件）extended weekly review"
+    with session_scope() as s:
+        s.add(PlaudFile(id="h-gen", filename=long_title, status=FileStatus.processing,
+                        duration_ms=90000, start_time_ms=1783582838000, scene=1))
+        s.add(PlaudFile(id="h-err", filename="Failed import", status=FileStatus.error,
+                        duration_ms=30000, start_time_ms=1783582839000, scene=1))
+
+    r = c.get("/home")
+    assert r.status_code == 200
+    # Ops vocabulary and the aggregate filter route replace the old tile.
+    assert '<span class="home-card-title">Generating</span>' in r.text
+    assert 'class="home-card" href="/?state=generating"' in r.text
+    # Title-first rows with one muted meta line and direct recording routes.
+    assert 'class="row-title" href="/file/h-gen"' in r.text
+    assert f'title="{long_title}">{long_title}</a>' in r.text
+    page = with_assets(c, r)
+    assert ".file-row .row-title { min-width: 0; color: var(--c-text); font-size: 14px; line-height: 22px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }" in page
+    # Friendly status chips: quiet done rows, Generating… while working.
+    row_gen = r.text.split('data-file-id="h-gen"', 1)[1].split("</li>", 1)[0]
+    assert '<span class="state state-processing">Generating…</span>' in row_gen
+    row_done = r.text.split('data-file-id="r1"', 1)[1].split("</li>", 1)[0]
+    assert 'class="state' not in row_done
+    # Needs attention: translated heading, aggregate route, friendly chip.
+    assert "Needs attention" in r.text
+    assert 'class="home-card" href="/?state=attention"' in r.text
+    row_err = r.text.split('data-file-id="h-err"', 1)[1].split("</li>", 1)[0]
+    assert '<span class="state state-attention">Needs attention</span>' in row_err
+
+
+def test_search_results_are_title_first_with_quiet_kind_labels(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    set_ask_enabled(c)
+    _seed()
+    from localplaud.db.models import Folder, PlaudFile, UserNote
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        folder = Folder(name="跨部門產品營運與客戶成功長期追蹤資料夾")
+        s.add(folder)
+        s.flush()
+        s.get(PlaudFile, "r1").folder_id = folder.id
+        s.add(UserNote(file_id="r1", title="Kept answer",
+                       content_md="hello darkness my old friend", source_type="ask_answer"))
+
+    r = c.get("/search?q=hello")
+    assert r.status_code == 200
+    # Title-first group header with duration · date · folder context, owned
+    # search styling with a stable two-line clamp, full text on title=.
+    assert '<strong class="search-group-title">Weekly Sync</strong>' in r.text
+    assert 'title="Weekly Sync"' in r.text
+    surfaces_css = c.get("/static/css/surfaces.css").text
+    assert ".sf-search-page .search-group-title { display:-webkit-box;-webkit-line-clamp:2" in surfaces_css
+    assert ".sf-search-page .search-hit-text { display:-webkit-box;-webkit-line-clamp:3" in surfaces_css
+    assert "<style>" not in r.text.split('data-surface="search"', 1)[1]
+    head = r.text.split('class="search-group-head"', 1)[1].split("</a>", 1)[0]
+    assert "10:00 ·" in head and "跨部門產品營運與客戶成功長期追蹤資料夾" in head
+    # Transcript match: the playable timestamp is the label — no jargon chips.
+    assert 'href="/file/r1?t=1.0"' in r.text
+    assert ">Semantic<" not in r.text and ">Transcript<" not in r.text
+    # The saved note is distinguished from generated notes.
+    assert '<span class="search-kind">Saved note</span>' in r.text
+    assert "recordings matched" in r.text
+
+    # Generated-note match keeps the quiet Note label.
+    notes = c.get("/search?q=point")
+    assert '<span class="search-kind">Note</span>' in notes.text
+
+    # A title match renders compactly instead of duplicating the heading.
+    titles = c.get("/search?q=Weekly")
+    assert "Matches the recording title" in titles.text
+    title_hit = titles.text.split("Matches the recording title", 1)[0].rsplit('class="search-hit"', 1)[1]
+    assert "Weekly Sync" not in title_hit
+    # No-query and no-match states offer direct next actions, no marketing.
+    empty = c.get("/search")
+    assert "Search your whole library" in empty.text
+    for href, label in (("/", "All files"), ("/notes", "Saved notes"),
+                        ("/ask", "Ask the library")):
+        assert f'href="{href}"' in empty.text and label in empty.text
+    missing = c.get("/search?q=zzznotfoundzzz")
+    assert "No matches for" in missing.text and "Ask the library" in missing.text
+
+
+def test_empty_local_transcript_has_honest_speech_notice(monkeypatch, tmp_path):
+    monkeypatch.setenv('LOCALPLAUD_API__LOGIN_PASSWORD', '')
+    monkeypatch.setenv('LOCALPLAUD_API__AUTH_TOKEN', '')
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile, Transcript
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(PlaudFile(id='silence', filename='Original recording', status=FileStatus.done))
+        session.add(Transcript(file_id='silence', provider='faster-whisper', source='local',
+                               text='', segments=[]))
+    response = c.get('/file/silence/transcript-page')
+    assert response.status_code == 200
+    assert 'No recognizable speech' in response.text
+    assert 'original audio is unchanged' in response.text
+    assert 'role="status"' in response.text
+
+
+def test_acoustic_revision_notice_describes_shown_history_and_preserves_tab(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import PlaudFile, Transcript, TranscriptRevision
+    from localplaud.db.session import session_scope
+    with session_scope() as session:
+        session.add(PlaudFile(id='history', filename='History'))
+        raw = Transcript(file_id='history', source='local', provider='fake', text='raw',
+                         segments=[{'text': 'raw', 'start': 0, 'end': 1}])
+        session.add(raw)
+        session.flush()
+        for number, kind in [(1, 'ai_polish'), (2, 'speech_cleanup')]:
+            session.add(TranscriptRevision(file_id='history', base_transcript_id=raw.id,
+                revision=number, source='local', kind=kind, text=kind,
+                segments=[{'text': kind, 'start': 0, 'end': 1}]))
+    preview = c.get('/file/history?tab=transcript&view=corrected&revision=1')
+    assert preview.status_code == 200
+    assert 'Transcript rechecked against audio.' not in preview.text
+    current = c.get('/file/history?tab=transcript')
+    assert 'Transcript rechecked against audio.' in current.text
+    assert '?view=raw&amp;tab=transcript&amp;return_to=' in current.text
+
+
+def test_recording_reading_and_share_entrypoints(monkeypatch, tmp_path):
+    """Local-only notes open for reading; public sharing is explicit, never automatic."""
+    client = _client(monkeypatch, tmp_path)
+    _seed()
+    page = client.get("/file/r1")
+    assert page.status_code == 200
+    html = page.text
+    assert re.search(r'<h2 class="recording-reading-title[^"]*"[^>]*>Weekly Sync</h2>', html)
+    assert 'class="recording-reading-title title-editable" title="Weekly Sync" contenteditable="plaintext-only"' in html
+    disclosure = re.search(r'<details[^>]+id="note-generation-settings"[^>]*>', html)
+    assert disclosure and 'open' not in disclosure.group()
+    assert 'id="menu-edit-title"' in html
+    assert 'id="menu-find-transcript"' in html
+    share = html.split('id="share-backdrop"', 1)[1].split('{% endblock', 1)[0]
+    assert share.index('id="public-share-title"') < share.index('class="workspace-share"')
+    assert 'id="create-public-share"' in share
+    assert 'data-share-view="transcript"' in share
+    assert 'data-share-view="notes"' in share
+    assert 'id="export-backdrop"' not in html
+    assert client.get('/api/files/r1/share-link').json()['active'] is False
+    assert 'src="/static/recording-share.js?v=3"' in html
+    assert "url.searchParams.set('tab',requested)" in html
+    assert "if(requested==='transcript')url.searchParams.delete('tab')" not in html
+
+
+def test_empty_recording_exposes_note_generation_settings(monkeypatch, tmp_path):
+    from localplaud.db.models import PlaudFile
+    from localplaud.db.session import session_scope
+
+    client = _client(monkeypatch, tmp_path)
+    with session_scope() as session:
+        session.add(PlaudFile(id='empty-reader', filename='Empty recording', origin='upload'))
+    html = client.get('/file/empty-reader').text
+    disclosure = re.search(r'<details[^>]+id="note-generation-settings"[^>]*>', html)
+    assert disclosure and 'open' in disclosure.group()
+    assert 'A local transcript is required first.' in html
+
+
+def test_share_sheet_is_available_in_progressive_workspace(monkeypatch, tmp_path):
+    """Library navigation receives the complete share UI and its independent initializer."""
+    client = _client(monkeypatch, tmp_path)
+    _seed()
+    page = client.get('/file/r1?workspace=true', headers={'HX-Request': 'true'})
+    assert page.status_code == 200
+    assert 'data-recording-share' in page.text
+    assert 'id="share-backdrop" data-file-id="r1" hidden' in page.text
+    assert 'data-share-panel="menu"' in page.text
+    assert 'data-share-panel="link"' in page.text
+    assert 'data-share-panel="transcript"' in page.text
+    assert 'data-share-panel="notes"' in page.text
+    assert 'id="export-backdrop"' not in page.text
+    assert '/static/recording-share.js?v=3' in page.text
+    # HTMX retains the outer shell: its old CSS must not size the new sheet.
+    assert '<link rel="stylesheet" href="/static/recording-share.css?v=4">' in page.text
+    stylesheet = client.get('/static/recording-share.css?v=4')
+    assert stylesheet.status_code == 200
+    assert stylesheet.headers['content-type'].startswith('text/css')
+    # Fanboy Social's generic ##.share-body rule hides essential app controls.
+    # Keep our dialog body out of that generic social-widget namespace.
+    assert 'class="import-body lp-recording-actions-body"' in page.text
+    assert not re.search(r'class="[^"]*(?<![\w-])share-body(?![\w-])', page.text)
+    assert '.lp-recording-actions-body' in stylesheet.text
+    assert client.get('/static/recording-share.js?v=3').status_code == 200
+    assert client.get('/api/files/r1/share-link').json()['active'] is False
+
+
+def test_share_note_clipboard_payload_is_local_and_script_safe(monkeypatch, tmp_path):
+    from localplaud.db.models import PlaudFile, UserNote
+    from localplaud.db.session import session_scope
+
+    client = _client(monkeypatch, tmp_path)
+    content = '</script><script>alert("note")</script>\n\nLocal manual note'
+    with session_scope() as session:
+        session.add(PlaudFile(id='clipboard-note', filename='Notes', origin='upload'))
+        session.add(UserNote(file_id='clipboard-note', title='My note', content_md=content, source_type='manual'))
+    html = client.get('/file/clipboard-note').text
+    payload = re.search(r'<script type="application/json" data-copy-note-text="saved-\d+">(.*?)</script>', html, re.S)
+    assert payload is not None
+    assert '</script>' not in payload.group(1)
+    assert json.loads(payload.group(1)) == content
+    assert re.search(r'<button[^>]+id="copy-transcript"[^>]+disabled', html)
+    assert 'data-share-view="copy-notes"' in html
+
+
+def test_cloud_note_uses_imported_tab_name_and_explains_unavailable_card(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import PlaudFile, Summary
+    from localplaud.db.session import session_scope
+    with session_scope() as session:
+        session.add(PlaudFile(id="cloud-card", filename="Recording", origin="plaud", error="Local stage paused"))
+        session.add(Summary(file_id="cloud-card", template="auto_sum_note", source="cloud",
+                            template_snapshot={"name": "Project review", "source": "plaud"},
+                            content_md="[](plaud://image?type=summaryCard&id=synthetic)\n\n## Topic\n\nOriginal ending"))
+        session.add(PlaudFile(id="cloud-empty", filename="Empty", origin="plaud"))
+        session.add(PlaudFile(id="cloud-expired", filename="Expired image", origin="plaud"))
+        session.add(Summary(file_id="cloud-expired", template="auto_sum_note", source="cloud",
+                            template_snapshot={"name": "Summary", "unavailable_images": 1},
+                            content_md="Original text with unavailable image"))
+    expired = c.get("/file/cloud-expired?tab=notes")
+    assert 'class="sub cloud-image-notice"' in expired.text
+    assert 'Original text with unavailable image' in expired.text
+    page = c.get("/file/cloud-card?tab=notes")
+    assert "Project review" in page.text
+    recovery = re.search(r'<details class="recording-recovery"([^>]*)>', page.text)
+    assert recovery and "open" not in recovery.group(1)
+    assert "Auto_Sum_Note" not in page.text
+    assert 'class="sub cloud-image-notice"' in page.text
+    assert "<h2>Topic</h2>" in page.text
+    assert "<p>Original ending</p>" in page.text
+    empty = c.get("/file/cloud-empty?tab=notes")
+    assert "Import Plaud notes" in empty.text
+    assert 'data-cloud-import-status role="status"' in empty.text
+
+
+def _seed_tags(count: int):
+    from localplaud.db.models import FileStatus, PlaudFile, Tag
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="tagged", filename="Tagged file", status=FileStatus.done))
+        s.flush()
+        rec = s.get(PlaudFile, "tagged")
+        tags = [Tag(name=f"Topic {i:03d}") for i in range(count)]
+        s.add_all(tags)
+        s.flush()
+        rec.tags = tags[-3:]
+        return [t.id for t in tags]
+
+
+def test_sidebar_tags_group_is_bounded_and_lazy(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    ids = _seed_tags(40)
+    html = c.get("/home").text
+    group = html.split('id="sidebar-tags"', 1)[1].split("</nav>", 1)[0]
+    # Most used first, bounded, with a lazy route to the rest.
+    assert group.count('href="/?tag=') == 8
+    assert f'href="/?tag={ids[-1]}"' in group
+    assert 'hx-get="/ui/sidebar-tags"' in group
+    assert "(40)" in group
+    assert "Topic 020" not in html
+
+    fragment = c.get("/ui/sidebar-tags").text
+    assert fragment.count('href="/?tag=') == 40
+    assert "data-sidebar-tag-filter" in fragment
+
+
+def test_sidebar_tags_marks_active_tag_even_outside_top_set(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    ids = _seed_tags(20)
+    rare = ids[10]  # unused and alphabetically outside the top eight
+    html = c.get(f"/?tag={rare}").text
+    group = html.split('id="sidebar-tags"', 1)[1].split("</nav>", 1)[0]
+    assert "data-transient-tag" in group
+    assert re.search(rf'class="nav-item on" href="/\?tag={rare}"', group)
+    assert 'data-active-tag-name="Topic 010"' in html
+    # "All files" is not active while a tag filter is applied.
+    assert not re.search(r'class="nav-item on" href="/"', html)
+
+
+def test_sidebar_hides_tags_group_without_tags(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    assert 'id="sidebar-tags"' not in c.get("/home").text
+
+
+def test_home_lists_five_recent_files(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        for i in range(8):
+            s.add(PlaudFile(id=f"h{i}", filename=f"Home file {i}", status=FileStatus.done,
+                            start_time_ms=1_700_000_000_000 + i))
+    html = c.get("/home").text
+    recent = html.split('id="home-recent-title"', 1)[1].split("</section>", 1)[0]
+    assert sorted(set(re.findall(r"Home file (\d)", recent))) == ["3", "4", "5", "6", "7"]
+
+
+def test_library_checkbox_gutter_reveals_on_hover_focus_selection_and_touch():
+    css = (Path(__file__).parents[1] / "src/localplaud/api/static/css/app.css").read_text()
+    assert ".file-table-head .head-check { position: absolute; left: 12px; opacity: 0;" in css
+    assert ".is-selecting .file-table-head .head-check, .file-table-head .head-check:focus-visible" in css
+    assert ".file-row:focus-within .row-check" in css
+    touch = css.index("@media (hover: none) { .file-row .row-check, .file-table-head .head-check")
+    # The touch override must come after the hidden-by-default row rule to win.
+    assert touch > css.index(".file-row .row-check { position: absolute;")
+
+
+def test_find_and_replace_opens_from_the_top_bar_over_the_current_tab(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    page = c.get("/file/r1?workspace=true").text
+
+    # The panel lives in the top bar, so it opens at the top right on any tab.
+    header = page.split('<header class="detail-topbar ws-topbar">', 1)[1].split("</header>", 1)[0]
+    assert '<details class="transcript-tool ws-find"><summary class="icon-action icon-only" id="open-find"' in header
+    assert 'id="find-popover"' in header and 'id="transcript-find"' in header
+    toolbar = page.split('<div class="transcript-toolbar">', 1)[1].split('<div class="legend"', 1)[0]
+    assert 'id="transcript-find"' not in toolbar
+    assert 'id="open-find-inline"' in toolbar
+
+    # Opening, typing, and Replace all never switch to the transcript on their own.
+    open_find = WORKSPACE_JS.split("const openFind = () => {", 1)[1].split("};", 1)[0]
+    assert 'data-panel="transcript"' not in open_find
+    assert "activatePanel('transcript',true)" not in page
+    assert "focusPending&&matches.length&&transcriptShown()" in page
+    assert "tab=transcript&return_to" not in page.split("getElementById('replace-all')", 1)[1]
+    assert "next.searchParams.set('tab',document.querySelector('.tabs>button.on')?.dataset.panel" in page

@@ -1,0 +1,374 @@
+# Deploying localplaud
+
+localplaud ships one repo that runs across very different hardware via Docker
+Compose **profiles**. A bundled Caddy reverse proxy terminates HTTPS for your
+domain automatically. See [ADR 0004](adr/0004-deployment-profiles.md) for the
+rationale.
+
+**Plaud-local operators:** for Fedora + inference-gateway-manager (IGM) client
+wiring, AMD/CPU extras, and Windows WSL policy, see
+[deploy-fedora-igm.md](deploy-fedora-igm.md) and [extras-matrix.md](extras-matrix.md).
+Those overlays do not change the upstream Docker profiles below.
+
+| Profile | Hardware                     | ASR                                   |
+| ------- | ---------------------------- | ------------------------------------- |
+| `cpu`   | CPU-only machine             | local turbo where practical; explicit cloud opt-in |
+| `gpu`   | NVIDIA + CUDA                | local Whisper large-v3-turbo           |
+| `mac`   | Apple Silicon                | local MLX large-v3-turbo on the host   |
+
+The subscription-independent reference profile uses local Whisper large-v3-turbo plus
+alignment and diarization. A cloud ASR remains possible, but is an explicit cost and
+privacy choice rather than an automatic fallback.
+
+## Evidence-note policy rollout
+
+Deploy controller and remote workers together when changing the note policy:
+`evidence-notes/v2` requests reject mismatched workers. Back up SQLite with its
+online backup API before a scoped regeneration, preserve the original audio and
+existing notes, and qualify real candidates first. Deploying does not enqueue all
+completed recordings. Manual derived-only resume can regenerate an older policy
+without rerunning ASR; source failures require a separate speech recovery.
+Private resumable subcall caches live beside the configured audio directory in
+`note-checkpoints/`; retain them across worker restarts. See
+[note-quality.md](note-quality.md) for configuration and evaluation limits.
+
+## Recording concurrency
+
+Set `pipeline.auto_process_untranscribed_only = true` to admit only recordings
+without a local transcript or completed transcription stage. Each admitted recording
+still runs its normal enabled stages, including notes. A recording whose local
+transcription completed within `pipeline.untranscribed_only_retry_hours` (default
+72) keeps its bounded automatic retries, so a new recording whose correction or
+notes failed still finishes. Older failures wait for manual Resume or an explicit
+recovery queue; automatic old-note retries and standalone index backfills are paused. Existing artifacts and user edits remain intact.
+Disable any separately installed maintenance/reprocessing service as well: manual
+and maintenance calls are intentionally outside this automatic queue filter.
+
+`pipeline.concurrency` bounds the daemon's recording slots. With more than one
+slot, each free slot selects one recording from the current queue; new downloads
+take priority over retries. Eligible retries are ordered by recording time, so a
+new recording retains priority after a failed attempt; backoff still controls
+when retry is allowed. A slow sibling does not hold up a free slot. Dispatch
+checks run at most 30 seconds apart and are also requested after discovery.
+`files_per_cycle` remains the batch limit for serial/CLI processing.
+
+Text correction and note generation for different recordings may overlap.
+Transcription, alignment, and diarization serialize within the controller process
+to limit model memory, and the remote GPU worker also enforces its own lock.
+Provider quotas and model limits still apply; parallelism improves library
+throughput, not necessarily one recording's latency. Existing processing leases
+prevent duplicate recording work, and completed stage artifacts remain reusable.
+
+## Graceful service shutdown
+
+`localplaud run` handles SIGTERM and SIGINT cooperatively. At Uvicorn's first
+signal capture it stops new daemon dispatch, lets HTTP shutdown finish, then runs
+the CLI cleanup: stop jobs, shut down the scheduler with `wait=True`, drain admitted
+workers, and release daemon ownership once. The scoped handlers remain active
+through cleanup, including repeated SIGTERM/SIGINT and Uvicorn's restored-handler signal
+replay (verified with installed Uvicorn 0.51.0). Requests received during app/config
+preparation are retained when Uvicorn takes over. Prior handlers are restored when
+the command returns; imports and calls from other threads install no handlers.
+Standalone `serve` keeps Uvicorn's normal signal behavior.
+
+This drain has no hard deadline and does not cancel upstream provider billing
+or terminate active recordings. Use the explicit local [maintenance gate](maintenance.md)
+to pause admission and observe both processes quiescent **before** sending a planned
+supervisor stop. Receipt scope excludes unmanaged CLI/backfill processes and other
+worker hosts. Keep the durable request present through deployment and restart, then
+explicitly resume. Maintenance does not add a durable queue for rejected manual
+requests or persist a force/profile payload before normal stage setup.
+
+Verify the loaded supervisor configuration, not just the file. The audited Mac
+on 2026-10-18 had `ExitTimeOut=300` in both plist files but a loaded timeout of
+60 seconds. Stopping an active service could still kill long work. SIGKILL cannot
+run finally blocks, drain children, or release ownership. An old interpreter
+without this gate needs a separate first-rollout drain and respawn interlock; the
+maintenance document lists those preconditions and explains why zero database
+claims alone is insufficient.
+
+Run the synthetic regression suite with the deployment virtualenv interpreter:
+
+```bash
+LOCALPLAUD_TEST_PYTHON=/path/to/deployment/.venv/bin/python sh tests/run_runtime_offline.sh
+```
+
+The runner strips inherited deployment settings and sets explicit
+`PYTHONPATH=tests/runtime_guard:src:<checkout>` for parent and child Python startup.
+It blocks real network/model access and disables `.env` loading. Signal fixtures
+stub registration, scheduler, jobs and database operations before use; they execute
+installed Uvicorn capture/replay with a synthetic HTTP loop and synthetic workers.
+A separate socket-free coroutine driver exercises installed Uvicorn shutdown,
+task waiting and lifespan cleanup with a synthetic ASGI app. It covers all first
+and repeated TERM/INT pairs, including transferred startup stops, and verifies
+captured-signal replay and handler restoration. These checks prove cleanup waits
+beyond five seconds and ownership is released once; they do not qualify real
+application cleanup, model/provider latency or a supervisor's loaded configuration.
+
+## Before you start (per host)
+
+1. **DNS**: point your domain's A/AAAA record at the machine's public IP.
+   Caddy needs this to obtain a certificate.
+2. **Ports**: open 80 and 443 to the internet (Caddy). No other port needs to
+   be public — the app listens on 8080 behind Caddy.
+3. **Secrets**: copy `.env.example` → `.env` and fill in:
+   - `DOMAIN` and `ACME_EMAIL`
+   - Authorize either the official Open API with `localplaud auth login` or the
+     official MCP with `npx -y @plaud-ai/mcp@latest install`.
+   - ASR keys for whichever provider you use.
+4. **Bootstrap** installs Docker (+ optionally the NVIDIA toolkit):
+   ```bash
+   ./scripts/deploy/bootstrap.sh          # Docker + compose
+   ./scripts/deploy/bootstrap.sh --gpu    # + nvidia-container-toolkit (Linux)
+   ```
+
+## Bring it up
+
+```bash
+git clone https://github.com/skyhong2002/localplaud && cd localplaud
+cp .env.example .env && $EDITOR .env
+cp config.example.toml config.toml && $EDITOR config.toml
+
+docker compose --profile <cpu|gpu|mac> up -d --build
+./scripts/deploy/smoke-test.sh http://localhost:8080
+```
+
+Then browse to `https://$DOMAIN`.
+
+The Web App ships its browser runtime inside the Python package. Normal operation
+does not require access to a JavaScript CDN, which is suitable for private or
+offline deployments.
+
+---
+
+## The reference deployment
+
+> **Decision (2026-07-31):** multi-host *web* deployments were dropped. There is
+> exactly one production instance — the Mac mini below — plus one private WSL
+> CUDA worker it dispatches GPU stages to (see
+> [remote-worker.md](remote-worker.md)). The former NVIDIA
+> (`nvplaud.observe.tw`) and Oracle (`plaud.skyhong.tw`) standalone instances
+> are retired and their host notes removed; the generic `cpu`/`gpu` profile
+> instructions below remain for anyone deploying localplaud on that hardware.
+
+The retired `plaud.skyhong.tw` address redirects HTTP and HTTPS requests to
+`https://plaud.observe.tw`, preserving paths and query strings. Oracle's Traefik
+file provider owns this redirect; its configuration is tracked in
+[`scripts/deploy/traefik-legacy-domain.yml`](../scripts/deploy/traefik-legacy-domain.yml)
+and installed as `/etc/dokploy/traefik/dynamic/localplaud-legacy.yml`.
+Traefik watches that directory and reloads changes automatically. This route needs
+no application container on Oracle. The production controller still enforces login.
+
+### 1. Mac mini (Apple Silicon) → `plaud.observe.tw` (production controller)
+
+Docker on macOS **cannot** pass the Metal GPU into a container, so on-device
+Whisper must run on the host. Two options:
+
+- **Cloud ASR in Docker** (simplest): use the `mac` profile with
+  `LOCALPLAUD_ASR__PROVIDER=deepgram` (or openai/assemblyai).
+- **On-device Metal ASR** (fastest, private): run the app natively and let
+  Caddy (in Docker) proxy to it:
+  ```bash
+  uv sync --extra mlx --extra diarize --extra local-llm
+  # config.toml: provider = "mlx-whisper"
+  # model = "mlx-community/whisper-large-v3-turbo"
+  # [diarize] provider = "pyannote", device = "cpu" (plus HF token/model acceptance)
+  uv run localplaud run                        # host app on :8080
+  docker compose --profile mac up -d caddy     # HTTPS only; Caddyfile → host.docker.internal:8080
+  ```
+  (Point the Caddyfile's `reverse_proxy` at `host.docker.internal:8080` for
+  this variant.)
+
+### 2. NVIDIA / CUDA host (generic `gpu` profile)
+
+In the reference deployment this hardware runs only as a **remote worker**
+behind the Mac mini controller, not as its own web instance — but the `gpu`
+profile still brings up a full standalone app if that is what you want:
+
+```bash
+./scripts/deploy/bootstrap.sh --gpu
+docker compose --profile gpu up -d --build
+```
+
+Uses `Dockerfile.cuda` (CUDA 12.8 + PyTorch/torchaudio 2.8 + faster-whisper on GPU + pyannote for
+diarization). The image keeps the versioned cuDNN 8 runtime required by
+WhisperX-pinned CTranslate2 alongside the base image's cuDNN 9 runtime. Verify
+the GPU is visible: `docker compose exec localplaud-gpu nvidia-smi`.
+Set `[asr] provider = "faster-whisper"`, model `large-v3-turbo`, device `cuda`,
+and keep the diarization profile enabled with `[diarize] device = "cuda"`.
+
+True word-level forced alignment is available through the separately selectable
+`align:whisperx` / `wav2vec2-auto` catalog entry. Native installs require the
+optional runtime:
+
+```bash
+uv sync --extra faster-whisper --extra forced-align --extra diarize
+```
+
+The bundled CUDA image installs this extra, but provider timestamps remain the safe
+initial selection. Enable WhisperX only after its language-specific model has passed
+a real-audio runtime check and Taiwan Mandarin / Mandarin-English benchmark on the
+target host; model availability alone is not quality evidence.
+
+For a fully local text path on the same NVIDIA host, enable the separately named
+Ollama profile and install an explicit model. Ollama is reachable only on the
+private Compose network; port 11434 is not published on the host:
+
+```bash
+docker compose --profile gpu --profile ollama up -d --build
+docker compose exec ollama-gpu ollama pull qwen3:4b-instruct-2507-q4_K_M
+```
+
+Point the stage-scoped LLM selections at the bundled service:
+
+```toml
+[llm]
+provider = "ollama"
+
+  [llm.ollama]
+  host = "http://ollama-gpu:11434"
+  model = "qwen3:4b-instruct-2507-q4_K_M"
+```
+
+The `ollama` profile is opt-in because provider choice and data-egress policy are
+explicit localplaud settings. Its model cache is durable in the `ollama_data`
+volume. On smaller GPUs, keep ASR, diarization, and text generation sequential and
+select a model that leaves enough memory for the configured context window.
+Use an instruction model for correction and structured notes: the floating
+`qwen3:4b` tag may resolve to a thinking variant whose visible reasoning is not
+valid structured output even when thinking is disabled by the client.
+
+> **Running CUDA natively (no Docker)**: the NVIDIA driver alone isn't enough —
+> CTranslate2 needs cuBLAS and cuDNN 9. Install the `cuda` extra
+> (`uv sync --extra cuda`), which pulls `nvidia-cublas-cu12` + `nvidia-cudnn-cu12`,
+> and ensure they're on `LD_LIBRARY_PATH`. The Docker image bundles them already.
+
+### 3. CPU-only host (generic `cpu` profile)
+
+A weak always-on box can still ingest/store with the `cpu` slim image; a cloud
+ASR API is an explicit choice, never an automatic fallback:
+
+```bash
+./scripts/deploy/bootstrap.sh
+# Explicit cloud choice only:
+# LOCALPLAUD_ASR__PROVIDER=deepgram + LOCALPLAUD_ASR__DEEPGRAM__API_KEY=...
+docker compose --profile cpu up -d --build
+```
+
+## Securing an exposed instance
+
+If the UI is reachable from anything but localhost:
+
+- Serve it through HTTPS and enable [Web App accounts](accounts.md), setting a
+  long random `LOCALPLAUD_API__SESSION_SECRET`, the public URL and Google client
+  credentials for initial owner bootstrap. New accounts remain pending until approved.
+- Account mode rejects all legacy shared passwords/API tokens. With accounts
+  disabled, the old `LOCALPLAUD_API__LOGIN_PASSWORD` and
+  `LOCALPLAUD_API__AUTH_TOKEN` settings remain available for legacy deployments.
+  Worker authentication and Plaud/provider credentials stay separate.
+- The reverse proxy normally only terminates HTTPS; upstream authentication can
+  still be used when a deployment deliberately delegates identity to it.
+
+See [ADR 0006](adr/0006-security-posture.md).
+
+### Search-indexing boundary (GSC-20261023)
+
+The production instance is private and is meant to stay out of search results.
+An unauthenticated home page that returns 401 and an "unknown" home page in
+Google Search Console are expected; do not loosen authentication to change that.
+
+- `robots.txt` disallows everything for every crawler. Only the user-triggered
+  assistant fetchers (`ChatGPT-User`, `Claude-User`, `Perplexity-User`,
+  `MistralAI-User`) may fetch `/share/` so that a link a user hands an
+  assistant still works.
+- Every response, including the 303 login redirect and 401/403 rejections,
+  sends `X-Robots-Tag: noindex, nofollow` and `Cache-Control: private, no-store`.
+  The login page also carries `<meta name="robots" content="noindex,nofollow">`.
+- There is no sitemap. `/sitemap.xml`, recordings, transcripts, Ask, the API
+  and OpenAPI docs all require a session. Do not submit a sitemap for this host.
+
+On 2026-10-23, commit `9b54ecb4` fixed a gap: the auth gate's early returns
+(login redirect, 401, 403) skipped the `X-Robots-Tag` default, so the anonymous
+home page and `/sitemap.xml` relied on `robots.txt` alone. After deployment,
+`https://plaud.observe.tw/`, `/sitemap.xml`, `/api/files`, `/recordings/1`,
+`/docs` and `/openapi.json` returned 401 with `noindex, nofollow`; browser
+navigation to `/` returned 303 to `/login?next=%2F` with the same header.
+`http://plaud.observe.tw/` redirects with 308 to HTTPS, and the retired
+`https://plaud.skyhong.tw/` redirects with 301 to `https://plaud.observe.tw/`.
+These checks show what the server sends. They do not show what Google has
+indexed.
+
+## Operating it
+
+- Logs: `docker compose --profile <p> logs -f`
+- One-off sync: `docker compose exec <service> localplaud poll --once`
+- The `run` command already polls on a schedule, processes the backlog, and
+  serves the UI; nothing else to cron.
+- A failed Plaud sync is reported separately and does not stop processing
+  recordings whose audio is already stored locally. Resume resets exhausted
+  retries while preserving completed artifacts and user edits.
+- To attach a separate GPU worker, configure its dedicated
+  `LOCALPLAUD_WORKER_TOKEN`, expose the authenticated worker API through HTTPS,
+  then register it in Settings. See [remote-worker.md](remote-worker.md).
+
+## Updating
+
+### Repair existing generated titles
+
+After updating both the controller and any remote workers, plan title-only repairs
+with the recording's existing local/remote Ollama summary profile:
+
+```bash
+python -m localplaud.title_repair --plan data/backups/title-repairs.jsonl
+# Optionally include recent automatic titles, even when syntactically valid:
+python -m localplaud.title_repair --plan data/backups/title-repairs.jsonl --since 2026-09-19
+# Review the private JSONL's before/title pairs, then apply:
+python -m localplaud.title_repair --apply data/backups/title-repairs.jsonl
+```
+
+Planning resumes from the private JSONL and does not rename files. Keep that file
+as title revision history: it records prior values, input lineage/hash, provider,
+model, and prompt version. It contains private titles and must not be committed.
+Application currently requires SQLite and skips manual renames, active processing, changed titles/transcripts,
+and already-applied entries. Audio, notes, ASR, indexes, and notification state are
+untouched. Unsupported provider profiles are skipped, never silently replaced.
+If review finds no usable transcript evidence, an entry may explicitly set
+`action` to `restore-source-name`, `title` to `null`, and a nonempty
+`review_reason`. This clears only the generated-title fields and restores the
+existing source name/date, with the same concurrency checks and saved old title.
+
+```bash
+git pull
+docker compose --profile <p> up -d --build
+```
+
+## Running natively (no Docker)
+
+Everything works without Docker too:
+
+```bash
+uv sync --extra faster-whisper --extra local-llm
+uv run localplaud run
+```
+
+Put it behind your own reverse proxy, or run a standalone Caddy/nginx pointing
+at `:8080`.
+
+
+## Account rollout (2026-10-07)
+
+The reference controller now enables individual Web App accounts with Google OIDC
+and local passwords. See [accounts](accounts.md) for owner bootstrap and recovery.
+The release passed 1,610 tests in a clean checkout, plus desktop/mobile browser
+checks for registration, pending approval, role restrictions, password changes and
+long account details. A copy of the production database passed the additive
+migration twice with existing row counts preserved and SQLite `quick_check` OK.
+
+Production smoke checks confirmed health/login/registration, rejection of legacy
+Bearer/header tokens and cross-origin login, secure OAuth cookies, the configured
+callback and PKCE redirect, and invalid-callback rejection. Browser navigation
+reached Google's sign-in surface without a redirect-URI mismatch. The account
+holder's real Google authentication and first-owner creation still require their
+first login; the validation session did not possess their Google credentials.
+Private configuration and an online SQLite backup are retained outside Git. The
+previous automatic-processing preference was restored after the controller restart.

@@ -1,0 +1,789 @@
+/* localplaud notes: in-place editing and find/replace.
+ *
+ * Editable notes are edited directly on the rendered page, as in Plaud: a click
+ * puts the caret where the user clicked and changes autosave as note versions.
+ * The server tags each top-level block with its Markdown source lines
+ * (data-md="start:end"); untouched blocks keep that source byte-for-byte and
+ * only edited blocks are serialized back to Markdown from the page.
+ *
+ * Loaded after workspace.js on every full load and HTMX #app-view swap; each
+ * run tears down the previous one. Strings go through window.localplaudT.
+ */
+(() => {
+  'use strict';
+  const tr = window.localplaudT || (message => message);
+  const controller = new AbortController();
+  const { signal } = controller;
+  window.localplaudNoteEditorTeardown?.();
+  window.localplaudNoteEditorTeardown = () => controller.abort();
+  const appView = document.getElementById('app-view');
+  appView?.addEventListener('htmx:beforeCleanupElement', event => { if (event.target === appView) controller.abort(); }, { signal });
+  const on = (target, type, handler, options = {}) => target?.addEventListener(type, handler, { signal, ...options });
+  const fileId = JSON.parse(document.getElementById('ws-config')?.textContent || '{}').fileId || location.pathname.split('/')[2];
+
+  /* ---------- Markdown serialization of edited blocks ---------- */
+
+  const BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'UL', 'OL', 'BLOCKQUOTE', 'PRE', 'HR', 'TABLE']);
+  const escapeText = text => text.replace(/\u00a0/g, ' ').replace(/[\\`*_[\]~<]/g, '\\$&');
+  // CommonMark only treats ** as emphasis when it is flanked correctly; keep
+  // spaces and edge punctuation (「」, parentheses, escapes) outside the markers.
+  const wrap = (marker, content) => {
+    const match = content.match(/^(\s*)([\p{P}\p{S}]*)([\s\S]*?)([\p{P}\p{S}]*)(\s*)$/u);
+    return match[3] ? `${match[1]}${match[2]}${marker}${match[3]}${marker}${match[4]}${match[5]}` : content;
+  };
+  // A <br> with nothing visible after it is the browser's placeholder for an
+  // empty or just-split line, not a hard break.
+  const trailingBreak = br => {
+    for (let node = br.nextSibling; node; node = node.nextSibling) {
+      if (node.nodeType === Node.TEXT_NODE ? node.nodeValue.trim() : node.nodeType === Node.ELEMENT_NODE && node.tagName !== 'BR') return false;
+    }
+    return true;
+  };
+  // ``singleLine`` holds for headings and table cells, where Markdown has no hard break.
+  const inline = (node, singleLine = false) => [...node.childNodes].map(child => {
+    if (child.nodeType === Node.TEXT_NODE) return escapeText(child.nodeValue.replace(/\s*\n\s*/g, ' '));
+    if (child.nodeType !== Node.ELEMENT_NODE) return '';
+    switch (child.tagName) {
+      case 'STRONG': case 'B': return wrap('**', inline(child, singleLine));
+      case 'EM': case 'I': return wrap('*', inline(child, singleLine));
+      case 'DEL': case 'S': case 'STRIKE': return wrap('~~', inline(child, singleLine));
+      case 'CODE': {
+        const text = child.textContent, fence = text.includes('`') ? '``' : '`';
+        return text ? `${fence}${fence.length > 1 ? ' ' : ''}${text}${fence.length > 1 ? ' ' : ''}${fence}` : '';
+      }
+      case 'A': {
+        const label = inline(child, singleLine), href = child.getAttribute('href') || '', title = child.getAttribute('title');
+        const target = href.replace(/[()\s<>]/g, encodeURIComponent) + (title ? ` "${title.replace(/["\\]/g, '\\$&')}"` : '');
+        return href ? `[${label}](${target})` : label;
+      }
+      case 'IMG': return `![${escapeText(child.getAttribute('alt') || '')}](${child.getAttribute('src') || ''})`;
+      case 'BR': return trailingBreak(child) ? '' : singleLine ? ' ' : '\\\n';
+      case 'INPUT': return '';
+      default: return BLOCK_TAGS.has(child.tagName) ? ` ${inline(child, singleLine)} ` : inline(child, singleLine);
+    }
+  }).join('');
+  // Text that would start a different block (a heading, list, quote, rule)
+  // keeps its literal meaning.
+  const guardLineStart = text => text.replace(
+    /^(\s*)(?:(\d+)([.)])(?=\s)|(#{1,6}(?=\s|$)|[-+*](?=\s)|>|={3,}|-{3,}))/gm,
+    (_match, space, digits, delimiter, marker) => (digits ? `${space}${digits}\\${delimiter}` : `${space}\\${marker}`),
+  );
+  const indent = (text, prefix) => text.split('\n').map(line => (line ? prefix + line : line)).join('\n');
+  const listMarkdown = list => {
+    let number = Number(list.getAttribute('start') || 1);
+    return [...list.children].filter(item => item.tagName === 'LI').map(item => {
+      const marker = list.tagName === 'OL' ? `${number++}. ` : '- ';
+      const checkbox = item.querySelector(':scope > input[type="checkbox"], :scope > p > input[type="checkbox"]');
+      const loose = [...item.children].some(child => child.tagName === 'P');
+      const parts = [];
+      let text = '';
+      const flush = () => { if (text.trim()) parts.push(guardLineStart(text.trim())); text = ''; };
+      [...item.childNodes].forEach(child => {
+        if (child.nodeType === Node.ELEMENT_NODE && (child.tagName === 'UL' || child.tagName === 'OL')) { flush(); parts.push(listMarkdown(child)); }
+        else if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'P') { flush(); parts.push(guardLineStart(inline(child).trim())); }
+        else if (child.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(child.tagName)) { flush(); parts.push(blockMarkdown(child)); }
+        else text += inline({ childNodes: [child] });
+      });
+      flush();
+      const task = checkbox ? (checkbox.checked ? '[x] ' : '[ ] ') : '';
+      const [first = '', ...rest] = parts.filter(part => part.trim());
+      const pad = ' '.repeat(marker.length);
+      return [`${marker}${task}${indent(first, pad).trimStart()}`, ...rest.map(part => indent(part, pad))].join(loose ? '\n\n' : '\n');
+    }).join('\n');
+  };
+  const tableMarkdown = table => {
+    const rowElements = [...table.querySelectorAll('tr')];
+    const rows = rowElements.map(row => [...row.children].map(cell => inline(cell, true).trim().replace(/\|/g, '\\|')));
+    if (!rows.length) return '';
+    const width = Math.max(...rows.map(row => row.length));
+    const header = [...rowElements[0].children];
+    const rule = Array.from({ length: width }, (_, index) => {
+      const align = header[index]?.getAttribute('align') || header[index]?.style.textAlign || '';
+      return { left: ':---', center: ':---:', right: '---:' }[align] || '---';
+    });
+    const line = row => `| ${Array.from({ length: width }, (_, index) => row[index] || '').join(' | ')} |`;
+    return [line(rows[0]), `| ${rule.join(' | ')} |`, ...rows.slice(1).map(line)].join('\n');
+  };
+  function blockMarkdown(element) {
+    const tag = element.tagName;
+    if (/^H[1-6]$/.test(tag)) {
+      const text = inline(element, true).trim();
+      return text ? `${'#'.repeat(Number(tag[1]))} ${text}` : '';
+    }
+    if (tag === 'UL' || tag === 'OL') return listMarkdown(element);
+    if (tag === 'BLOCKQUOTE') return indent(childBlocksMarkdown(element), '> ').replace(/^$/gm, '>');
+    if (tag === 'PRE') {
+      const code = element.textContent.replace(/\n$/, ''), fence = code.includes('```') ? '~~~' : '```';
+      const language = (element.querySelector('code')?.className.match(/(?:^|\s)language-(\S+)/) || [])[1] || '';
+      return `${fence}${language}\n${code}\n${fence}`;
+    }
+    if (tag === 'HR') return '---';
+    if (tag === 'TABLE') return tableMarkdown(element);
+    if (tag === 'DIV' && [...element.children].some(child => BLOCK_TAGS.has(child.tagName))) return childBlocksMarkdown(element);
+    return guardLineStart(inline(element).trim());
+  }
+  // Loose text and inline elements directly under a container form paragraphs.
+  function childBlocksMarkdown(container) {
+    const blocks = [];
+    let loose = [];
+    const flush = () => {
+      const text = inline({ childNodes: loose }).trim();
+      if (text) blocks.push(guardLineStart(text));
+      loose = [];
+    };
+    [...container.childNodes].forEach(child => {
+      if (child.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(child.tagName)) { flush(); blocks.push(blockMarkdown(child)); }
+      else loose.push(child);
+    });
+    flush();
+    return blocks.filter(block => block.trim()).join('\n\n');
+  }
+
+  /* ---------- In-place editor ---------- */
+
+  const editors = new Map();
+  const panelOf = body => body.closest('.note-panel');
+
+  // A generated note is never changed in place: its first edit creates (once)
+  // the recording's editable copy of it, and every save goes to that copy.
+  class ExistingCopy extends Error {
+    constructor(note) { super(String(note.id)); this.note = note; }
+  }
+  const createEditor = body => {
+    let id = body.dataset.noteEditable || null;
+    const summaryId = body.dataset.summaryEditable;
+    const panel = panelOf(body);
+    const form = panel.querySelector('[data-workspace-note-form]');
+    const status = panel.querySelector('[data-note-save-state]');
+    const sources = new WeakMap();
+    let version = Number(body.dataset.noteVersion || 0);
+    let title = form?.elements.title.value || '';
+    // The exact stored source: a <textarea> would drop a leading newline and
+    // shift every block's line range.
+    let lastSaved = JSON.parse(panel.querySelector('script[data-note-markdown]')?.textContent || 'null') ?? form.elements.content_md.value;
+    let timer = 0, saving = null, dirty = false, conflict = false, failed = false;
+    signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+
+    const lines = lastSaved.split('\n');
+    const covered = new Set();
+    [...body.children].forEach(element => {
+      const range = (element.dataset.md || element.firstElementChild?.dataset.md || '').split(':').map(Number);
+      if (range.length !== 2 || !range.every(Number.isInteger)) return;
+      for (let line = range[0]; line < range[1]; line += 1) covered.add(line);
+      sources.set(element, { html: element.outerHTML, md: lines.slice(range[0], range[1]).join('\n').replace(/\s+$/, '') });
+    });
+    // Source that renders no block of its own (link reference definitions)
+    // is kept verbatim at the end, where it still resolves.
+    const unrendered = lines.filter((line, index) => !covered.has(index) && line.trim()).join('\n');
+
+    const serialize = () => {
+      const blocks = [];
+      let loose = [];
+      const flushLoose = () => {
+        const text = inline({ childNodes: loose }).trim();
+        if (text) blocks.push({ md: guardLineStart(text) });
+        loose = [];
+      };
+      [...body.childNodes].forEach(node => {
+        if (node.nodeType !== Node.ELEMENT_NODE || !BLOCK_TAGS.has(node.tagName)) { loose.push(node); return; }
+        flushLoose();
+        const known = sources.get(node), html = node.outerHTML;
+        // Snapshot the HTML now: text typed or replaced while this save is in
+        // flight must not be recorded as matching the Markdown being sent.
+        blocks.push({ element: node, html, md: known && known.html === html ? known.md : blockMarkdown(node) });
+      });
+      flushLoose();
+      return blocks.filter(block => block.md.trim());
+    };
+    const contentOf = blocks => [...blocks.map(block => block.md), ...(unrendered ? [unrendered] : [])].join('\n\n');
+    const request = (content, baseVersion, keepalive = false) => fetch(`/api/notes/${id}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: form ? form.elements.title.value : title, content_md: content, base_version: baseVersion }),
+      keepalive,
+      credentials: 'same-origin',
+    });
+
+    const setStatus = (text, state = '') => {
+      if (!status) return;
+      status.textContent = text;
+      status.dataset.state = state;
+    };
+    const preserveConflict = (existing = null) => {
+      conflict = true;
+      dirty = true;
+      clearTimeout(timer);
+      // Read the live DOM, including keystrokes entered while the request was
+      // in flight. Never replace it with the older submitted/saved snapshot.
+      const draft = contentOf(serialize());
+      body.contentEditable = 'false';
+      body.setAttribute('aria-readonly', 'true');
+      closeFind();
+      setStatus(tr(existing ? 'This note already has an edited copy. Your draft is still here.' : 'This note changed elsewhere. Your draft is still here.'), 'error');
+
+      const recovery = document.createElement('section');
+      recovery.className = 'note-draft-recovery';
+      recovery.dataset.noteDraftRecovery = '';
+      recovery.setAttribute('aria-label', tr('Recover unsaved draft'));
+      const explanation = document.createElement('p');
+      explanation.textContent = tr('Saving is paused. Copy or download your draft before leaving this page, then compare it with the saved note.');
+      const columns = document.createElement('div');
+      columns.className = 'note-draft-columns';
+      const field = (label, value, attribute) => {
+        const wrapper = document.createElement('label');
+        const caption = document.createElement('span');
+        caption.textContent = tr(label);
+        const area = document.createElement('textarea');
+        area.className = 'search-input';
+        area.readOnly = true;
+        area.rows = 8;
+        area.value = value;
+        area.setAttribute(attribute, '');
+        wrapper.append(caption, area);
+        columns.append(wrapper);
+        return { wrapper, caption, area };
+      };
+      const local = field('Your unsaved draft (Markdown)', draft, 'data-note-draft');
+      const saved = field('Saved note (Markdown)', '', 'data-note-saved');
+      saved.wrapper.hidden = true;
+      const actions = document.createElement('div');
+      actions.className = 'note-draft-actions';
+      const action = label => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn sec';
+        button.textContent = tr(label);
+        actions.append(button);
+        return button;
+      };
+      const copy = action('Copy draft');
+      const download = action('Download draft');
+      const compare = action('Compare with saved note');
+      const latestId = String(existing?.id || id);
+      const link = document.createElement('a');
+      link.className = 'btn sec';
+      link.href = `/file/${encodeURIComponent(fileId)}?tab=notes&note_id=${encodeURIComponent(latestId)}`;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = tr('Open saved note in a new tab');
+      actions.append(link);
+      const feedback = document.createElement('p');
+      feedback.setAttribute('role', 'status');
+      feedback.setAttribute('aria-live', 'polite');
+      recovery.append(explanation, columns, actions, feedback);
+      // Put recovery before long notes so it is reachable without scrolling
+      // through the entire retained draft.
+      body.before(recovery);
+
+      on(copy, 'click', async () => {
+        try {
+          try { await navigator.clipboard.writeText(draft); }
+          catch (_error) {
+            local.area.focus();
+            local.area.select();
+            if (!document.execCommand('copy')) throw new Error('clipboard unavailable');
+          }
+          feedback.textContent = tr('Draft copied. Keep it until you have recovered your changes.');
+        } catch (_error) {
+          local.area.focus();
+          local.area.select();
+          feedback.textContent = tr('Copy failed. Select and copy the draft below, or download it.');
+        }
+      });
+      on(download, 'click', () => {
+        const url = URL.createObjectURL(new Blob([draft], { type: 'text/markdown;charset=utf-8' }));
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = 'unsaved-note-draft.md';
+        recovery.append(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        feedback.textContent = tr('Keep the downloaded draft until you have recovered your changes.');
+      });
+      on(compare, 'click', async () => {
+        compare.disabled = true;
+        columns.setAttribute('aria-busy', 'true');
+        feedback.textContent = tr('Loading saved note…');
+        try {
+          // The current API has no single-note GET. Scope the read to this
+          // recording; comparison never adopts its version or sends a write.
+          const response = await fetch(`/api/notes?file_id=${encodeURIComponent(fileId)}`, { credentials: 'same-origin', cache: 'no-store', signal });
+          const result = await response.json();
+          const note = result.notes?.find(item => String(item.id) === latestId);
+          if (!response.ok || typeof note?.content_md !== 'string') throw new Error('saved note unavailable');
+          if (signal.aborted) return;
+          saved.caption.textContent = `${tr('Saved note (Markdown)')} · v${note.version}`;
+          saved.area.value = note.content_md;
+          saved.wrapper.hidden = false;
+          feedback.textContent = tr('Compare both versions, then recover your changes in the saved note. Your draft stays on this page.');
+        } catch (error) {
+          if (error.name !== 'AbortError') feedback.textContent = tr('Could not load the saved note. Your draft is still here. Try comparing again or open the saved note in a new tab.');
+        } finally {
+          compare.disabled = false;
+          columns.removeAttribute('aria-busy');
+        }
+      });
+    };
+    const adoptCopy = async () => {
+      const response = await fetch(`/api/files/${encodeURIComponent(fileId)}/summaries/${summaryId}/editable-copy`, { method: 'POST', credentials: 'same-origin' });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof result.detail === 'string' ? tr(result.detail) : tr('Could not save'));
+      // An existing copy may hold earlier edits; never overwrite it with this text.
+      if (result.content_md !== lastSaved || Number(result.version) !== 1) throw new ExistingCopy(result);
+      id = String(result.id);
+      version = result.version;
+      title = result.title;
+      const url = new URL(location.href);
+      url.searchParams.delete('note');
+      url.searchParams.set('note_id', id);
+      history.replaceState(history.state, '', url);
+    };
+    const syncChrome = () => {
+      body.dataset.noteVersion = String(version);
+      if (!form) return;
+      form.elements.base_version.value = String(version);
+      form.elements.content_md.value = lastSaved;
+      form.dataset.originalContent = lastSaved;
+      const chip = panel.querySelector('[data-user-note-history] + .chip');
+      if (chip) chip.textContent = `v${version}`;
+      const history = panel.querySelector('[data-user-note-history]');
+      if (history) history.dataset.noteVersion = String(version);
+    };
+
+    const save = async () => {
+      clearTimeout(timer);
+      if (saving) { await saving; if (!dirty) return; }
+      if (!dirty || conflict) return;
+      const blocks = serialize();
+      const content = contentOf(blocks);
+      dirty = false;
+      if (content === lastSaved) { setStatus(tr('Saved'), 'saved'); return; }
+      setStatus(tr('Saving…'), 'saving');
+      saving = (async () => {
+        try {
+          if (!id) await adoptCopy();
+          const response = await request(content, version);
+          const result = await response.json().catch(() => ({}));
+          if (response.ok) {
+            version = Number(result.version ?? version + 1);
+            lastSaved = content;
+            blocks.forEach(block => { if (block.element) sources.set(block.element, { html: block.html, md: block.md }); });
+            syncChrome();
+            setStatus(dirty ? tr('Unsaved changes') : tr('Saved'), dirty ? 'dirty' : 'saved');
+            return;
+          }
+          if (response.status === 409) {
+            preserveConflict();
+            return;
+          }
+          throw new Error(typeof result.detail === 'string' ? result.detail : tr('Could not save'));
+        } catch (error) {
+          if (error instanceof ExistingCopy) {
+            preserveConflict(error.note);
+            return;
+          }
+          dirty = true;
+          failed = true;
+          setStatus(tr('Could not save. Retrying…'), 'error');
+        }
+      })();
+      await saving;
+      saving = null;
+      if (dirty && !conflict && !signal.aborted) schedule(failed ? 5000 : 1200);
+      failed = false;
+    };
+    const schedule = (delay = 1200) => { clearTimeout(timer); timer = setTimeout(() => save(), delay); };
+    const changed = () => {
+      if (conflict) return;
+      dirty = true;
+      setStatus(tr('Unsaved changes'), 'dirty');
+      schedule();
+    };
+
+    body.contentEditable = 'true';
+    body.setAttribute('role', 'textbox');
+    body.setAttribute('aria-multiline', 'true');
+    body.spellcheck = true;
+    on(body, 'focus', () => { try { document.execCommand('defaultParagraphSeparator', false, 'p'); } catch (_error) { /* unsupported */ } });
+    on(body, 'input', changed);
+    on(body, 'blur', () => save());
+    on(body, 'keydown', event => {
+      if (event.key === 'Escape') { event.preventDefault(); body.blur(); }
+      else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') { event.preventDefault(); save(); }
+    });
+    // Pasted rich text would bring foreign markup and styles; keep plain text.
+    on(body, 'paste', event => {
+      const text = event.clipboardData?.getData('text/plain');
+      if (text == null) return;
+      event.preventDefault();
+      document.execCommand('insertText', false, text);
+    });
+    on(body, 'drop', event => event.preventDefault());
+    // Links stay usable: a plain click follows them, as on a read-only page.
+    on(body, 'click', event => {
+      const link = event.target.closest('a[href]');
+      if (!link || window.getSelection()?.toString()) return;
+      event.preventDefault();
+      if (event.metaKey || event.ctrlKey) window.open(link.href, '_blank', 'noopener');
+      else location.href = link.href;
+    });
+    // Leaving the page must not lose the last keystrokes. Ask first while a
+    // save is outstanding; once the page is really going, send what is on it.
+    on(window, 'beforeunload', event => {
+      if (!dirty && !saving) return;
+      event.preventDefault();
+      event.returnValue = '';
+      save();
+    });
+    on(window, 'pagehide', () => {
+      if (conflict || (!dirty && !saving)) return;
+      const content = contentOf(serialize());
+      if (content === lastSaved) return;
+      // An in-flight save will have advanced the version by the time this lands.
+      const baseVersion = saving ? version + 1 : version;
+      // Browsers cap keepalive bodies at 64 KiB; the beforeunload prompt covers larger notes.
+      if (new Blob([content]).size < 60_000) request(content, baseVersion, true).catch(() => {});
+    });
+
+    const editor = {
+      body,
+      changed,
+      flush: async () => { if (dirty || saving) await save(); },
+      get busy() { return dirty || Boolean(saving); },
+      // A version conflict or an existing edited copy stops saving for good.
+      get blocked() { return conflict; },
+    };
+    editors.set(body, editor);
+    return editor;
+  };
+
+  document.querySelectorAll('[data-note-editable], [data-summary-editable]').forEach(createEditor);
+
+  // HTMX navigation does not fire beforeunload. A pending save can still fail,
+  // and navigation started on a clean page can return after editing/conflict.
+  // Check both boundaries; explicit discard belongs only to that request.
+  const discardedRequests = new WeakSet();
+  const guardNavigation = event => {
+    const { target, xhr } = event.detail || {};
+    if (!appView || !(target === appView || target?.contains(appView))) return;
+    if (event.type === 'htmx:beforeSwap' && event.detail.shouldSwap === false) return;
+    if (xhr && discardedRequests.has(xhr)) return;
+    if (![...editors.values()].some(editor => editor.busy || editor.blocked)) return;
+    if (confirm(tr('Leave this page and discard the unsaved draft? Copy or download it first.'))) {
+      if (xhr) discardedRequests.add(xhr);
+    } else {
+      event.preventDefault();
+      if (event.type === 'htmx:beforeSwap') event.detail.shouldSwap = false;
+    }
+  };
+  on(document, 'htmx:beforeRequest', guardNavigation, { capture: true });
+  on(document, 'htmx:beforeSwap', guardNavigation, { capture: true });
+
+  // Markdown source editing reads the form, so finish any in-place save first.
+  on(document, 'click', async event => {
+    const button = event.target.closest('[data-note-edit]');
+    const editor = button && editors.get(panelOf(button)?.querySelector('[data-note-editable]'));
+    if (!editor || (!editor.busy && !editor.blocked)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    await editor.flush();
+    // A failing save keeps its error visible instead of opening stale source.
+    if (!editor.busy && !editor.blocked) button.click();
+  }, { capture: true });
+
+  const focusId = new URLSearchParams(location.search).get('focus_note');
+  if (focusId) {
+    const body = document.querySelector(`[data-note-editable="${CSS.escape(focusId)}"]`);
+    if (body) requestAnimationFrame(() => {
+      body.focus({ preventScroll: true });
+      const selection = window.getSelection(), range = document.createRange();
+      range.selectNodeContents(body.firstElementChild || body);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+    const clean = new URL(location.href);
+    clean.searchParams.delete('focus_note');
+    history.replaceState(history.state, '', clean);
+  }
+
+  /* ---------- Find and replace ---------- */
+
+  const highlights = typeof Highlight === 'function' && CSS.highlights ? CSS.highlights : null;
+  const noteBody = panel => panel?.querySelector('[data-workspace-note-body], [data-generated-note-prose]');
+  let active = null;
+
+  const textIndex = body => {
+    const nodes = [], walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    const blockOf = node => {
+      let element = node.parentElement;
+      while (element && element !== body && !BLOCK_TAGS.has(element.tagName) && !['LI', 'TD', 'TH'].includes(element.tagName)) element = element.parentElement;
+      return element;
+    };
+    let text = '', previousBlock = null;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      // A line break between blocks keeps a match from spanning two of them.
+      const block = blockOf(node);
+      if (text && block !== previousBlock) text += '\n';
+      previousBlock = block;
+      nodes.push({ node, start: text.length });
+      text += node.nodeValue;
+    }
+    const locate = offset => {
+      let low = 0, high = nodes.length - 1;
+      while (low < high) {
+        const middle = (low + high + 1) >> 1;
+        if (nodes[middle].start <= offset) low = middle; else high = middle - 1;
+      }
+      return nodes[low];
+    };
+    return { text, locate };
+  };
+
+  const clearHighlights = () => { highlights?.delete('note-find'); highlights?.delete('note-find-current'); };
+
+  const findRanges = (body, query, caseSensitive) => {
+    const ranges = [], starts = [];
+    if (!query) return { ranges, starts };
+    const { text, locate } = textIndex(body);
+    const haystack = caseSensitive ? text : text.toLocaleLowerCase();
+    const needle = caseSensitive ? query : query.toLocaleLowerCase();
+    for (let index = haystack.indexOf(needle); index >= 0; index = haystack.indexOf(needle, index + needle.length)) {
+      const start = locate(index), end = locate(index + needle.length - 1);
+      const range = document.createRange();
+      range.setStart(start.node, index - start.start);
+      range.setEnd(end.node, index + needle.length - end.start);
+      ranges.push(range);
+      starts.push(index);
+    }
+    return { ranges, starts };
+  };
+  // Edits only text nodes, so links, formatting and untouched blocks keep
+  // their Markdown source when the editor serializes the note.
+  const replaceInBody = (body, ranges, value) => {
+    // Last first, so earlier ranges keep valid offsets.
+    [...ranges].reverse().forEach(range => {
+      range.deleteContents();
+      if (value) range.insertNode(document.createTextNode(value));
+    });
+    body.normalize();
+  };
+
+  const openFind = (panel, query = null) => {
+    const body = noteBody(panel);
+    if (!body) return;
+    if (active?.panel === panel) {
+      if (query !== null) { active.input.value = query; active.input.dispatchEvent(new Event('input')); }
+      active.input.focus({ preventScroll: true }); active.input.select(); active.bar.scrollIntoView({ block: 'nearest' }); return;
+    }
+    closeFind();
+    const editor = editors.get(body);
+    const bar = document.createElement('div');
+    bar.className = 'note-find';
+    bar.setAttribute('role', 'search');
+    bar.innerHTML = `
+      <div class="note-find-row">
+        <input class="search-input" type="search" data-find-query>
+        <span class="sub note-find-count" aria-live="polite"></span>
+        <button class="icon-action icon-only" type="button" data-find-step="-1">↑</button>
+        <button class="icon-action icon-only" type="button" data-find-step="1">↓</button>
+        <button class="icon-action icon-only" type="button" data-find-close>✕</button>
+      </div>
+      ${editor && !editor.blocked ? `<div class="note-find-row">
+        <input class="search-input" type="text" data-find-replacement>
+        <button class="btn sec" type="button" data-find-replace-one></button>
+        <button class="btn sec" type="button" data-find-replace-all></button>
+        <label class="sub note-find-case"><input type="checkbox" data-find-case> <span></span></label>
+      </div>` : ''}`;
+    const input = bar.querySelector('[data-find-query]');
+    input.placeholder = tr('Find in note');
+    input.setAttribute('aria-label', tr('Find in note'));
+    bar.querySelector('[data-find-step="-1"]').setAttribute('aria-label', tr('Previous match'));
+    bar.querySelector('[data-find-step="1"]').setAttribute('aria-label', tr('Next match'));
+    bar.querySelector('[data-find-close]').setAttribute('aria-label', tr('Close'));
+    const replacement = bar.querySelector('[data-find-replacement]');
+    if (replacement) {
+      replacement.placeholder = tr('Replace with');
+      replacement.setAttribute('aria-label', tr('Replace with'));
+      bar.querySelector('[data-find-replace-one]').textContent = tr('Replace');
+      bar.querySelector('[data-find-replace-all]').textContent = tr('Replace all');
+      bar.querySelector('.note-find-case span').textContent = tr('Match case');
+    }
+    const count = bar.querySelector('.note-find-count');
+    body.before(bar);
+    const toggle = panel.querySelector('[data-note-find]');
+    toggle?.setAttribute('aria-expanded', 'true');
+    const state = { panel, body, bar, input, matches: [], starts: [], position: -1 };
+    active = state;
+
+    const caseSensitive = () => Boolean(bar.querySelector('[data-find-case]')?.checked);
+    const paint = () => {
+      if (!highlights) return;
+      clearHighlights();
+      if (!state.matches.length) return;
+      highlights.set('note-find', new Highlight(...state.matches));
+      if (state.position >= 0) highlights.set('note-find-current', new Highlight(state.matches[state.position]));
+    };
+    const refresh = ({ keepPosition = false } = {}) => {
+      const query = input.value;
+      const found = findRanges(body, query, caseSensitive());
+      state.matches = found.ranges;
+      state.starts = found.starts;
+      if (!keepPosition || state.position >= state.matches.length) state.position = state.matches.length ? 0 : -1;
+      count.textContent = !query ? '' : state.matches.length ? `${state.position + 1} / ${state.matches.length}` : tr('No results');
+      paint();
+    };
+    const reveal = () => {
+      const range = state.matches[state.position];
+      if (!range) return;
+      const rect = range.getBoundingClientRect();
+      if (rect.top < 80 || rect.bottom > window.innerHeight - 40) range.startContainer.parentElement?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      if (!highlights) { const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); }
+    };
+    const step = delta => {
+      if (!state.matches.length) return;
+      state.position = (state.position + delta + state.matches.length) % state.matches.length;
+      count.textContent = `${state.position + 1} / ${state.matches.length}`;
+      paint();
+      reveal();
+    };
+    const replaceRanges = ranges => {
+      if (editor?.blocked) return;
+      replaceInBody(body, ranges, replacement.value);
+      editor.changed();
+    };
+
+    on(input, 'input', () => { refresh(); reveal(); });
+    on(input, 'keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); step(event.shiftKey ? -1 : 1); }
+      else if (event.key === 'Escape') { event.preventDefault(); closeFind(true); }
+    });
+    bar.querySelectorAll('[data-find-step]').forEach(button => on(button, 'click', () => step(Number(button.dataset.findStep))));
+    on(bar.querySelector('[data-find-close]'), 'click', () => closeFind(true));
+    on(bar.querySelector('[data-find-case]'), 'change', () => refresh());
+    on(replacement, 'keydown', event => { if (event.key === 'Escape') { event.preventDefault(); closeFind(true); } });
+    on(bar.querySelector('[data-find-replace-one]'), 'click', () => {
+      const range = state.matches[state.position];
+      if (!range) return;
+      // Continue after the inserted text, even if it contains the query.
+      const resume = state.starts[state.position] + replacement.value.length;
+      replaceRanges([range]);
+      refresh();
+      const next = state.starts.findIndex(start => start >= resume);
+      state.position = state.matches.length ? Math.max(0, next) : -1;
+      if (state.matches.length) count.textContent = `${state.position + 1} / ${state.matches.length}`;
+      paint();
+      reveal();
+    });
+    on(bar.querySelector('[data-find-replace-all]'), 'click', () => {
+      const total = state.matches.length;
+      if (!total) return;
+      replaceRanges(state.matches);
+      refresh();
+      count.textContent = `${tr('Replaced')} ${total}`;
+    });
+    if (editor) on(body, 'input', () => { if (active === state) refresh({ keepPosition: true }); });
+
+    const selected = window.getSelection()?.toString();
+    if (query !== null) input.value = query;
+    else if (selected && !selected.includes('\n') && body.contains(window.getSelection().anchorNode)) input.value = selected;
+    refresh();
+    reveal();
+    input.focus({ preventScroll: true });
+    input.select();
+    bar.scrollIntoView({ block: 'nearest' });
+  };
+
+  function closeFind(restoreFocus = false) {
+    if (!active) return;
+    const { panel, bar } = active;
+    bar.remove();
+    clearHighlights();
+    const toggle = panel.querySelector('[data-note-find]');
+    toggle?.setAttribute('aria-expanded', 'false');
+    active = null;
+    if (restoreFocus) toggle?.focus();
+  }
+
+  on(document, 'click', event => {
+    const button = event.target.closest('[data-note-find]');
+    if (!button) return;
+    const panel = button.closest('.note-panel');
+    if (active?.panel === panel) closeFind(true); else openFind(panel);
+  });
+  const visibleNotePanel = () => {
+    const panel = [...document.querySelectorAll('.note-panel:not([hidden])')].find(item => item.offsetParent !== null);
+    return panel && noteBody(panel) && !noteBody(panel).hidden ? panel : null;
+  };
+  // Ctrl/⌘ F searches the note being read; the transcript keeps its own find.
+  on(document, 'keydown', event => {
+    if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'f' || event.shiftKey || event.altKey) return;
+    const panel = visibleNotePanel();
+    if (!panel || document.activeElement?.closest('#recording-panel-transcript')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    openFind(panel);
+  }, { capture: true });
+  /* ---------- Recording-wide search (used by the workspace Find & replace) ---------- */
+
+  const noteTab = target => document.querySelector(`.tabs [data-note-target="${CSS.escape(target)}"]`);
+  // Every note once: a generated note whose editable copy has its own panel is
+  // searched (and replaced) through that copy; its preserved output is skipped.
+  const searchTargets = () => [...document.querySelectorAll('.note-panel')].flatMap(panel => {
+    const body = noteBody(panel);
+    const target = panel.dataset.notePanel || '';
+    const summaryId = target.startsWith('sum-') ? target.slice(4) : null;
+    if (!body || (summaryId && document.querySelector(`[data-source-summary="${CSS.escape(summaryId)}"]`))) return [];
+    return [{ target, body, editor: editors.get(body) || null, label: noteTab(target)?.querySelector('.note-tab-label')?.textContent.trim() || tr('Note') }];
+  });
+  const markdownFormOpen = item => {
+    const form = item.body.closest('.note-panel')?.querySelector('[data-workspace-note-form]');
+    return Boolean(form && !form.hidden);
+  };
+  const noteSearch = {
+    // Notes whose Markdown source editor is open: replacing the rendered text
+    // underneath would overwrite what is being typed there.
+    editing: () => searchTargets().filter(item => item.editor && markdownFormOpen(item)).map(item => item.label),
+    count: (query, caseSensitive = false) => searchTargets()
+      .map(item => ({ target: item.target, label: item.label, editable: Boolean(item.editor && !item.editor.blocked), count: findRanges(item.body, query, caseSensitive).ranges.length }))
+      .filter(item => item.count),
+    // Replaces in every editable note, then waits for each save. Notes that
+    // could not be saved are returned by label and keep their unsaved text.
+    replaceAll: async (query, replacement, caseSensitive = false) => {
+      closeFind();
+      const targets = searchTargets().filter(item => item.editor && !markdownFormOpen(item));
+      // Finish pending saves first so each replacement starts from saved text.
+      for (const item of targets) if (item.editor.busy) await item.editor.flush();
+      const touched = [];
+      let replaced = 0;
+      targets.forEach(item => {
+        const { ranges } = findRanges(item.body, query, caseSensitive);
+        if (!ranges.length) return;
+        if (item.editor.blocked) { touched.push(item); return; }
+        replaceInBody(item.body, ranges, replacement);
+        item.editor.changed();
+        replaced += ranges.length;
+        touched.push(item);
+      });
+      // One at a time: each save takes the note write lock.
+      for (const item of touched) await item.editor.flush();
+      const failed = touched.filter(item => item.editor.busy || item.editor.blocked).map(item => item.label);
+      return { replaced, notes: touched.length, failed };
+    },
+    reveal: (target, query) => {
+      noteTab(target)?.click();
+      const panel = document.querySelector(`.note-panel[data-note-panel="${CSS.escape(target)}"]`);
+      if (panel) requestAnimationFrame(() => openFind(panel, query));
+    },
+  };
+  window.localplaudNoteSearch = noteSearch;
+  signal.addEventListener('abort', () => { if (window.localplaudNoteSearch === noteSearch) delete window.localplaudNoteSearch; });
+
+  // Switching notes or tabs hides the panel; drop its stale highlights.
+  const observer = new MutationObserver(() => { if (active && (active.panel.hidden || active.panel.offsetParent === null)) closeFind(); });
+  document.querySelectorAll('.note-panel').forEach(panel => observer.observe(panel, { attributes: true, attributeFilter: ['hidden'] }));
+  const notesPanel = document.getElementById('recording-panel-notes');
+  if (notesPanel) observer.observe(notesPanel, { attributes: true, attributeFilter: ['hidden', 'class'] });
+  signal.addEventListener('abort', () => { observer.disconnect(); clearHighlights(); });
+})();

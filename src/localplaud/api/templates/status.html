@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Status — localplaud{% endblock %}
+{% block body %}
+<div class="content"><div class="pane-inner">
+<h1 class="page">{{ t('Status') }}</h1>
+
+<div class="stats">
+  <div class="tile"><div class="k">{{ t('Recordings') }}</div><div class="v">{{ stats.total }}</div></div>
+  <div class="tile"><div class="k">{{ t('Processed') }}</div><div class="v">{{ stats.done }}</div></div>
+  <div class="tile"><div class="k">{{ t('In progress') }}</div><div class="v">{{ stats.processing }}</div></div>
+  <div class="tile"><div class="k">{{ t('Total audio') }}</div><div class="v">{{ stats.hours }}<small> h</small></div></div>
+</div>
+<div class="sub status-usage">{{ usage_totals.attempts }} {{ t('recorded stage attempts') }} · {{ usage_totals.latency_hours }} {{ t('execution hours') }}{% if usage_totals.estimated_cost_usd %} · {{ t('estimated provider cost') }} ${{ usage_totals.estimated_cost_usd }}{% else %} · {{ t('no priced provider usage recorded') }}{% endif %}</div>
+
+<div class="status-cols">
+  <div class="panel">
+    <strong>{{ t('Environment') }}</strong>
+    <div class="status-list">
+      {% for c in checks %}
+      <div class="status-check">
+        <span class="status-check-name">{{ c.name }}</span>
+        {% if c.detail %}<span class="sub status-check-detail">{{ c.detail }}</span>{% endif %}
+        <span class="status-check-mark {% if c.ok %}ok{% else %}bad{% endif %}">{% if c.ok %}{{ icon('check', 'sm') }}{% else %}{{ icon('x', 'sm') }}{% endif %}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <strong>{{ t('Pipeline') }}</strong>
+    <div class="status-list">
+      {% for name, count in status_rows %}
+      <div class="status-row">
+        <span class="st {{ name }}">{{ name }}</span>
+        <span class="status-count">{{ count }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{% if stage_rows %}
+<div class="panel status-panel">
+  <strong>{{ t('Processing stages') }}</strong>
+  <div class="status-stage-grid">
+    {% for stage, state, count in stage_rows %}
+    <div class="status-row">
+      <span class="status-stage">{{ stage }} <span class="st {{ state }}">{{ state }}</span></span>
+      <span class="status-count">{{ count }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% if stage_issues %}
+<div class="panel status-panel">
+  <strong>{{ t('Needs attention') }}</strong>
+  <div class="status-list status-issues">
+    {% for issue in stage_issues %}
+    <div>
+      <a href="/file/{{ issue.file_id }}">{{ issue.filename }}</a>
+      · {{ issue.stage }} <span class="st {{ issue.status }}">{{ issue.status }}</span>
+      {% if issue.error %}<div class="sub status-issue-error">{{ issue.error }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="panel status-panel">
+  <strong>{{ t('Configuration') }}</strong>
+  <div class="status-config">
+    <div><span class="sub">ASR</span><br><code>{{ cfg.asr }}</code></div>
+    <div><span class="sub">LLM</span><br><code>{{ cfg.llm }}</code></div>
+    <div><span class="sub">{{ t('Automatic processing') }}</span><br><code>{{ t(cfg.auto_process) }}</code></div>
+    <div><span class="sub">{{ t('Embeddings') }}</span><br><code>{{ cfg.embeddings }}</code></div>
+    <div><span class="sub">{{ t('Diarize') }}</span><br><code>{{ cfg.diarize }}</code></div>
+    <div><span class="sub">{{ t('Summary template') }}</span><br><code>{{ cfg.summary_template }}</code></div>
+    <div><span class="sub">{{ t('Files per cycle') }}</span><br><code>{{ cfg.files_per_cycle }}</code></div>
+    <div><span class="sub">{{ t('Retry policy') }}</span><br><code>{{ cfg.retry_policy }}</code></div>
+    <div><span class="sub">{{ t('Poll interval') }}</span><br><code>{{ cfg.poll_interval }}s</code></div>
+  </div>
+</div>
+</div></div>
+{% endblock %}

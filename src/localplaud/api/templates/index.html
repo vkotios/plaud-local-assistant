@@ -1,0 +1,831 @@
+{% extends "base.html" %}
+{% from "_library.html" import file_row, file_table_head with context %}
+
+{%- macro liburl(sort='__keep__', dir='__keep__', state='__keep__', scene='__keep__', view='__keep__', folder='__keep__', tag='__keep__', origin='__keep__', ranges=true) -%}
+{%- set sort_value = lib.sort if sort == '__keep__' else sort -%}
+{%- set dir_value = lib.dir if dir == '__keep__' else dir -%}
+{%- set state_value = lib.state if state == '__keep__' else state -%}
+{%- set scene_value = lib.scene if scene == '__keep__' else scene -%}
+{%- set view_value = lib.view if view == '__keep__' else view -%}
+{%- set folder_value = lib.folder if folder == '__keep__' else folder -%}
+{%- set tag_value = lib.tag if tag == '__keep__' else tag -%}
+{%- set origin_value = lib.origin if origin == '__keep__' else origin -%}
+/?sort={{ sort_value }}&amp;dir={{ dir_value }}&amp;view={{ view_value }}
+{%- if q %}&amp;q={{ q | urlencode }}{% endif -%}
+{%- if state_value %}&amp;state={{ state_value | urlencode }}{% endif -%}
+{%- if scene_value is not none and scene_value != '' %}&amp;scene={{ scene_value }}{% endif -%}
+{%- if folder_value is not none and folder_value != '' %}&amp;folder={{ folder_value }}{% endif -%}
+{%- if tag_value is not none and tag_value != '' %}&amp;tag={{ tag_value }}{% endif -%}
+{%- if origin_value %}&amp;origin={{ origin_value }}{% endif -%}
+{%- if ranges and lib.date_from %}&amp;date_from={{ lib.date_from }}{% endif -%}
+{%- if ranges and lib.date_to %}&amp;date_to={{ lib.date_to }}{% endif -%}
+{%- if ranges and lib.min_duration_minutes is not none %}&amp;min_duration_minutes={{ lib.min_duration_minutes }}{% endif -%}
+{%- if ranges and lib.max_duration_minutes is not none %}&amp;max_duration_minutes={{ lib.max_duration_minutes }}{% endif -%}
+{%- endmacro -%}
+
+{%- macro sorth(col, label) -%}
+  {%- set active = lib.sort == col -%}
+  {%- set nxt = ('desc' if (active and lib.dir == 'asc') else ('asc' if active else ('asc' if col == 'name' else 'desc'))) -%}
+  <a class="sorth {% if active %}on{% endif %}" href="{{ liburl(sort=col, dir=nxt) }}">
+    {{ label }}{% if active %}<span class="arr">{{ '▲' if lib.dir == 'asc' else '▼' }}</span>{% endif %}
+  </a>
+{%- endmacro -%}
+
+{% block mobile_topbar %}{% if active == 'ask' %}{{ super() }}{% else %}
+{% include "_m_root_topbar.html" %}
+{% endif %}{% endblock %}
+
+{% block body %}
+{% if active == 'ask' %}
+<style>
+  .ask-surface { max-width:900px;margin:0 auto;padding:8px 0 60px; }
+  .ask-hero { padding:20px 0 18px;border-bottom:1px solid var(--border);margin-bottom:18px; }
+  .ask-hero h1 { display:flex;align-items:center;gap:9px;margin:0 0 5px;font-size:22px;letter-spacing:0; }
+  .ask-hero .nav-icon { width:21px;height:21px;color:var(--red); }
+  .ask-scope { border:1px solid var(--border);border-radius:8px;padding:14px;margin:0 0 14px;background:var(--c-surface-2); }
+  .ask-scope-details { border:1px solid var(--border);border-radius:8px;margin:0 0 12px;background:var(--c-surface-2); }
+  .ask-scope-details>summary { display:flex;align-items:center;gap:7px;padding:11px 14px;cursor:pointer;list-style:none;font-size:12.5px;min-width:0;flex-wrap:wrap; }
+  .ask-scope-details>summary::-webkit-details-marker { display:none; }
+  .ask-scope-details>summary:hover { background:var(--panel2); }
+  .ask-scope-details>summary:focus-visible { outline:2px solid var(--blue);outline-offset:-2px;border-radius:8px; }
+  .ask-scope-details[open]>summary { border-bottom:1px solid var(--border); }
+  .ask-scope-details .ask-scope { border:0;margin:0;background:none; }
+  .ask-row-label { font-size:11px;font-weight:700;margin-bottom:6px; }
+</style>
+{% endif %}
+<div class="library-page"><div class="page-frame">
+  {% if active == 'ask' %}
+  <section class="ask-surface" id="library-ask">
+    <div class="ask-hero"><div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px"><div><h1><span class="nav-icon" style="--nav-icon:url('/static/lucide/sparkles.svg')"></span>{{ t('Ask localplaud') }}</h1><div class="sub">{{ t('Ask across your library. Answers stay grounded in indexed recordings and cite their sources.') }}</div></div><button class="btn sec" type="button" data-open-ask-history><span class="nav-icon" style="--nav-icon:url('/static/lucide/history.svg')"></span>{{ t('History') }}</button></div></div>
+    <details class="ask-scope-details" id="library-ask-scope-details">
+      <summary>
+        <span class="nav-icon" style="--nav-icon:url('/static/lucide/list-filter.svg');width:12px;height:12px"></span>
+        <span>{{ t('Scope') }} · <strong id="library-ask-scope-summary">{{ t('Entire library') }}</strong></span>
+        <span class="sub" style="font-size:11px">{{ t('folder, tag, speaker, dates, or specific recordings') }}</span>
+      </summary>
+    <fieldset class="ask-scope" id="library-ask-scope">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:8px">
+        <label class="sub" style="font-size:11px">{{ t('Folder') }}<select class="search-input" name="ask_folder_id" style="width:100%;margin-top:3px;padding:7px 9px"><option value="">{{ t('Any folder') }}</option>{% for folder in organization.folders %}<option value="{{ folder.id }}">{{ folder.name }}</option>{% endfor %}</select></label>
+        <label class="sub" style="font-size:11px">{{ t('Tag') }}<select class="search-input" name="ask_tag_id" style="width:100%;margin-top:3px;padding:7px 9px"><option value="">{{ t('Any tag') }}</option>{% for tag in organization.tags %}<option value="{{ tag.id }}">{{ tag.name }}</option>{% endfor %}</select></label>
+        <label class="sub" style="font-size:11px">{{ t('Source') }}<select class="search-input" name="ask_origin" style="width:100%;margin-top:3px;padding:7px 9px"><option value="">{{ t('Any source') }}</option><option value="plaud">Plaud</option><option value="local">{{ t('Local') }}</option></select></label>
+        <label class="sub" style="font-size:11px">{{ t('Named speaker') }}<select class="search-input" name="ask_speaker_name" style="width:100%;margin-top:3px;padding:7px 9px"><option value="">{{ t('Any named speaker') }}</option>{% for speaker in named_speakers %}<option value="{{ speaker.name }}">{{ speaker.name }} · {{ speaker.recording_count }}</option>{% endfor %}</select></label>
+        <div class="sub" style="font-size:11px;grid-column:1/-1;margin-bottom:-3px">{{ t('Recorded date') }} · {{ workspace_preferences.timezone }}</div>
+        <label class="sub" style="font-size:11px">{{ t('From') }}<input class="search-input" type="date" name="ask_date_from" style="width:100%;margin-top:3px;padding:7px 9px"></label>
+        <label class="sub" style="font-size:11px">{{ t('To') }}<input class="search-input" type="date" name="ask_date_to" style="width:100%;margin-top:3px;padding:7px 9px"></label>
+        <label class="sub" style="font-size:11px;grid-column:1/-1">{{ t('Recordings (optional)') }}<select class="search-input" name="ask_file_ids" multiple size="5" style="width:100%;margin-top:3px;padding:7px 9px">{% for file in files %}<option value="{{ file.id }}">{{ file.filename }} · {{ file.start_time_ms | dt }}</option>{% endfor %}</select></label>
+      </div>
+    </fieldset>
+    </details>
+    <div class="ask-row-label sub">{{ t('Suggested') }}</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">{% for chip in ["What decisions were made recently?", "Show action items across recordings", "What themes keep recurring?"] %}<button type="button" class="btn sec library-ask-chip" data-q="{{ t(chip) }}" style="padding:6px 11px;font-size:12px">{{ t(chip) }}</button>{% endfor %}</div>
+    <div class="ask-row-label sub">{{ t('Quick actions') }} <span style="font-weight:400">· {{ t('creates an Ask thread; recordings and notes stay unchanged') }}</span></div>
+    <div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:11px">{% for skill in ask_skills %}<form data-ask-request data-ask-status="library-ask-status" hx-post="/ask/skill" hx-target="#answer" hx-sync="#answer:drop" hx-swap="innerHTML" hx-indicator="#spin" hx-include="#library-ask-scope"><input type="hidden" name="skill_key" value="{{ skill.key }}"><button type="submit" class="btn sec" title="{{ skill.description }}" style="padding:6px 11px;font-size:12px">{{ skill.name }}</button></form>{% endfor %}</div>
+    <form class="ask" data-ask-request data-ask-status="library-ask-status" hx-post="/ask" hx-target="#answer" hx-sync="#answer:drop" hx-swap="innerHTML" hx-indicator="#spin" hx-include="#library-ask-scope"><input id="library-ask-q" data-ask-question name="q" placeholder="{{ t('Ask anything about your recordings…') }}" autocomplete="off" required><button class="btn" type="submit">{{ t('Ask') }}</button></form>
+    <div id="spin" class="htmx-indicator sub" style="margin:-6px 2px 8px">{{ t('thinking…') }}</div>
+    <div id="library-ask-status" class="ask-request-status" role="status" aria-live="polite"></div>
+    {% if ask_threads %}<div style="display:flex;gap:6px;flex-wrap:wrap;margin:-5px 0 10px"><span class="sub" style="font-size:11px">{{ t('Recent Ask') }}</span>{% for thread in ask_threads %}<a class="chip {% if selected_ask_thread and selected_ask_thread.thread_id == thread.id %}on{% endif %}" href="/?ask=true&amp;ask_thread={{ thread.id }}#library-ask">{{ thread.title | truncate(38) }}</a>{% endfor %}</div>{% endif %}
+    <div id="answer" role="region" aria-label="{{ t('Answer') }}">{% if selected_ask_thread %}{% set thread=selected_ask_thread %}{% set file_id=None %}{% set target='answer' %}{% include '_ask_thread.html' %}{% endif %}</div>
+  </section>
+  {% else %}
+  {% set active_folder = organization.folders | selectattr('id', 'equalto', lib.folder) | first %}
+  {% set active_tag = organization.tags | selectattr('id', 'equalto', lib.tag) | first %}
+  {% set active_scene = facets.scenes | selectattr('active') | first %}
+  {% set active_origin = facets.origins | selectattr('active') | first %}
+  {% set filter_count = (1 if q else 0) + (1 if lib.state else 0) + (1 if lib.scene is not none else 0) + (1 if lib.folder is not none else 0) + (1 if lib.tag is not none else 0) + (1 if lib.origin else 0) + (1 if lib.date_from else 0) + (1 if lib.date_to else 0) + (1 if lib.min_duration_minutes is not none else 0) + (1 if lib.max_duration_minutes is not none else 0) %}
+  {% if lib.view == 'trash' %}{% set view_title = t('Trash') %}{% elif lib.view == 'uncategorized' %}{% set view_title = t('Unfiled') %}{% elif active_folder %}{% set view_title = active_folder.name %}{% elif active_tag %}{% set view_title = active_tag.name %}{% elif active_scene %}{% set view_title = t(active_scene.label) %}{% elif lib.origin == 'plaud' %}{% set view_title = t('Plaud recordings') %}{% elif lib.origin == 'local' %}{% set view_title = t('Local uploads') %}{% else %}{% set view_title = t('All files') %}{% endif %}
+  {% set selectable = lib.view != 'trash' %}
+  <div class="library-head"{% if active_tag %} data-active-tag-name="{{ active_tag.name }}"{% endif %}>
+    <h1 class="page-title"><span class="only-wide">{{ view_title }}</span><button class="title-switch only-compact" type="button" data-dialog-open="library-sheet" aria-haspopup="dialog">{{ view_title }}{{ icon('chevron-down') }}</button></h1>
+    <div class="library-tools">
+      <form class="library-search search-field" method="get" action="/" role="search">{{ icon('search') }}<input class="input" type="search" name="q" value="{{ q }}" placeholder="{{ t('Search files') }}" aria-label="{{ t('Search files') }}" enterkeyhint="search"><input type="hidden" name="view" value="{{ lib.view }}">{% for name, value in [('folder', lib.folder), ('tag', lib.tag), ('origin', lib.origin), ('state', lib.state), ('scene', lib.scene), ('sort', lib.sort), ('dir', lib.dir), ('date_from', lib.date_from), ('date_to', lib.date_to), ('min_duration_minutes', lib.min_duration_minutes), ('max_duration_minutes', lib.max_duration_minutes)] %}{% if value is not none and value != '' %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endif %}{% endfor %}</form>
+      <details class="filter-menu" {% if lib.invalid_date_range or lib.invalid_duration_range %}open{% endif %}><summary class="icon-btn" aria-label="{{ t('Filter and organize') }}" data-tooltip="{{ t('Filter and organize') }}">{{ icon('filter') }}{% if filter_count %}<span class="filter-count" aria-hidden="true">{{ filter_count }}</span><span class="visually-hidden">{{ filter_count }} {{ t('active filters') }}</span>{% endif %}</summary><div class="filter-popover">
+      <div class="filter-head"><strong>{{ t('Filter and organize') }}</strong><button class="icon-btn filter-close" type="button" aria-label="{{ t('Close filters') }}">{{ icon('x') }}</button></div>
+      <div class="orgbox" aria-label="{{ t('Library organization') }}">
+        <div class="orgrow">
+          <span class="lbl">{{ t('Folders') }}</span>
+          <a class="fchip {% if lib.folder is none %}on{% endif %}" href="{{ liburl(view='all', folder='', tag='') }}">{{ t('All') }}</a>
+          {% for folder in organization.folders %}
+          <a class="fchip {% if lib.folder == folder.id %}on{% endif %}" href="{{ liburl(view='all', folder=folder.id, tag='') }}" title="{{ folder.name }}"><span class="folder-glyph" style="--folder-color:{{ folder.color or 'var(--c-text-2)' }}">{{ icon('folder', 'xs') }}</span>{{ folder.name }} <span class="n">{{ folder.count }}</span></a>
+          {% endfor %}
+          <details class="quickadd"><summary>+ {{ t('Folder') }}</summary>
+            <form data-create-kind="folders"><input class="input" name="name" maxlength="80" placeholder="{{ t('Folder name') }}" required><button class="btn btn-sm">{{ t('Add') }}</button></form>
+          </details>
+        </div>
+        {% set tag_kinds = [('topic', t('Topics')), ('person', t('People')), ('org', t('Organizations')), ('custom', t('Other'))] %}
+        <label class="tag-filter-select"><span class="lbl">{{ t('Tags') }}</span><select class="select" id="library-tag-filter" aria-label="{{ t('Tags') }}" onchange="window.location.href=this.value">
+          <option value="{{ liburl(view='all', folder='', tag='') }}"{% if lib.tag is none %} selected{% endif %}>{{ t('All') }}</option>
+          {% for kind, kind_label in tag_kinds %}{% set kind_tags = organization.tags | selectattr('kind', 'equalto', kind) | list %}{% if kind_tags %}<optgroup label="{{ kind_label }}">{% for tag in kind_tags %}<option value="{{ liburl(view='all', folder='', tag=tag.id) }}"{% if lib.tag == tag.id %} selected{% endif %}>{{ tag.name }} · {{ tag.count }}</option>{% endfor %}</optgroup>{% endif %}{% endfor %}
+        </select></label>
+        <div class="orgrow">
+          <details class="quickadd"><summary>+ {{ t('Tag') }}</summary>
+            <form data-create-kind="tags"><input class="input" name="name" maxlength="80" placeholder="{{ t('Tag name') }}" required><button class="btn btn-sm">{{ t('Add') }}</button></form>
+          </details>
+        </div>
+        <button class="org-manage" id="organization-manager-open" type="button">{{ icon('pencil', 'xs') }}{{ t('Manage folders and tags') }}</button>
+        <div id="organization-create-status" class="sub org-status" role="status" aria-live="polite"></div>
+      </div>
+      <div class="libbar">
+        <div class="filtrow">
+          <span class="lbl">{{ t('State') }}</span>
+          <a class="fchip {% if not lib.state %}on{% endif %}" href="{{ liburl(lib.sort, lib.dir, '', lib.scene, lib.view) }}">{{ t('All') }}</a>
+          {% for s in states %}<a class="fchip {% if lib.state == s %}on{% endif %}" href="{{ liburl(lib.sort, lib.dir, s, lib.scene, lib.view) }}">{{ t(s) }}</a>{% endfor %}
+        </div>
+        {% if facets.scenes %}
+        <div class="filtrow">
+          <span class="lbl">{{ t('Source') }}</span>
+          <a class="fchip {% if lib.scene is none %}on{% endif %}" href="{{ liburl(lib.sort, lib.dir, lib.state, '', lib.view) }}">{{ t('All') }}</a>
+          {% for sc in facets.scenes %}<a class="fchip {% if sc.active %}on{% endif %}" href="{{ liburl(lib.sort, lib.dir, lib.state, sc.value, lib.view) }}">{{ t(sc.label) }} <span class="n">{{ sc.count }}</span></a>{% endfor %}
+        </div>
+        {% endif %}
+        {% if facets.origins %}
+        <div class="filtrow">
+          <span class="lbl">{{ t('Comes from') }}</span>
+          <a class="fchip {% if not lib.origin %}on{% endif %}" href="{{ liburl(origin='') }}">{{ t('All') }}</a>
+          {% for source in facets.origins %}<a class="fchip {% if source.active %}on{% endif %}" href="{{ liburl(origin=source.value) }}">{{ t(source.label) }} <span class="n">{{ source.count }}</span></a>{% endfor %}
+        </div>
+        {% endif %}
+        <div class="filtrow">
+          <span class="lbl">{{ t('View') }}</span>
+          <a class="fchip {% if lib.view == 'all' %}on{% endif %}" href="{{ liburl(view='all') }}">{{ t('All files') }}</a>
+          <a class="fchip {% if lib.view == 'uncategorized' %}on{% endif %}" href="{{ liburl(view='uncategorized', folder='', tag='') }}">{{ t('Unfiled') }}</a>
+          <a class="fchip trash {% if lib.view == 'trash' %}on{% endif %}" href="{{ liburl(view='trash', folder='', tag='') }}">{{ t('Trash') }} <span class="n">{{ facets.trash_count }}</span></a>
+        </div>
+        <form class="range-filter" method="get" action="/">
+          {% for name, value in [('q', q), ('sort', lib.sort), ('dir', lib.dir), ('state', lib.state), ('scene', lib.scene), ('view', lib.view), ('folder', lib.folder), ('tag', lib.tag), ('origin', lib.origin)] %}{% if value is not none and value != '' %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endif %}{% endfor %}
+          <fieldset><legend>{{ t('Recorded date') }}</legend><div class="range-inputs"><label>{{ t('From') }}<input class="input" type="date" name="date_from" value="{{ lib.date_from or '' }}"></label><label>{{ t('To') }}<input class="input" type="date" name="date_to" value="{{ lib.date_to or '' }}"></label></div></fieldset>
+          <fieldset><legend>{{ t('Duration in minutes') }}</legend><div class="range-inputs"><label>{{ t('Minimum') }}<input class="input" type="number" name="min_duration_minutes" value="{{ lib.min_duration_minutes if lib.min_duration_minutes is not none else '' }}" min="0" max="1000000" step="0.1" inputmode="decimal"></label><label>{{ t('Maximum') }}<input class="input" type="number" name="max_duration_minutes" value="{{ lib.max_duration_minutes if lib.max_duration_minutes is not none else '' }}" min="0" max="1000000" step="0.1" inputmode="decimal"></label></div></fieldset>
+          <div class="range-actions">{% if lib.invalid_date_range %}<span class="range-error" role="alert">{{ t('Start date must not follow end date.') }}</span>{% elif lib.invalid_duration_range %}<span class="range-error" role="alert">{{ t('Minimum duration must not exceed maximum duration.') }}</span>{% endif %}<a class="range-clear" href="{{ liburl(ranges=false) }}">{{ t('Clear date and duration') }}</a><button class="btn btn-sm range-submit" type="submit">{{ icon('check', 'xs') }}{{ t('Apply filters') }}</button></div>
+        </form>
+      </div>
+      </div></details>
+      <div class="menu-wrap">
+        <button class="icon-btn" type="button" data-menu="library-more-menu" aria-haspopup="menu" aria-expanded="false" aria-controls="library-more-menu" aria-label="{{ t('More options') }}" data-tooltip="{{ t('More options') }}">{{ icon('more') }}</button>
+        <div class="menu" id="library-more-menu" role="menu" data-placement="bottom-end" hidden>
+          {% if selectable and files %}<button class="menu-item" role="menuitem" type="button" data-select-mode>{{ icon('check-square') }}{{ t('Select recordings') }}</button>{% endif %}
+          <button class="menu-item" role="menuitem" type="button" data-open-filters>{{ icon('filter') }}{{ t('Filter and organize') }}</button>
+          <button class="menu-item" role="menuitem" type="button" data-folder-create>{{ icon('folder-plus') }}{{ t('New folder') }}</button>
+          <button class="menu-item" role="menuitem" type="button" data-proxy-click="organization-manager-open">{{ icon('tag') }}{{ t('Manage folders and tags') }}</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" role="menuitem" type="button" data-open-import="device">{{ icon('upload') }}{{ t('Import audio') }}</button>
+          <button class="menu-item" role="menuitem" type="button" data-open-import="plaud">{{ icon('refresh') }}{{ t('Sync from Plaud now') }}</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% if filter_count and files %}
+  <ul class="active-filters" aria-label="{{ t('Active filters') }}">
+    {% if q %}<li><a class="chip" href="{{ liburl() | replace('&amp;q=' ~ (q | urlencode), '') }}">{{ t('Search') }}: {{ q }} {{ icon('x', 'xs') }}</a></li>{% endif %}
+    {% if lib.state %}<li><a class="chip" href="{{ liburl(state='') }}">{{ t('State') }}: {{ t('Needs attention') if lib.state == 'attention' else t(lib.state) }} {{ icon('x', 'xs') }}</a></li>{% endif %}
+    {% if active_scene %}<li><a class="chip" href="{{ liburl(scene='') }}">{{ t('Source') }}: {{ t(active_scene.label) }} {{ icon('x', 'xs') }}</a></li>{% endif %}
+    {% if active_folder %}<li><a class="chip" href="{{ liburl(folder='') }}">{{ t('Folder') }}: {{ active_folder.name }} {{ icon('x', 'xs') }}</a></li>{% endif %}
+    {% if active_tag %}<li><a class="chip" href="{{ liburl(tag='') }}">{{ t('Tag') }}: {{ active_tag.name }} {{ icon('x', 'xs') }}</a></li>{% endif %}
+    {% if active_origin %}<li><a class="chip" href="{{ liburl(origin='') }}">{{ t('Comes from') }}: {{ t(active_origin.label) }} {{ icon('x', 'xs') }}</a></li>{% endif %}
+    {% if lib.date_from or lib.date_to or lib.min_duration_minutes is not none or lib.max_duration_minutes is not none %}<li><a class="chip" href="{{ liburl(ranges=false) }}">{% if lib.date_from or lib.date_to %}{{ lib.date_from or '…' }} – {{ lib.date_to or '…' }}{% endif %}{% if lib.min_duration_minutes is not none or lib.max_duration_minutes is not none %} · {{ lib.min_duration_minutes if lib.min_duration_minutes is not none else 0 }}–{{ lib.max_duration_minutes if lib.max_duration_minutes is not none else '∞' }} {{ t('minutes') }}{% endif %} {{ icon('x', 'xs') }}</a></li>{% endif %}
+    <li><a class="text-btn" href="/?sort={{ lib.sort }}&amp;dir={{ lib.dir }}&amp;view={{ lib.view }}">{{ t('Clear all filters') }}</a></li>
+  </ul>
+  {% endif %}
+
+  {# Recordings stop here once automatic retries run out; offer one obvious way
+     to resume them all. Only on the bare state view, so the count is exact. #}
+  {% set retry_statuses = ['error', 'partial'] if lib.state == 'attention' else ([lib.state] if lib.state in attention_states else []) %}
+  {% if retry_statuses and files and lib.view == 'all' and filter_count == 1 %}
+  <div class="library-banner attention-retry" id="attention-retry">{{ icon('alert') }}<span class="attention-retry-copy"><strong>{{ pagination.total }} {{ t('recordings did not finish processing') }}</strong> {{ t('Reprocessing reruns only the failed or unfinished steps; finished speech recognition is not redone.') }}<span class="attention-retry-status" id="attention-retry-status" role="status" aria-live="polite"></span></span><button class="btn btn-sm" type="button" id="attention-retry-button" data-statuses="{{ retry_statuses | join(',') }}">{{ icon('refresh', 'sm') }}{{ t('Reprocess all') }}</button></div>
+  {% endif %}
+
+  {% if lib.view == 'trash' %}
+  <div class="library-banner trash">{{ icon('info') }}<span><strong>{{ t("Trash mirrors Plaud's cloud trash.") }}</strong> {{ t('This is a read-only recovery view — localplaud never deletes your cloud data. Restore a recording in the Plaud app to bring it back.') }}</span></div>
+  {% endif %}
+
+  {% if not files %}
+  <div class="empty-state{% if filter_count or lib.view == 'uncategorized' %} filtered-empty{% endif %}">
+    {% if lib.view == 'trash' %}
+      {{ icon('trash') }}<p class="empty-title">{{ t('Nothing in trash.') }}</p>
+      <p class="empty-body">{{ t('Recordings you delete in the Plaud app show up here until Plaud removes them.') }}</p>
+    {% elif filter_count or lib.view == 'uncategorized' %}
+      {{ icon('filter') }}<p class="empty-title filtered-empty-title">{{ t('No recordings match these filters.') }}</p>
+      {% if lib.view == 'uncategorized' and not filter_count %}<p class="empty-body">{{ t('Every recording is in a folder or tagged.') }}</p>{% endif %}
+      <ul class="active-filter-list" aria-label="{{ t('Active filters') }}">
+        {% if q %}<li>{{ t('Search') }}: {{ q }}</li>{% endif %}
+        {% if lib.state %}<li>{{ t('State') }}: {{ t('Needs attention') if lib.state == 'attention' else t(lib.state) }}</li>{% endif %}
+        {% if active_scene %}<li>{{ t('Source') }}: {{ t(active_scene.label) }}</li>{% endif %}
+        {% if active_folder %}<li>{{ t('Folder') }}: {{ active_folder.name }}</li>{% endif %}
+        {% if active_tag %}<li>{{ t('Tag') }}: {{ active_tag.name }}</li>{% endif %}
+        {% if active_origin %}<li>{{ t('Comes from') }}: {{ t(active_origin.label) }}</li>{% endif %}
+        {% if lib.view == 'uncategorized' %}<li>{{ t('View') }}: {{ t('Unfiled') }}</li>{% endif %}
+        {% if lib.date_from %}<li>{{ t('From') }}: {{ lib.date_from }}</li>{% endif %}
+        {% if lib.date_to %}<li>{{ t('To') }}: {{ lib.date_to }}</li>{% endif %}
+        {% if lib.min_duration_minutes is not none %}<li>{{ t('Minimum') }}: {{ lib.min_duration_minutes }} {{ t('minutes') }}</li>{% endif %}
+        {% if lib.max_duration_minutes is not none %}<li>{{ t('Maximum') }}: {{ lib.max_duration_minutes }} {{ t('minutes') }}</li>{% endif %}
+      </ul>
+      <div class="empty-actions"><a class="btn sec filtered-empty-reset" href="/?sort={{ lib.sort }}&amp;dir={{ lib.dir }}&amp;view=all">{{ icon('undo', 'sm') }}{{ t('Clear all filters') }}</a></div>
+    {% else %}
+      {{ icon('waveform') }}<p class="empty-title">{{ t('No recordings yet.') }}</p>
+      <p class="empty-body">{{ t('Connect the official Plaud API or MCP in Settings, then import your library.') }}</p>
+      <div class="empty-actions"><button class="btn" type="button" data-open-import="device">{{ icon('upload', 'sm') }}{{ t('Import audio') }}</button><button class="btn sec" type="button" data-open-import="plaud">{{ icon('cloud', 'sm') }}{{ t('Import from Plaud') }}</button></div>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="file-table" id="library-table">
+    {% if selectable %}
+    <div class="bulkbar batch-bar" id="bulkbar">
+      <span class="batch-count"><input class="checkbox" id="select-all-batch" type="checkbox" aria-label="{{ t('Select all visible recordings') }}" checked><span>{{ t('Selected') }} (<span id="selected-count">0</span>)</span></span>
+      <select class="select" id="bulk-action" aria-label="{{ t('Organization action') }}">
+        <option value="folder">{{ t('Move to folder') }}</option>
+        <option value="add-tag">{{ t('Add tag') }}</option>
+        <option value="remove-tag">{{ t('Remove tag') }}</option>
+        <option value="resume">{{ t('Resume processing') }}</option>
+      </select>
+      <select class="select" id="bulk-target" aria-label="{{ t('Folder or tag') }}"></select>
+      <button class="btn" type="button" id="bulk-apply">{{ t('Apply') }}</button>
+      <button class="btn bulk-export" type="button" id="bulk-export-open">{{ icon('download', 'sm') }}{{ t('Export selected') }}</button>
+      <button class="btn danger bulk-delete-processing" type="button" id="bulk-delete-processing" aria-expanded="false" aria-controls="bulk-delete-confirm">{{ icon('trash', 'sm') }}{{ t('Delete local processing') }}</button>
+      <button class="text-btn batch-cancel" type="button" id="bulk-clear">{{ t('Cancel') }}</button>
+      <div class="bulkmsg" id="bulk-message" role="status"></div>
+      <div class="bulk-danger-confirm" id="bulk-delete-confirm" role="alertdialog" aria-labelledby="bulk-delete-title" aria-describedby="bulk-delete-description" hidden>
+        <div class="bulk-danger-copy">{{ icon('alert') }}<div><strong id="bulk-delete-title">{{ t('Delete local processing') }}</strong><p id="bulk-delete-description">{{ t('Delete local transcript, corrections, generated notes, mind map, search index, and processing history?') }}</p><ul class="bulk-danger-preserved" role="list">{% for kept in ['Original audio', 'Folders', 'Tags', 'Ask history', 'Saved notes', 'Editable note', 'Plaud imports'] %}<li>{{ icon('check', 'xs') }}{{ t(kept) }}</li>{% endfor %}</ul></div></div>
+        <div class="bulk-danger-actions"><button type="button" class="btn sec" id="bulk-delete-cancel">{{ t('Cancel') }}</button><button type="button" class="btn btn-danger-solid bulk-delete-confirm" id="bulk-delete-confirm-button">{{ t('Delete local processing') }}</button></div>
+        <div class="bulk-danger-status" id="bulk-delete-status" role="status" aria-live="polite"></div>
+      </div>
+    </div>
+    {% endif %}
+    <div class="mobile-library-controls">
+      <label class="mobile-sort-label">{{ icon('arrow-up-down', 'sm') }}<span class="visually-hidden">{{ t('Sort recordings') }}</span><select class="mobile-sort" id="mobile-sort" aria-label="{{ t('Sort recordings') }}">
+        <option value="{{ liburl(sort='recorded', dir='desc') }}"{% if lib.sort == 'recorded' and lib.dir == 'desc' %} selected{% endif %}>{{ t('Newest first') }}</option>
+        <option value="{{ liburl(sort='recorded', dir='asc') }}"{% if lib.sort == 'recorded' and lib.dir == 'asc' %} selected{% endif %}>{{ t('Oldest first') }}</option>
+        <option value="{{ liburl(sort='name', dir='asc') }}"{% if lib.sort == 'name' and lib.dir == 'asc' %} selected{% endif %}>{{ t('Name') }} A–Z</option>
+        <option value="{{ liburl(sort='name', dir='desc') }}"{% if lib.sort == 'name' and lib.dir == 'desc' %} selected{% endif %}>{{ t('Name') }} Z–A</option>
+        <option value="{{ liburl(sort='duration', dir='desc') }}"{% if lib.sort == 'duration' and lib.dir == 'desc' %} selected{% endif %}>{{ t('Longest first') }}</option>
+        <option value="{{ liburl(sort='duration', dir='asc') }}"{% if lib.sort == 'duration' and lib.dir == 'asc' %} selected{% endif %}>{{ t('Shortest first') }}</option>
+      </select></label>
+      <span class="t-meta">{{ pagination.total }} {{ t('recordings') }}</span>
+      {% if selectable %}<label class="mobile-select-all"><input class="checkbox" id="select-all-mobile" type="checkbox">{{ t('Select visible') }}</label>{% endif %}
+    </div>
+    {{ file_table_head(lib, liburl, selectable=selectable) }}
+    <ul class="file-list" aria-label="{{ view_title }}">
+      {% for f in files %}{{ file_row(f, return_to_param=return_to_param, selectable=selectable, show_folder=lib.folder is none) }}{% endfor %}
+    </ul>
+  </div>
+  {% if pagination.pages > 1 %}
+  {% set page_start = (pagination.page - 1) * pagination.page_size + 1 %}
+  {% set page_end = [pagination.page * pagination.page_size, pagination.total] | min %}
+  <nav class="pagination library-pagination" aria-label="{{ t('Library pages') }}">
+    <span class="sub pagination-summary">{{ page_start }}–{{ page_end }} {{ t('of') }} {{ pagination.total }}</span>
+    {% if pagination.page > 1 %}<a class="pagination-link pagination-edge" data-page-nav href="{{ request.url.include_query_params(page=pagination.page - 1) }}" aria-label="{{ t('Previous') }}">{{ icon('chevron-left', 'sm') }}</a>{% else %}<span class="pagination-link pagination-edge" aria-disabled="true" aria-label="{{ t('Previous') }}">{{ icon('chevron-left', 'sm') }}</span>{% endif %}
+    {% for item in range(1, pagination.pages + 1) %}
+      {% if item == pagination.page %}<span class="pagination-current" aria-current="page" aria-label="{{ t('Page') }} {{ item }}">{{ item }}</span>
+      {% else %}<a class="pagination-link" data-page-nav href="{{ request.url.include_query_params(page=item) }}" aria-label="{{ t('Page') }} {{ item }}">{{ item }}</a>{% endif %}
+    {% endfor %}
+    {% if pagination.page < pagination.pages %}<a class="pagination-link pagination-edge" data-page-nav href="{{ request.url.include_query_params(page=pagination.page + 1) }}" aria-label="{{ t('Next') }}">{{ icon('chevron-right', 'sm') }}</a>{% else %}<span class="pagination-link pagination-edge" aria-disabled="true" aria-label="{{ t('Next') }}">{{ icon('chevron-right', 'sm') }}</span>{% endif %}
+  </nav>
+  {% endif %}
+  {% endif %}
+  {% endif %}
+</div></div>
+{% if active != 'ask' %}
+<dialog class="sheet" id="library-sheet" aria-labelledby="library-sheet-title">
+  <div class="sheet-grabber" aria-hidden="true"></div>
+  <div class="dialog-head"><h2 class="dialog-title" id="library-sheet-title">{{ t('Folders and filters') }}</h2><button class="icon-btn" type="button" data-dialog-close aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+  <div class="dialog-body" style="padding:0 0 12px">
+    <div class="sheet-section">{{ t('Sort by') }}</div>
+    <div class="sheet-sort">
+      {% for key, label, dir in [('recorded', t('Date created'), 'desc'), ('name', t('Name'), 'asc'), ('duration', t('Duration'), 'desc')] %}
+      {% set on = lib.sort == key %}<a class="chip{% if on %} on{% endif %}" href="{{ liburl(sort=key, dir=(('asc' if lib.dir == 'desc' else 'desc') if on else dir)) }}"{% if on %} aria-current="true"{% endif %}>{{ label }}{% if on %}{{ icon('arrow-up' if lib.dir == 'asc' else 'arrow-down', 'xs') }}{% endif %}</a>
+      {% endfor %}
+    </div>
+    <ul class="sheet-list">
+      <li><a class="sheet-row" href="/" {% if lib.view == 'all' and filter_count == 0 %}aria-current="page"{% endif %}>{{ icon('files') }}<span>{{ t('All files') }}</span><span class="count">{{ sidebar.counts.all }}</span></a></li>
+      <li><a class="sheet-row" href="/?view=uncategorized" {% if lib.view == 'uncategorized' %}aria-current="page"{% endif %}>{{ icon('inbox') }}<span>{{ t('Unfiled') }}</span><span class="count">{{ sidebar.counts.uncategorized }}</span></a></li>
+      <li><a class="sheet-row" href="/?view=trash" {% if lib.view == 'trash' %}aria-current="page"{% endif %}>{{ icon('trash') }}<span>{{ t('Trash') }}</span><span class="count">{{ sidebar.counts.trash }}</span></a></li>
+    </ul>
+    <div class="sheet-section sheet-section-row"><span>{{ t('Folders') }}</span><button class="icon-btn" type="button" data-folder-create aria-label="{{ t('New folder') }}">{{ icon('plus', 'sm') }}</button></div>
+    <ul class="sheet-list">
+      {% for folder in organization.folders %}<li><a class="sheet-row" href="/?folder={{ folder.id }}" {% if lib.folder == folder.id %}aria-current="page"{% endif %}><span class="folder-glyph" style="--folder-color:{{ folder.color or 'var(--c-text-2)' }}">{{ icon('folder') }}</span><span class="truncate">{{ folder.name }}</span><span class="count">{{ folder.count }}</span></a></li>
+      {% else %}<li><button class="sheet-row" type="button" data-folder-create>{{ icon('folder-plus') }}<span>{{ t('Create a folder') }}</span></button></li>{% endfor %}
+    </ul>
+    <div class="sheet-section">{{ t('Comes from') }}</div>
+    <ul class="sheet-list">
+      {% for sc in facets.scenes %}<li><a class="sheet-row" href="/?scene={{ sc.value }}" {% if sc.active %}aria-current="page"{% endif %}>{{ icon('smartphone' if sc.value == 101 else ('upload' if sc.value == 102 else ('mic' if sc.value in (1, 7) else 'waveform'))) }}<span>{{ t(sc.label) }}</span><span class="count">{{ sc.count }}</span></a></li>{% endfor %}
+      {% for source in facets.origins %}<li><a class="sheet-row" href="/?origin={{ source.value }}" {% if source.active %}aria-current="page"{% endif %}>{{ icon('cloud' if source.value == 'plaud' else 'drive') }}<span>{{ t(source.label) }}</span><span class="count">{{ source.count }}</span></a></li>{% endfor %}
+    </ul>
+    <div class="sheet-section">{{ t('Status') }}</div>
+    <ul class="sheet-list">
+      <li><a class="sheet-row" href="/?state=active" {% if lib.state == 'active' %}aria-current="page"{% endif %}>{{ icon('loader') }}<span>{{ t('Processing') }}</span><span class="count">{{ sidebar.ops.processing }}</span></a></li>
+      <li><a class="sheet-row" href="/?state=attention" {% if lib.state == 'attention' %}aria-current="page"{% endif %}>{{ icon('alert') }}<span>{{ t('Needs attention') }}</span><span class="count">{{ sidebar.ops.attention }}</span></a></li>
+      <li><a class="sheet-row" href="/?state=done" {% if lib.state == 'done' %}aria-current="page"{% endif %}>{{ icon('circle-check') }}<span>{{ t('Ready') }}</span><span class="count">{{ sidebar.ops.ready }}</span></a></li>
+    </ul>
+  </div>
+</dialog>
+{% endif %}
+{% if files and lib.view != 'trash' and pagination.pages > 1 %}
+<div class="import-backdrop" id="page-change-backdrop" hidden>
+  <section class="import-modal page-change-modal" role="alertdialog" aria-modal="true" aria-labelledby="page-change-title" aria-describedby="page-change-description">
+    <div class="import-head"><span id="page-change-title">{{ t('Change page?') }}</span><button class="import-close" id="page-change-close" type="button" aria-label="{{ t('Close') }}"><span class="nav-icon" style="--nav-icon:url('/static/lucide/x.svg')"></span></button></div>
+    <div class="import-body page-change-body">
+      <p id="page-change-description">{{ t('Changing pages clears the recordings selected on this page.') }}</p>
+      <div class="page-change-actions"><button class="btn sec" id="page-change-cancel" type="button">{{ t('Stay on this page') }}</button><button class="btn" id="page-change-confirm" type="button">{{ t('Change page') }}</button></div>
+    </div>
+  </section>
+</div>
+{% endif %}
+{% if active != 'ask' %}
+<div class="import-backdrop" id="organization-manager-backdrop" hidden>
+  <section class="import-modal organization-manager-modal" role="dialog" aria-modal="true" aria-labelledby="organization-manager-title" aria-describedby="organization-manager-description">
+    <div class="import-head"><span id="organization-manager-title">{{ t('Manage folders and tags') }}</span><button class="import-close" id="organization-manager-close" type="button" aria-label="{{ t('Close') }}"><span class="nav-icon" style="--nav-icon:url('/static/lucide/x.svg')"></span></button></div>
+    <div class="import-body organization-manager-body">
+      <p class="sub" id="organization-manager-description" style="margin:0;font-size:12px">{{ t('Rename or remove local organization without deleting recordings or audio.') }}</p>
+      {% for kind, heading in [('folders', t('Folders')), ('tags', t('Tags'))] %}
+      <section class="organization-manager-section" data-organization-section="{{ kind }}">
+        <h3>{{ heading }}</h3>
+        <form class="organization-manager-create" data-create-kind="{{ kind }}">
+          <label><span class="visually-hidden">{{ t('Folder name') if kind == 'folders' else t('Tag name') }}</span><input class="search-input" name="name" maxlength="80" placeholder="{{ t('Folder name') if kind == 'folders' else t('Tag name') }}" required></label>
+          <button class="btn" type="submit"><span class="nav-icon" style="--nav-icon:url('/static/lucide/plus.svg')"></span>{{ t('Add') }}</button>
+        </form>
+        <div class="organization-manager-list" data-organization-list="{{ kind }}"><div class="sub" style="padding:11px 0">{{ t('Loading…') }}</div></div>
+      </section>
+      {% endfor %}
+      <div class="sub organization-manager-status" id="organization-manager-status" role="status" aria-live="polite"></div>
+    </div>
+  </section>
+  <template id="organization-manager-row-template">
+    <div class="organization-manager-row">
+      <div class="organization-manager-view">
+        <div class="organization-manager-name"><span data-organization-name></span><span class="organization-manager-count"></span></div>
+        <div class="organization-manager-actions"><button class="organization-manager-action" data-organization-rename type="button"><span class="nav-icon" style="--nav-icon:url('/static/lucide/pencil.svg')"></span></button><button class="organization-manager-action delete" data-organization-delete type="button"><span class="nav-icon" style="--nav-icon:url('/static/lucide/trash-2.svg')"></span></button></div>
+      </div>
+      <form class="organization-manager-edit" hidden><input class="search-input" name="name" maxlength="80" required aria-label="{{ t('Name') }}"><button class="btn" type="submit">{{ t('Save') }}</button><button class="btn sec" data-organization-cancel type="button">{{ t('Cancel') }}</button></form>
+      <div class="organization-manager-confirm" hidden><span>{{ t('Removing this folder or tag only unassigns it. Recordings and audio stay intact.') }}</span><div class="organization-manager-confirm-actions"><button class="btn sec" data-organization-delete-cancel type="button">{{ t('Cancel') }}</button><button class="btn" data-organization-delete-confirm type="button" style="background:var(--red)">{{ t('Delete') }}</button></div></div>
+    </div>
+  </template>
+</div>
+{% endif %}
+{% if files and lib.view != 'trash' %}
+<div class="import-backdrop" id="bulk-export-backdrop" hidden>
+  <section class="import-modal" style="min-height:0;width:min(600px,100%)" role="dialog" aria-modal="true" aria-labelledby="bulk-export-title" aria-describedby="bulk-export-description">
+    <div class="import-head"><span id="bulk-export-title">{{ t('Export selected recordings') }}</span><button class="import-close" id="bulk-export-close" type="button" aria-label="{{ t('Close') }}"><span class="nav-icon" style="--nav-icon:url('/static/lucide/x.svg')"></span></button></div>
+    <form class="import-body" id="bulk-export-form" style="gap:14px">
+      <div><strong><span id="bulk-export-count">0</span> {{ t('recordings') }}</strong><div class="sub" id="bulk-export-description" style="font-size:12px;margin-top:3px">{{ t('Available transcripts and notes are included; manifest.json lists anything unavailable.') }}</div></div>
+      <div class="bulk-export-options">
+        <fieldset class="bulk-export-option">
+          <label class="bulk-export-choice"><input id="bulk-export-transcript" type="checkbox" checked> {{ t('Transcript') }}</label>
+          <div class="bulk-export-controls" id="bulk-export-transcript-controls">
+            <label class="sub">{{ t('Format') }}<select class="search-input" id="bulk-export-transcript-format"><option value="txt">TXT</option><option value="srt">SRT</option><option value="vtt">VTT</option><option value="docx">DOCX</option><option value="pdf">PDF</option></select></label>
+            <label><input id="bulk-export-timestamps" type="checkbox" checked> {{ t('Timestamps') }}</label>
+            <label><input id="bulk-export-speakers" type="checkbox" checked> {{ t('Speaker labels') }}</label>
+          </div>
+        </fieldset>
+        <fieldset class="bulk-export-option">
+          <label class="bulk-export-choice"><input id="bulk-export-notes" type="checkbox" checked> {{ t('Notes') }}</label>
+          <div class="bulk-export-controls" id="bulk-export-notes-controls">
+            <label class="sub">{{ t('Format') }}<select class="search-input" id="bulk-export-notes-format"><option value="md">MD</option><option value="txt">TXT</option><option value="docx">DOCX</option><option value="pdf">PDF</option></select></label>
+          </div>
+        </fieldset>
+      </div>
+      <div id="bulk-export-status" class="sub" role="status" aria-live="polite" style="font-size:12px;min-height:17px"></div>
+      <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn sec" id="bulk-export-cancel" type="button">{{ t('Cancel') }}</button><button class="btn" id="bulk-export-download" type="submit"><span class="nav-icon" style="--nav-icon:url('/static/lucide/download.svg')"></span>{{ t('Download ZIP') }}</button></div>
+    </form>
+  </section>
+</div>
+{% endif %}
+{% if active == 'ask' %}
+  {% set ask_history_file_id = none %}
+  {% set ask_history_selected_id = selected_ask_thread.thread_id if selected_ask_thread else none %}
+  {% set ask_history_open_url = '/?ask=true#library-ask' %}
+  {% include '_ask_history.html' %}
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const cleanupController = new AbortController();
+  const appView = document.getElementById('app-view');
+  appView?.addEventListener('htmx:beforeCleanupElement', event => {
+    if (event.target === appView) cleanupController.abort();
+  });
+  const filterMenu = document.querySelector('.filter-menu');
+  const filterTrigger = filterMenu?.querySelector(':scope > summary');
+  const filterClose = filterMenu?.querySelector('.filter-close');
+  let filterReturnFocus = null;
+  filterTrigger?.addEventListener('click', () => {
+    if (!filterMenu.open) filterReturnFocus = document.activeElement;
+  }, {signal: cleanupController.signal});
+  filterMenu?.addEventListener('toggle', () => {
+    if (filterMenu.open) filterClose?.focus();
+  }, {signal: cleanupController.signal});
+  const closeFilters = () => {
+    if (!filterMenu?.open) return;
+    filterMenu.open = false;
+    (filterReturnFocus?.isConnected ? filterReturnFocus : filterTrigger)?.focus();
+  };
+  filterClose?.addEventListener('click', closeFilters, {signal: cleanupController.signal});
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && filterMenu?.open) {
+      event.preventDefault();
+      closeFilters();
+    }
+  }, {signal: cleanupController.signal});
+  const tr = window.localplaudT;
+  const organizationOpen = document.getElementById('organization-manager-open');
+  const organizationBackdrop = document.getElementById('organization-manager-backdrop');
+  const organizationClose = document.getElementById('organization-manager-close');
+  const organizationStatus = document.getElementById('organization-manager-status');
+  const createStatus = document.getElementById('organization-create-status');
+  const organizationRowTemplate = document.getElementById('organization-manager-row-template');
+  let organizationData = null;
+  let organizationRequest = null;
+  const organizationModal = organizationBackdrop ? window.localplaudModal({backdrop:organizationBackdrop,background:()=>[document.querySelector('.library-page'),document.querySelector('.sidebar'),document.querySelector('.m-topbar'),document.querySelector('.nav-scrim')],cleanupSignal:cleanupController.signal}) : null;
+  document.addEventListener('keydown',event=>{if(event.key!=='Escape'||organizationBackdrop?.hidden)return;event.preventDefault();event.stopImmediatePropagation();organizationModal?.close();},{capture:true,signal:cleanupController.signal});
+  const organizationDetail = (data, fallback) => { const detail=data?.detail,item=Array.isArray(detail)?detail[0]?.msg:detail;return tr(typeof item==='string'?item:fallback); };
+  const getOrganization = async () => {
+    if (organizationData) return organizationData;
+    if (!organizationRequest) organizationRequest = fetch('/api/organization',{signal:cleanupController.signal}).then(async response=>{const data=await response.json();if(!response.ok)throw new Error(organizationDetail(data,'Could not load organization'));organizationData=data;return data;}).finally(()=>{organizationRequest=null;});
+    return organizationRequest;
+  };
+  const setOrganizationBusy = value => { organizationModal?.setBusy(value);if(organizationClose)organizationClose.disabled=value;organizationBackdrop?.querySelectorAll('button,input').forEach(control=>{control.disabled=value;}); };
+  const resetOrganizationRow = row => { row.querySelector('.organization-manager-view').hidden=false;row.querySelector('.organization-manager-edit').hidden=true;row.querySelector('.organization-manager-confirm').hidden=true; };
+  const resetOrganizationManager = () => { organizationBackdrop?.querySelectorAll('.organization-manager-row').forEach(resetOrganizationRow);if(organizationStatus)organizationStatus.textContent='';setOrganizationBusy(false); };
+  async function mutateOrganization(url, options, fallback) { let response;try{response=await fetch(url,{...options,signal:cleanupController.signal});}catch(error){if(error.name==='AbortError')throw error;throw new Error(tr(fallback));}let data={};try{data=await response.json();}catch(_error){}if(!response.ok)throw new Error(organizationDetail(data,fallback));return data; }
+  const bindOrganizationRow = row => {
+    const view=row.querySelector('.organization-manager-view'),edit=row.querySelector('.organization-manager-edit'),confirmDelete=row.querySelector('.organization-manager-confirm'),input=edit.elements.name,name=row.querySelector('[data-organization-name]'),kind=row.dataset.organizationKind,id=row.dataset.organizationId,color=row.dataset.organizationColor||null;
+    row.querySelector('[data-organization-rename]').addEventListener('click',()=>{confirmDelete.hidden=true;view.hidden=true;edit.hidden=false;input.value=name.textContent.trim();input.focus();},{signal:cleanupController.signal});
+    row.querySelector('[data-organization-cancel]').addEventListener('click',()=>{resetOrganizationRow(row);row.querySelector('[data-organization-rename]').focus();},{signal:cleanupController.signal});
+    row.querySelector('[data-organization-delete]').addEventListener('click',event=>{edit.hidden=true;confirmDelete.hidden=false;event.currentTarget.closest('.organization-manager-view').hidden=true;confirmDelete.querySelector('[data-organization-delete-cancel]').focus();},{signal:cleanupController.signal});
+    row.querySelector('[data-organization-delete-cancel]').addEventListener('click',()=>{resetOrganizationRow(row);row.querySelector('[data-organization-delete]').focus();},{signal:cleanupController.signal});
+    edit.addEventListener('submit',async event=>{event.preventDefault();const nextName=input.value.trim();if(!nextName){organizationStatus.textContent=tr('Enter a name');input.focus();return;}setOrganizationBusy(true);organizationStatus.textContent=tr('Updating…');try{await mutateOrganization(`/api/${kind}/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nextName,color})},'Could not rename item');location.reload();}catch(error){organizationStatus.textContent=error.name==='AbortError'?'':error.message;setOrganizationBusy(false);input.focus();}},{signal:cleanupController.signal});
+    row.querySelector('[data-organization-delete-confirm]').addEventListener('click',async()=>{setOrganizationBusy(true);organizationStatus.textContent=tr('Deleting…');try{await mutateOrganization(`/api/${kind}/${id}`,{method:'DELETE'},'Could not delete item');const url=new URL(location.href),queryKey=kind==='folders'?'folder':'tag';if(url.searchParams.get(queryKey)===id)url.searchParams.delete(queryKey);location.replace(`${url.pathname}${url.search}${url.hash}`);}catch(error){organizationStatus.textContent=error.name==='AbortError'?'':error.message;setOrganizationBusy(false);confirmDelete.querySelector('[data-organization-delete-confirm]').focus();}},{signal:cleanupController.signal});
+  };
+  const renderOrganization = data => {
+    for (const kind of ['folders','tags']) {
+      const list=organizationBackdrop?.querySelector(`[data-organization-list="${kind}"]`);if(!list)continue;list.replaceChildren();
+      for (const item of data[kind]||[]) {const row=organizationRowTemplate.content.firstElementChild.cloneNode(true);row.dataset.organizationKind=kind;row.dataset.organizationId=String(item.id);row.dataset.organizationColor=item.color||'';row.querySelector('[data-organization-name]').textContent=item.name;row.querySelector('.organization-manager-count').textContent=`${item.count} ${tr('recordings')}`;row.querySelector('[data-organization-rename]').ariaLabel=`${tr('Rename')} ${item.name}`;row.querySelector('[data-organization-delete]').ariaLabel=`${tr('Delete')} ${item.name}`;bindOrganizationRow(row);list.append(row);}
+      if(!list.children.length){const empty=document.createElement('div');empty.className='sub';empty.style.padding='11px 0';empty.textContent=tr('No folders or tags in this section yet.');list.append(empty);}
+    }
+  };
+  organizationOpen?.addEventListener('click',async event=>{resetOrganizationManager();organizationModal.open(event.currentTarget,organizationClose);organizationStatus.textContent=tr('Loading…');try{renderOrganization(await getOrganization());organizationStatus.textContent='';}catch(error){organizationStatus.textContent=error.name==='AbortError'?'':error.message;}},{signal:cleanupController.signal});
+  organizationClose?.addEventListener('click',()=>organizationModal.close(),{signal:cleanupController.signal});
+  organizationBackdrop?.addEventListener('localplaud:modal-close',resetOrganizationManager,{signal:cleanupController.signal});
+  const checks = [...document.querySelectorAll('.row-select')];
+  const all = document.getElementById('select-all');
+  const mobileAll = document.getElementById('select-all-mobile');
+  const mobileSort = document.getElementById('mobile-sort');
+  const bar = document.getElementById('bulkbar');
+  const count = document.getElementById('selected-count');
+  const action = document.getElementById('bulk-action');
+  const target = document.getElementById('bulk-target');
+  const apply = document.getElementById('bulk-apply');
+  const clear = document.getElementById('bulk-clear');
+  const message = document.getElementById('bulk-message');
+  const deleteProcessing = document.getElementById('bulk-delete-processing');
+  const deleteConfirm = document.getElementById('bulk-delete-confirm');
+  const deleteCancel = document.getElementById('bulk-delete-cancel');
+  const deleteConfirmButton = document.getElementById('bulk-delete-confirm-button');
+  const deleteStatus = document.getElementById('bulk-delete-status');
+  const exportOpen = document.getElementById('bulk-export-open');
+  const exportBackdrop = document.getElementById('bulk-export-backdrop');
+  const exportForm = document.getElementById('bulk-export-form');
+  const exportStatus = document.getElementById('bulk-export-status');
+  const exportDownload = document.getElementById('bulk-export-download');
+  const exportTranscript = document.getElementById('bulk-export-transcript');
+  const exportNotes = document.getElementById('bulk-export-notes');
+  const pageChangeBackdrop = document.getElementById('page-change-backdrop');
+  const pageChangeClose = document.getElementById('page-change-close');
+  const pageChangeCancel = document.getElementById('page-change-cancel');
+  const pageChangeConfirm = document.getElementById('page-change-confirm');
+  let targetRequestVersion = 0;
+  const pageChangeModal = pageChangeBackdrop ? window.localplaudModal({backdrop:pageChangeBackdrop,background:()=>[document.querySelector('.library-page'),document.querySelector('.sidebar'),document.querySelector('.m-topbar'),document.querySelector('.nav-scrim')],cleanupSignal:cleanupController.signal}) : null;
+  let pendingPageUrl = null;
+  let exportOpener = null;
+  let backgroundInert = new Map();
+
+  document.querySelectorAll('.library-ask-chip').forEach(chip => chip.addEventListener('click', () => {
+    const input = document.getElementById('library-ask-q');
+    if (input) { input.value = chip.dataset.q; input.focus(); }
+  }));
+
+  const scopeDetails = document.getElementById('library-ask-scope-details');
+  if (scopeDetails) {
+    const tr = window.localplaudT;
+    const summaryLabel = document.getElementById('library-ask-scope-summary');
+    // The summary always states the truthful current boundary: library-wide
+    // until any filter narrows it. Reading it never mutates anything.
+    const updateScopeSummary = () => {
+      const controls = [...scopeDetails.querySelectorAll('#library-ask-scope select,#library-ask-scope input')];
+      const active = controls.reduce((count, el) => {
+        if (el.multiple) return count + (el.selectedOptions.length ? 1 : 0);
+        return count + (el.value ? 1 : 0);
+      }, 0);
+      summaryLabel.textContent = active ? `${tr('Custom scope')} · ${active}` : tr('Entire library');
+    };
+    scopeDetails.addEventListener('change', updateScopeSummary);
+    updateScopeSummary();
+  }
+
+  function selected() { return checks.filter(c => c.checked).map(c => c.value); }
+  function sync() {
+    const n = selected().length;
+    if (count) count.textContent = n;
+    if (bar) bar.classList.toggle('on', n > 0);
+    if (exportOpen) exportOpen.disabled = n > 50;
+    [all, mobileAll].filter(Boolean).forEach(control => {
+      control.checked = n > 0 && n === checks.length;
+      control.indeterminate = n > 0 && n < checks.length;
+    });
+    if (!n) closeDeleteConfirm({restoreFocus:false});
+    const table = document.getElementById('library-table');
+    table?.classList.toggle('has-selection', n > 0);
+    if (n > 0) table?.classList.add('is-selecting');
+    checks.forEach(c => c.closest('.file-row')?.classList.toggle('is-selected', c.checked));
+    const batchAll = document.getElementById('select-all-batch');
+    if (batchAll) { batchAll.checked = n > 0 && n === checks.length; batchAll.indeterminate = n > 0 && n < checks.length; }
+  }
+  document.getElementById('select-all-batch')?.addEventListener('change', event => {
+    const everything = event.currentTarget.checked;
+    checks.forEach(c => { c.checked = everything; });
+    sync();
+  }, {signal:cleanupController.signal});
+  document.addEventListener('click', event => {
+    if (event.target.closest('[data-select-mode]')) {
+      const table = document.getElementById('library-table');
+      table?.classList.toggle('is-selecting');
+      if (!table?.classList.contains('is-selecting')) { checks.forEach(c => { c.checked = false; }); sync(); }
+      return;
+    }
+    if (event.target.closest('[data-open-filters]') && filterMenu) { filterReturnFocus = document.activeElement; filterMenu.open = true; return; }
+    const proxy = event.target.closest('[data-proxy-click]');
+    if (proxy) document.getElementById(proxy.dataset.proxyClick)?.click();
+  }, {signal:cleanupController.signal});
+  async function targets() {
+    if (!target || !action) return;
+    const requestVersion = ++targetRequestVersion;
+    const selectedAction = action.value;
+    const lifecycle = selectedAction === 'resume';
+    target.hidden = lifecycle;
+    if (lifecycle) { target.disabled = true; if (apply) apply.disabled = false; return; }
+    const isFolder = action.value === 'folder';
+    target.disabled = true;if(apply)apply.disabled = true;
+    let data;try{data=await getOrganization();}catch(error){show(error.name==='AbortError'?'':error.message,true);return;}
+    if(requestVersion!==targetRequestVersion||action.value!==selectedAction)return;
+    const items = isFolder ? data.folders : data.tags;
+    target.innerHTML = '';
+    if (isFolder) target.add(new Option(window.localplaudT('No folder'), ''));
+    for (const item of items) target.add(new Option(item.name, String(item.id)));
+    target.disabled = !isFolder && !items.length;
+    if (apply) apply.disabled = !isFolder && !items.length;
+  }
+  function show(text, error=false) {
+    if (!message) return;
+    message.textContent = text;
+    message.style.color = error ? 'var(--red)' : 'var(--muted)';
+    message.classList.add('on');
+  }
+  function closeDeleteConfirm({restoreFocus=true}={}) {
+    if (!deleteConfirm || deleteConfirm.hidden) return;
+    deleteConfirm.hidden = true;
+    deleteProcessing?.setAttribute('aria-expanded','false');
+    if (deleteStatus) deleteStatus.textContent = '';
+    if (restoreFocus) deleteProcessing?.focus();
+  }
+  checks.forEach(c => c.addEventListener('change', sync));
+  [all, mobileAll].filter(Boolean).forEach(control => control.addEventListener('change', () => {
+    checks.forEach(c => c.checked = control.checked);
+    sync();
+  }));
+  document.querySelectorAll('[data-page-nav]').forEach(link => link.addEventListener('click', event => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (!selected().length) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    pendingPageUrl = link.href;
+    pageChangeModal?.open(link, pageChangeCancel);
+  }, {capture:true,signal:cleanupController.signal}));
+  [pageChangeClose, pageChangeCancel].filter(Boolean).forEach(control => control.addEventListener('click', () => pageChangeModal?.close(), {signal:cleanupController.signal}));
+  pageChangeBackdrop?.addEventListener('localplaud:modal-close', () => { pendingPageUrl = null; }, {signal:cleanupController.signal});
+  pageChangeConfirm?.addEventListener('click', () => { if (pendingPageUrl) window.location.href = pendingPageUrl; }, {signal:cleanupController.signal});
+  mobileSort?.addEventListener('change', () => { window.location.href = mobileSort.value; });
+  const syncMobileSortFromLocation = () => {
+    if (!mobileSort) return;
+    const current = new URL(window.location.href);
+    const sort = current.searchParams.get('sort') || 'recorded';
+    const dir = current.searchParams.get('dir') || 'desc';
+    const matching = [...mobileSort.options].find(option => {
+      const optionUrl = new URL(option.value, window.location.origin);
+      return optionUrl.searchParams.get('sort') === sort && optionUrl.searchParams.get('dir') === dir;
+    });
+    if (matching) mobileSort.value = matching.value;
+  };
+  window.addEventListener('pageshow', syncMobileSortFromLocation, {signal:cleanupController.signal});
+  clear?.addEventListener('click', () => { checks.forEach(c => c.checked = false); document.getElementById('library-table')?.classList.remove('is-selecting'); sync(); });
+  action?.addEventListener('change', () => { closeDeleteConfirm({restoreFocus:false}); targets(); });
+  deleteProcessing?.addEventListener('click', () => {
+    if (!selected().length) return;
+    deleteConfirm.hidden = false;
+    deleteProcessing.setAttribute('aria-expanded','true');
+    if (deleteStatus) deleteStatus.textContent = '';
+    deleteCancel?.focus();
+  });
+  deleteCancel?.addEventListener('click', () => closeDeleteConfirm());
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !deleteConfirm || deleteConfirm.hidden) return;
+    event.preventDefault();
+    closeDeleteConfirm();
+  }, {signal:cleanupController.signal});
+  targets();
+  sync();
+
+  const exportFocusables = () => [...exportBackdrop.querySelectorAll('button:not([disabled]),input:not([disabled]),select:not([disabled]),a[href],[tabindex]:not([tabindex="-1"])')].filter(item => !item.closest('[hidden]'));
+  function setExportBackgroundInert(inert) {
+    const regions = [...document.querySelectorAll('.sidebar,.m-topbar,.m-tabbar,.library-page')];
+    if (inert) {
+      backgroundInert = new Map(regions.map(region => [region, region.inert]));
+      regions.forEach(region => { region.inert = true; });
+    } else {
+      backgroundInert.forEach((wasInert, region) => { region.inert = wasInert; });
+      backgroundInert.clear();
+    }
+  }
+  function closeExport({restoreFocus=true}={}) {
+    if (!exportBackdrop || exportBackdrop.hidden) return;
+    exportBackdrop.hidden = true;
+    setExportBackgroundInert(false);
+    document.body.classList.remove('dialog-open');
+    if (restoreFocus) exportOpener?.focus();
+    exportOpener = null;
+  }
+  function syncExportOptions() {
+    if (!exportTranscript || !exportNotes || !exportDownload) return;
+    document.getElementById('bulk-export-transcript-controls')?.querySelectorAll('input,select').forEach(control => { control.disabled = !exportTranscript.checked; });
+    document.getElementById('bulk-export-notes-controls')?.querySelectorAll('input,select').forEach(control => { control.disabled = !exportNotes.checked; });
+    exportDownload.disabled = !exportTranscript.checked && !exportNotes.checked;
+  }
+  exportTranscript?.addEventListener('change', syncExportOptions);
+  exportNotes?.addEventListener('change', syncExportOptions);
+  syncExportOptions();
+  exportOpen?.addEventListener('click', event => {
+    const fileIds = selected();
+    if (!fileIds.length) return;
+    if (fileIds.length > 50) { show(tr('Select no more than 50 recordings'), true); return; }
+    exportOpener = event.currentTarget;
+    document.getElementById('bulk-export-count').textContent = fileIds.length;
+    exportStatus.textContent = '';
+    exportBackdrop.hidden = false;
+    setExportBackgroundInert(true);
+    document.body.classList.add('dialog-open');
+    requestAnimationFrame(() => exportFocusables()[0]?.focus());
+  });
+  document.getElementById('bulk-export-close')?.addEventListener('click', () => closeExport());
+  document.getElementById('bulk-export-cancel')?.addEventListener('click', () => closeExport());
+  exportBackdrop?.addEventListener('click', event => { if (event.target === exportBackdrop) closeExport(); });
+  document.addEventListener('keydown', event => {
+    if (!exportBackdrop || exportBackdrop.hidden) return;
+    if (event.key === 'Escape') { event.preventDefault(); closeExport(); return; }
+    if (event.key !== 'Tab') return;
+    const items = exportFocusables();
+    if (!items.length) { event.preventDefault(); return; }
+    const first = items[0], last = items.at(-1);
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }, {signal: cleanupController.signal});
+  cleanupController.signal.addEventListener('abort', () => closeExport({restoreFocus:false}), {once:true});
+
+  exportForm?.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!exportTranscript.checked && !exportNotes.checked) { exportStatus.textContent = tr('Choose at least one content type'); return; }
+    exportDownload.disabled = true;
+    exportStatus.textContent = tr('Preparing archive…');
+    const body = {
+      file_ids: selected(),
+      transcript_format: exportTranscript.checked ? document.getElementById('bulk-export-transcript-format').value : null,
+      notes_format: exportNotes.checked ? document.getElementById('bulk-export-notes-format').value : null,
+      timestamps: document.getElementById('bulk-export-timestamps').checked,
+      speakers: document.getElementById('bulk-export-speakers').checked,
+    };
+    try {
+      const response = await fetch('/api/files/export', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), signal:cleanupController.signal});
+      if (!response.ok) {
+        const message = response.status === 404 ? tr('A selected recording is no longer available') : response.status === 409 ? tr('No selected recording has an available transcript or note') : response.status === 422 ? tr('Export request is invalid') : tr('Could not export recordings');
+        throw new Error(message);
+      }
+      const blob = await response.blob();
+      if (cleanupController.signal.aborted) return;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const filename = /filename="?([^";]+)"?/i.exec(disposition)?.[1] || 'localplaud-recordings.zip';
+      link.href = url; link.download = filename; document.body.append(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const partial = Number(response.headers.get('X-Localplaud-Export-Skipped') || 0) + Number(response.headers.get('X-Localplaud-Export-Errors') || 0);
+      exportStatus.textContent = tr(partial ? 'Archive downloaded. Some unavailable items are listed in manifest.json.' : 'Archive downloaded');
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+      exportStatus.textContent = error.message || tr('Could not export recordings');
+    } finally {
+      if (!cleanupController.signal.aborted) syncExportOptions();
+    }
+  });
+
+  deleteConfirmButton?.addEventListener('click', async () => {
+    const fileIds = selected();
+    if (!fileIds.length) return;
+    deleteConfirmButton.disabled = true;
+    deleteCancel.disabled = true;
+    deleteProcessing.disabled = true;
+    deleteStatus.textContent = tr('Removing local data…');
+    try {
+      const response = await fetch('/api/files/bulk', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file_ids:fileIds,action:'delete_local_processing'})});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || tr('Could not remove local data'));
+      show(tr('Removed. Reloading…'));
+      window.setTimeout(() => window.location.reload(), 350);
+    } catch (error) {
+      deleteStatus.textContent = error.message;
+      deleteConfirmButton.disabled = false;
+      deleteCancel.disabled = false;
+      deleteProcessing.disabled = false;
+      deleteConfirmButton.focus();
+    }
+  });
+
+  apply?.addEventListener('click', async () => {
+    const fileIds = selected();
+    if (!fileIds.length) return;
+    const lifecycle = action.value === 'resume';
+    const body = {file_ids: fileIds};
+    if(lifecycle)body.action='resume';
+    if (action.value === 'folder') body.folder_id = target.value ? Number(target.value) : null;
+    if (action.value === 'add-tag') body.add_tag_ids = [Number(target.value)];
+    if (action.value === 'remove-tag') body.remove_tag_ids = [Number(target.value)];
+    apply.disabled = true;
+    show(tr('Saving organization…'));
+    try {
+      const response = await fetch(lifecycle?'/api/files/bulk':'/api/files/organize', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || tr('Could not organize recordings'));
+      show(`${data.updated} ${action.value === 'resume' ? tr('recordings queued') : tr('recordings updated')}`);
+      window.setTimeout(() => window.location.reload(), 350);
+    } catch (error) {
+      show(error.message, true);
+      apply.disabled = false;
+    }
+  });
+
+  const retryAll = document.getElementById('attention-retry-button');
+  const retryStatus = document.getElementById('attention-retry-status');
+  retryAll?.addEventListener('click', async () => {
+    retryAll.disabled = true;
+    retryStatus.classList.remove('err');
+    retryStatus.textContent = tr('Queuing…');
+    try {
+      const response = await fetch('/api/files/reprocess-all', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({mode:'resume', statuses:retryAll.dataset.statuses.split(','), include_trash:false})
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || tr('Could not queue recordings'));
+      const notes = [`${data.queued} ${tr('recordings queued')}`];
+      if (data.processing) notes.push(`${data.processing} ${tr('already processing')}`);
+      if (data.no_audio) notes.push(`${data.no_audio} ${tr('have no local audio')}`);
+      retryStatus.textContent = `${notes.join(' · ')} — ${tr('They leave this list as each one finishes.')}`;
+      retryAll.lastChild.textContent = tr('Queued for processing');
+    } catch (error) {
+      retryStatus.classList.add('err');
+      retryStatus.textContent = error.message;
+      retryAll.disabled = false;
+    }
+  });
+
+  document.querySelectorAll('[data-create-kind]').forEach(form => {
+    const nameField = form.elements.name;
+    if(nameField){
+      // Localize the native required-field bubble instead of the browser's
+      // English default, matching the inline empty-name status message.
+      nameField.addEventListener('invalid', () => nameField.setCustomValidity(tr('Enter a name')));
+      nameField.addEventListener('input', () => nameField.setCustomValidity(''));
+    }
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = form.querySelector('button');
+      const status = form.closest('#organization-manager-backdrop') ? organizationStatus : createStatus;
+      const name = String(new FormData(form).get('name') || '').trim();
+      if(!name){if(status)status.textContent=tr('Enter a name');form.elements.name.focus();return;}
+      button.disabled = true;
+      if(status)status.textContent = '';
+      try {
+        const data = await mutateOrganization(`/api/${form.dataset.createKind}`, {
+          method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})
+        }, 'Could not create item');
+        if(status)status.textContent=tr('Created. Reloading…');
+        window.location.href = `/?view=all&${form.dataset.createKind === 'folders' ? 'folder' : 'tag'}=${data.id}`;
+      } catch (error) {
+        if(error.name==='AbortError')return;
+        button.disabled = false;
+        if(status)status.textContent = error.message;
+        form.elements.name.focus();
+      }
+    }, {signal:cleanupController.signal});
+  });
+})();
+</script>
+{% endblock %}

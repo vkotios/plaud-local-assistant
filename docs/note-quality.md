@@ -1,0 +1,245 @@
+# Recording note quality
+
+The default `evidence-notes/v2` policy generates notes from the canonical local
+transcript. Plaud descriptions inform the selected template's format, but neither
+Plaud notes nor Plaud transcripts are normal generation inputs. The exact template
+snapshot is retained separately from our execution policy.
+
+## Generation and recovery
+
+1. Assess timestamps, speaker labels, sparse speech, gaps and repeated phrases.
+   Invalid timestamps and long fixed English filler loops block new derived
+   artifacts and expose a degraded state. Sparse speech or missing speakers alone
+   produce warnings: these checks do not classify music or silence as failed ASR.
+2. Split the complete transcript into timestamped source parts, retaining every
+   nonempty segment and the tail of oversized utterances. Neighbor context is
+   marked separately from each chunk's target evidence.
+3. Extract atomic facts with topic, type, status, nullable owner/deadline and exact
+   source quotations. Every source part must be cited or carry an explicit reason
+   for exclusion; a model reviewer checks those exclusions too. A separate call
+   checks the extraction against the
+   original chunk for omissions, invented commitments and reversed conditions.
+4. Plan descriptive topic sections. Each extracted fact must be assigned exactly
+   once. Only identical claims with matching status/ownership collapse; conflicting
+   or revised claims remain distinct. If the ledger exceeds the request budget,
+   bounded groups are planned separately, so global deduplication is not promised.
+5. Draft sections in bounded groups against both facts and their original source passages. Keep
+   reasons, alternatives, event/number pairs and uncertainty. Technical discussion,
+   teaching, calls and informal conversation need different structures; explicit
+   specialist templates retain priority. Recorded actions are distinct from ideas.
+6. Independently verify each draft against its source passages. Repair extraction
+   or prose at most twice; continuing material verification failures leave the stage failed
+   and existing notes intact. Noncritical wording observations are retained separately
+   in provenance; they are not a claim of perfect accuracy. Evidence references
+   remain internal: published note prose does not include playback timestamps
+   or timestamp links. The note page also hides legacy generated playback links
+   without rewriting the original content or its indexed evidence.
+7. Save accepted notes through normal revision history and invalidate a dependent
+   mind map when its source changes. Canonical transcript, speaker and note
+   fingerprints reject a save if the user edited the inputs during generation.
+   When evidence-note generation fails, preserve the old dependent mind map in a
+   degraded state; indexing the usable canonical transcript can still complete.
+   Review failures include the remaining material issues for targeted recovery.
+   Invalid quotation feedback identifies the fact and rejected source reference,
+   so retries can copy the exact source span instead of receiving only a generic
+   validation failure. A rejected extraction is retained in memory for targeted
+   patches within the existing repair limit; it is never cached as accepted.
+   Patched facts still require exact-source validation and independent review
+   before publication.
+
+The ledger stores source IDs, timestamps, quotations, source digest and the
+provider/model. Coverage and phase usage describe executed checks; they are not
+measurements of semantic accuracy. A model reviewer is not independent human or
+audio verification and can share the generator's mistakes.
+
+## Modes
+
+| `note_quality` | What it does | Typical time for a 70 minute meeting |
+| --- | --- | --- |
+| `standard` (default) | The whole transcript goes to the model in one request and the model chooses what matters: meeting information, topic sections, action items and suggestions. Providers that advertise a large context (`single_pass_chars`, the OpenAI-compatible clients including the AI gateway) take up to `note_single_pass_chars`; others and longer recordings keep the bounded chunked path, so no part of a recording is ever dropped. | about 3 to 4 minutes |
+| `evidence` | Opt-in audited fact ledger: chunked extraction, review, planning, drafting and verification with citations for every fact. Thorough and traceable, but a 70 minute meeting needs about 180 requests and produces a note roughly as long as the transcript. | 60 to 100 minutes |
+| `legacy` | The original chunked algorithm, kept for explicit compatibility. | varies |
+
+Why `standard` is the default: on the same 80 minute recording, a Plaud note was about
+3,000 characters in 8 topic sections plus action items, the evidence engine produced
+about 22,000 characters in 142 narrow sections, and one standard request produced about
+5,000 characters in 9 topic sections plus action items in 3.5 minutes. A note is for
+deciding and following up, so selecting what matters is the feature. Use `evidence` when
+a recording needs every claim traced to its source. Switching modes does not delete
+existing notes; a recording regenerated under a new mode keeps its earlier revisions.
+
+## Configuration
+
+```toml
+[pipeline]
+note_quality = "standard"       # default; "evidence" selects the audited ledger, "legacy" the v1 algorithm
+note_single_pass_chars = 120000 # one-request budget for large-context providers
+note_evidence_chunk_chars = 120000 # complete request budget, capped by provider capability
+note_repair_attempts = 2        # 0..2; never an unbounded repair loop
+note_parallelism = 3            # 1..8; only for providers that declare overlapping calls safe
+```
+
+Evidence chunks, plan groups and draft batches are independent calls, so they run up to
+`note_parallelism` at a time on providers that declare `supports_parallel_calls` (the
+OpenAI-compatible clients, including the AI gateway). Results are merged in source order,
+so fact ids, citations, ledger and note text are identical to a sequential run; only wall
+time changes, and total subscription use does not. A local single-model server (Ollama, the
+remote GPU worker) stays sequential. The gateway client reuses a subscription reserve
+reading for 10 seconds across overlapping calls and never caches a failed or exhausted
+reading.
+
+Review objections that survive the bounded repairs do not fail the stage. The
+pipeline is designed to finish without a person: the best extraction or draft is
+published, every unresolved objection is kept in `coverage.unresolved_review_issues`
+and in the evidence ledger (`chunks[].audit_issues`), the coverage is marked
+`review_status = "accepted_with_issues"`, and a final `## 覆核備註` section lists the
+objections verbatim at the end of the note so a reader sees the doubt next to the
+content. Structurally invalid model output (bad JSON, unknown citations, quotes that
+are not in the transcript) is still rejected and left to the pipeline's retry policy.
+
+The existing stage-scoped provider profile still selects the model, egress policy,
+fallbacks and cost ceiling. This feature does not authorize a new provider or
+silently downgrade a model. The production GPT-6 configuration is documented in
+[gpt6-settings.md](gpt6-settings.md). ASR/diarization/embedding models retain their
+own capability requirements.
+
+Successful validated subcalls are checkpointed under `data/note-checkpoints/`
+(or beside the configured audio download directory), using private directory/file
+permissions. Keys include the source/context, provider configuration digest,
+prompt, schema and policy version. Retry reuses matching subcalls; a changed
+source/model/prompt cannot replay an incompatible answer. Checkpoints contain
+private recording content: back them up as private data, never commit them.
+A failed stage retains its reservation under the existing cost accounting policy.
+Rejected candidates keep their last review feedback in a separate checkpoint.
+A later stage retry continues that repair instead of replaying the same rejected
+answer. Already reviewed chunks and drafts remain reusable. Each invocation still
+has the configured repair limit and the normal stage retry/cost policy applies;
+source, model or review-prompt changes invalidate the continuation.
+Fact repairs specify indexed replacements, additions, removals and exclusion
+updates. Unmentioned facts stay byte-for-byte equivalent instead of being
+regenerated; the merged ledger must still pass quotation/coverage validation and
+source review. Repair checkpoints are compatible with previously reviewed facts
+because the source-review criteria are unchanged.
+
+The request budget includes serialized source metadata and schemas, not just
+transcript characters. Small local-model contexts may require substantially more
+calls. Oversized evidence fails explicitly rather than truncating. Codex CLI does
+not enforce the adapter's `max_tokens` argument; token settings are request
+allowances, not a guarantee of output length. Evidence generation uses more model
+calls than the legacy summarizer and remains subject to quota reserve checks.
+
+Controller and remote worker must agree on `evidence-notes/v2`. Remote cache keys
+include the policy and quality options. A manual resume regenerates a mismatched
+policy/mode while preserving history; deploying alone does not enqueue the entire
+completed library. Bad ASR requires acoustic recovery, never replacement with a
+Plaud reference transcript. See [speech-quality.md](speech-quality.md).
+
+## Evaluation and rollout
+
+Use user-owned recordings in a private manifest. Preserve old notes, canonical
+transcript revisions/hashes, model/profile and recording dates. Split development
+and validation cases by discussion group. Evaluate note generation on a fixed
+local transcript separately from the full raw-audio pipeline.
+
+Check early/middle/late topics, conditions, negation, event-number pairing,
+proposal-versus-decision status, invented owners/deadlines, meaningful detail and
+repetition. Synthetic contract tests exercise failures and recovery; they do not
+prove model accuracy. A longer note is not by itself an improvement.
+
+A private monthly audit motivated this policy: it found template leakage,
+compression loss, misattributed decisions and unusable upstream transcripts.
+Reference notes are comparison/debug material only. Targets such as 95% annotated
+important-fact coverage and zero critical reversals require a separately recorded
+human evaluation; they are not established by this implementation. Qualify real
+candidates before bulk regeneration and record failures instead of claiming that
+all recordings reached completion.
+
+Automatic transcript correction is a prerequisite of both ingestion and notes-only
+reprocessing when `pipeline.polish` is enabled. `transcript-polish/v4` reviews
+proposed edits automatically; no operator approval is required. A correction or
+review failure preserves existing artifacts and defers new notes until a retry
+succeeds. Successful corrections invalidate dependent notes/maps/indexes and the
+same processing cycle rebuilds them from the canonical revision. See
+[speech-quality.md](speech-quality.md#automatic-correction-and-edit-review).
+
+## Transcript correction speed
+
+Correction proposes edits per chunk and then reviews every individual edit against the
+original text. Chunks take their context from the source transcript, and review batches
+judge their own edits independently, so neither depends on another's output. With
+`pipeline.polish_parallelism` (default 4) they run concurrently on providers that
+declare `supports_parallel_calls`, and results are merged in source order: the corrected
+transcript, decisions and counters equal a sequential run (asserted by tests); only wall
+time changes. Single-model local servers stay sequential. Budget reservations are still
+recorded one at a time, and progress never moves backwards while chunks finish out of
+order.
+
+Review requests are the larger part of correction: every proposed edit is judged against
+its neighbouring original text, and with the conservative 8,000 character batches a
+202 minute recording needed 217 review requests (2.6 million characters sent, 93% of the
+stage) to judge 1,033 edits. Hosted large-context providers now take
+`pipeline.polish_review_chars` (default 60,000) characters per review request. A batch the
+model answers incompletely, or that times out, is halved and retried, never skipped; one
+edit that still cannot be decided fails the stage as before. Local single-model servers
+keep the conservative budget.
+
+Measured on those 1,033 real edits with the production gateway: 4 requests instead of 217,
+0.2 million characters instead of 2.6 million, about 4 minutes instead of about 30. The
+decisions are not bit-identical, because model answers vary between runs: two identical
+large-batch runs disagreed on 2.4% of edits, large batches disagreed with the stored small
+batches on 4% to 5%, and net approvals rose by about 1% (957 to 963 and 968). Edits that
+flipped consistently were mostly insertions of 的, punctuation and context-supported
+renderings, and large batches also rejected number and English-fragment edits that small
+batches had approved. Review has no acoustic ground truth, so this is evidence of
+comparable judgement, not proof of better judgement.
+
+Correction requests (proposals and edit review) are narrow lexical judgements, so
+`pipeline.polish_reasoning_effort` (default `medium`) lowers a provider's configured
+reasoning effort for this stage only. It can lower the effort, never raise it, and notes,
+mind maps and Ask keep their own. A 79 minute recording, same transcript, offline:
+
+| Proposal run | Seconds | Requests | Approved edits |
+| --- | --- | --- | --- |
+| high, 8,000 characters (twice) | 617, 619 | 40 | 985, 997 |
+| medium, 8,000 characters | 429 | 40 | 1,015 |
+| medium, 24,000 characters | 407 | 13 | 1,216 |
+| high, 24,000 characters | 535 | 13 | 1,005 |
+
+Two identical high runs approved edit sets that overlap only 68% (182 edits differ,
+mostly insertions), so model variation is large. Medium at the same chunk size is within
+it (overlap 60% to 72% with the high runs, covers 89% of the edits both high runs
+approved). Larger chunks, at either effort, move away from the baseline (about 50%
+overlap) and add many insertions, so they are not used. Edit identity is compared by
+exact offsets and text, which counts a trailing-space variant of the same fix as a
+different edit; treat the percentages as a conservative bound. This was one recording
+and no acoustic ground truth: it shows medium is not detectably different from high, not
+that it is better.
+
+## Retired note templates
+
+Some libraries still hold local notes written under template keys no current catalog
+offers (for example the July `default` template run by a small local model, often in
+English and written from part of the recording). They show beside the current note as
+out-of-date copies. When a note under a current catalog template is persisted, a
+recording's notes under retired keys are archived as immutable versions
+(`archive_reason = retired-template`) and leave the live list; the mind map, cloud
+mirrors, personal templates and active user templates are never retired, and nothing is
+retired for a recording that has no current note. Editable copies keep their text and
+lose only the link to the removed source note.
+
+`scripts/maintenance/retire_legacy_notes.py --template default` lists what would be
+removed; `--apply` first writes a full SQLite backup and a JSON export under
+`data/backups/`, then deletes those notes and their archived versions outright. Only run
+the second form as an explicit operator decision.
+
+## Provider content filters
+
+A hosted provider's safety filter can stop a response for one particular passage
+(`response incomplete (content_filter)`). Retrying the identical request cannot succeed,
+and failing the stage leaves a recording unfinished for a single sentence, so the client
+raises `LLMContentFiltered`, a splittable output error. Correction splits the refused chunk
+down to the single segment and keeps that segment's transcribed words; the edit review
+halves a refused batch and leaves an edit nobody could judge unapplied. Everything around
+the refused passage is processed normally and the stage records the split and the kept
+segment. Notes and mind maps still fail visibly if the provider refuses a whole request.
+

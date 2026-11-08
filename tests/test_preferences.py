@@ -1,0 +1,369 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from tests.assets import with_assets
+
+
+def _client(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    import localplaud.db.session as db_session
+    from localplaud.config import get_settings
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path / 'prefs.db'}")
+    monkeypatch.setenv(
+        "LOCALPLAUD_PLAUD__OFFICIAL__TOKENS_PATH", str(tmp_path / "plaud-tokens.json")
+    )
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    from localplaud.api.app import app
+
+    return TestClient(app)
+
+
+def test_workspace_preferences_are_validated_persisted_and_rendered(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    with client:
+        defaults = client.get("/api/preferences/workspace")
+        assert defaults.status_code == 200
+        assert defaults.json() == {
+            "workspace_name": "localplaud",
+            "theme": "light",
+            "density": "comfortable",
+            "timezone": "Asia/Taipei",
+            "hour_cycle": "24",
+            "locale": "en",
+            "auto_process_new_recordings": True,
+            "ask_enabled": False,
+            # Without accounts the workspace has no owner, so its name is editable.
+            "workspace_name_locked": False,
+        }
+
+        invalid = client.put(
+            "/api/preferences/workspace",
+            json=defaults.json() | {"timezone": "Not/A_Timezone"},
+        )
+        assert invalid.status_code == 422
+        assert client.get("/api/preferences/workspace").json() == defaults.json()
+
+        updated = client.put(
+            "/api/preferences/workspace",
+            json={
+                "workspace_name": "Sky Lab",
+                "theme": "light",
+                "density": "compact",
+                "timezone": "UTC",
+                "hour_cycle": "12",
+                "locale": "zh-Hant-TW",
+                "auto_process_new_recordings": False,
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["workspace_name"] == "Sky Lab"
+
+        page = client.get("/settings")
+        assert page.status_code == 200
+        assert '<html lang="zh-Hant-TW" data-density="compact" data-theme="light">' in page.text
+        assert 'name="theme" value="light"' in page.text
+        assert 'option value="dark"' not in page.text
+        assert '<span class="ws-name">Sky Lab</span>' in page.text and "自架工作區" in page.text
+        assert 'id="workspace-preferences"' in page.text
+        assert 'href="#workspace-preferences"' in page.text
+        assert 'value="UTC"' in page.text
+        assert '<option value="12" selected>12 小時制</option>' in page.text
+        assert '<option value="zh-Hant-TW" selected>繁體中文（台灣）</option>' in page.text
+        assert 'name="auto_process_new_recordings"' in page.text
+        assert 'name="auto_process_new_recordings" checked' not in page.text
+        assert "自動處理新錄音" in page.text
+        assert "工作區偏好設定" in page.text
+        for text in (
+            "帳號",
+            "存取與安全性",
+            "同步與備份",
+            "私人工作區備份",
+            "此主機的建議設定",
+            "連線",
+            "自訂詞彙表",
+            "模型目錄",
+            "執行設定檔",
+            "筆記範本",
+            "建立供應商連線",
+            "新增模型",
+            "遠端工作節點",
+            "已授權的 Webhook",
+            "已授權的電子郵件",
+            "支援與關於",
+        ):
+            assert text in page.text
+        assert "#workspace-preferences-form{grid-template-columns:1fr!important}" in page.text
+
+
+def test_daemon_processing_respects_workspace_preference(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    calls: list[int] = []
+    reindex_calls: list[int] = []
+    note_calls: list[tuple[int, bool]] = []
+
+    def fake_process_pending(_settings, *, limit):
+        calls.append(limit)
+        return 1
+
+    monkeypatch.setattr("localplaud.worker.pipeline.process_pending", fake_process_pending)
+    monkeypatch.setattr(
+        "localplaud.worker.reindex.process_pending_reindexes",
+        lambda _settings, *, limit: reindex_calls.append(limit) or 0,
+    )
+    monkeypatch.setattr(
+        "localplaud.worker.knowledge_index.process_pending_documents",
+        lambda _settings, *, limit, reconcile: note_calls.append((limit, reconcile)) or 0,
+    )
+    from localplaud.cli import process_automatic_pending
+    from localplaud.config import get_settings
+
+    with client:
+        assert process_automatic_pending(get_settings()) == 1
+        preferences = client.get("/api/preferences/workspace").json()
+        response = client.put(
+            "/api/preferences/workspace",
+            json=preferences | {"auto_process_new_recordings": False},
+        )
+        assert response.status_code == 200
+        assert process_automatic_pending(get_settings()) == 0
+    assert calls == [get_settings().pipeline.files_per_cycle]
+    assert reindex_calls == [get_settings().pipeline.files_per_cycle]
+    assert note_calls == [(get_settings().pipeline.files_per_cycle * 4, False)]
+
+
+@pytest.mark.parametrize(("enabled", "expected_calls"), [(False, 0), (True, 1)])
+def test_api_startup_resumes_remote_jobs_only_when_auto_processing_is_enabled(
+    monkeypatch, tmp_path, enabled, expected_calls
+):
+    client = _client(monkeypatch, tmp_path)
+    from localplaud.api import app as app_module
+    from localplaud.db.session import init_db, session_scope
+    from localplaud.preferences import (
+        DEFAULT_WORKSPACE_PREFERENCES,
+        save_workspace_preferences,
+    )
+
+    init_db()
+    with session_scope() as session:
+        save_workspace_preferences(
+            session,
+            DEFAULT_WORKSPACE_PREFERENCES
+            | {"auto_process_new_recordings": enabled},
+        )
+
+    calls: list[str] = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            assert daemon is True
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(
+        app_module, "resume_pending_jobs", lambda: calls.append("resumed")
+    )
+    # Patch only the startup resume dispatch; the maintenance status reporter
+    # is a long-lived loop that must keep running on a real thread.
+    monkeypatch.setattr(app_module, "tracked_thread", ImmediateThread)
+    with client:
+        assert client.get("/healthz").status_code == 200
+    assert calls == ["resumed"] * expected_calls
+
+
+def test_managed_daemon_startup_skips_duplicate_database_init_and_resume(
+    monkeypatch, tmp_path
+):
+    client = _client(monkeypatch, tmp_path)
+    from localplaud.api import app as app_module
+    from localplaud.db.session import init_db
+
+    init_db()
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "init_db", lambda: calls.append("init"))
+    monkeypatch.setattr(
+        app_module, "resume_pending_jobs", lambda: calls.append("resume")
+    )
+    app_module.app.state.database_initialized = True
+    app_module.app.state.managed_daemon = True
+    try:
+        with client:
+            assert client.get("/healthz").status_code == 200
+    finally:
+        del app_module.app.state.database_initialized
+        del app_module.app.state.managed_daemon
+    assert calls == []
+
+
+def test_workspace_timezone_and_clock_apply_to_recorded_dates(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    with client:
+        body = client.get("/api/preferences/workspace").json() | {
+            "timezone": "UTC",
+            "hour_cycle": "12",
+        }
+        assert client.put("/api/preferences/workspace", json=body).status_code == 200
+
+        from localplaud.db.models import FileStatus, PlaudFile
+        from localplaud.db.session import session_scope
+
+        with session_scope() as session:
+            session.add(
+                PlaudFile(
+                    id="dated",
+                    filename="Dated recording",
+                    status=FileStatus.discovered,
+                    start_time_ms=3_600_000,
+                    duration_ms=60_000,
+                )
+            )
+        page = client.get("/home")
+        assert page.status_code == 200
+        assert "Dated recording" in page.text
+        assert "AM" in page.text or "PM" in page.text
+
+
+def test_interface_locale_translates_shell_and_primary_pages(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    with client:
+        defaults = client.get("/api/preferences/workspace").json()
+        invalid = client.put(
+            "/api/preferences/workspace", json=defaults | {"locale": "not-a-locale"}
+        )
+        assert invalid.status_code == 422
+
+        updated = client.put(
+            "/api/preferences/workspace", json=defaults | {"locale": "zh-Hant-TW"}
+        )
+        assert updated.status_code == 200
+        for path, text in (
+            ("/home", "最近的檔案"),
+            ("/templates", "結構化筆記"),
+            ("/discover", "本機自動化"),
+            ("/notifications", "目前沒有通知"),
+                ("/", "名稱"),
+            ("/search", "搜尋整個錄音庫"),
+            ("/notes", "目前沒有已儲存筆記"),
+            ("/status", "執行環境"),
+        ):
+            page = client.get(path)
+            assert page.status_code == 200
+            assert '<html lang="zh-Hant-TW"' in page.text
+            assert "所有檔案" in page.text
+            assert text in page.text
+
+        settings = client.get("/settings")
+        settings_assets = with_assets(client, settings)
+        assert 'aria-label="設定區段"' in settings_assets
+        assert 'aria-label="Settings sections"' not in settings.text
+        assert 'const tr=window.localplaudT' in settings_assets
+        assert 'window.localplaudT = message => ({' in settings_assets
+        assert "建立含資訊清單與 SHA-256 的一致性 SQLite 快照" in settings_assets
+        assert "目前沒有工作區備份" in settings_assets
+        assert "已授權的備份目的地" in settings_assets
+        assert "尚未授權遠端備份目的地" in settings_assets
+        assert "明確允許私人／區網目的地與 HTTP" in settings_assets
+        assert "依實際證據推薦本機 ASR 設定" in settings_assets
+        assert "密鑰只會以參照方式保存" in settings_assets
+        assert "修正姓名與專業詞彙，不變更原始 ASR" in settings_assets
+        assert "每個處理階段皆明確指定" in settings_assets
+        assert "對外資料傳送須明確啟用" in settings_assets
+        assert "SMTP 傳送須明確啟用" in settings_assets
+        assert "診斷檔只包含彙總計數" in settings_assets
+        assert "檢查 Plaud 新錄音" in settings_assets
+        assert "localStatus.textContent=`${tr('Importing')}" in settings_assets
+        assert "showCheckResult(tr('Checking Plaud…'))" in settings_assets
+        assert "button.textContent=tr('Uploading…')" in settings_assets
+        assert "out.textContent=tr('Authorizing…')" in settings_assets
+        assert "confirm(tr('Revoke this backup destination? Upload history is preserved.'))" in settings_assets
+        assert "out.textContent=tr('Creating a verified profile…')" in settings_assets
+        assert "out.textContent=tr('Created. Reloading…')" in settings_assets
+        assert "out.textContent=tr('Registered. Reloading…')" in settings_assets
+        assert "out.textContent=tr('Authorized. Reloading…')" in settings_assets
+        assert "out.textContent=tr(data.status||'error')" in settings_assets
+
+        from localplaud.i18n import catalog
+
+        messages = catalog("zh-Hant-TW")
+        assert messages["Saving…"] == "儲存中…"
+        assert messages["healthy"] == "正常"
+        assert messages["align"] == "時間對齊"
+        assert "Speech character insertion" not in messages
+
+
+def test_traditional_chinese_catalog_covers_all_static_template_messages():
+    """Every explicitly translatable template literal must have a zh-TW value."""
+    from localplaud.i18n import catalog
+
+    template_dir = Path(__file__).parents[1] / "src/localplaud/api/templates"
+    workspace_js = Path(__file__).parents[1] / "src/localplaud/api/static/js/workspace.js"
+    keys: set[str] = set()
+    for template in [*template_dir.glob("*.html"), workspace_js]:
+        source = template.read_text(encoding="utf-8")
+        keys.update(re.findall(r"\b(?:t|tr)\('([^']+)'\)", source))
+
+    missing = sorted(keys - catalog("zh-Hant-TW").keys())
+    assert missing == []
+
+
+def test_dynamic_action_messages_use_translation_helper():
+    """User-visible JS actions must not bypass the centralized locale catalog."""
+    template_dir = Path(__file__).parents[1] / "src/localplaud/api/templates"
+    literal_patterns = (
+        r"(?:textContent\s*=|alert\(|confirm\(|prompt\()\s*'([^']*[A-Za-z][^']*)'",
+        r"(?:textContent\s*=|alert\(|confirm\(|prompt\()\s*`([^`]*[A-Za-z][^`]*)`",
+    )
+    violations: list[str] = []
+    technical_fragments = (
+        "${position",
+        "${matches.length}",
+        "${stamp",
+        # User-owned speaker names joined by an arrow are not locale prose.
+        "${speakerLabel(source)} → ${speakerLabel(target)}",
+        # Playback-speed display (e.g. "1.5x") — a language-neutral multiplier
+        # suffix, not translatable prose. The app's own player uses "1×"/"2×"
+        # unlocalized as well.
+        "${speeds[speedIndex]}",
+    )
+    workspace_js = Path(__file__).parents[1] / "src/localplaud/api/static/js/workspace.js"
+    for template in [*template_dir.glob("*.html"), workspace_js]:
+        source = template.read_text(encoding="utf-8")
+        for pattern in literal_patterns:
+            for message in re.findall(pattern, source):
+                if "tr(" in message or message.startswith(technical_fragments):
+                    continue
+                violations.append(f"{template.name}: {message}")
+    assert violations == []
+
+
+def test_appearance_defaults_to_system_and_settings_offers_the_control(monkeypatch, tmp_path):
+    """Browsers without a stored choice follow the OS; Settings can pick Light/Dark/Auto."""
+    client = _client(monkeypatch, tmp_path)
+    with client:
+        page = client.get("/settings")
+        assert page.status_code == 200
+        html = page.text
+        assert "localStorage.getItem('localplaud:appearance')||'system'" in html
+        for mode in ("light", "dark", "system"):
+            assert f'data-appearance-set="{mode}"' in html
+        assert 'aria-labelledby="settings-appearance-label"' in html
+
+    app_js = (
+        Path(__file__).parents[1] / "src/localplaud/api/static/js/app.js"
+    ).read_text(encoding="utf-8")
+    assert "dataset.appearanceMode || 'system'" in app_js
+    assert "mode = 'system';" in app_js
+    for standalone in ("login.html", "share.html"):
+        source = (
+            Path(__file__).parents[1] / "src/localplaud/api/templates" / standalone
+        ).read_text(encoding="utf-8")
+        assert ":root[data-appearance=\"dark\"]" in source

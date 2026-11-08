@@ -1,0 +1,756 @@
+"""Tests for library sorting, filtering, and trash/uncategorized views."""
+
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+from html import unescape
+from urllib.parse import parse_qs, urlsplit
+
+from tests.assets import with_assets
+
+
+def _client(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    import localplaud.db.session as db_session
+    from localplaud.config import get_settings
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path/'lib.db'}")
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    from localplaud.api.app import app
+    from localplaud.db.session import init_db
+
+    init_db()
+    return TestClient(app)
+
+
+def _seed():
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    # Mixed names, durations, scenes, statuses, and one trashed row.
+    rows = [
+        # id, filename, status, duration_ms, start_time_ms, scene, is_trash
+        ("a", "Alpha meeting", FileStatus.done, 300000, 1000, 1, False),
+        ("b", "Bravo call", FileStatus.error, 900000, 2000, 1, False),
+        ("c", "Charlie note", FileStatus.partial, 120000, 3000, 2, False),
+        ("d", "Delta memo", FileStatus.processing, 600000, 4000, 2, False),
+        ("t", "Trashed thing", FileStatus.done, 60000, 5000, 1, True),
+    ]
+    with session_scope() as s:
+        for fid, name, st, dur, start, scene, trash in rows:
+            s.add(
+                PlaudFile(
+                    id=fid,
+                    filename=name,
+                    status=st,
+                    duration_ms=dur,
+                    start_time_ms=start,
+                    scene=scene,
+                    is_trash=trash,
+                )
+            )
+
+
+def _ids(client, query=""):
+    return [f["id"] for f in client.get(f"/api/files{query}").json()["files"]]
+
+
+def _ms(value: str) -> int:
+    return int(datetime.fromisoformat(value).astimezone(UTC).timestamp() * 1000)
+
+
+def _set_timezone(client, timezone: str) -> None:
+    preferences = client.get("/api/preferences/workspace").json()
+    response = client.put("/api/preferences/workspace", json=preferences | {"timezone": timezone})
+    assert response.status_code == 200
+
+
+def test_default_excludes_trash_and_sorts_recent_desc(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    ids = _ids(c)
+    assert "t" not in ids  # trash excluded by default
+    # newest start_time_ms first
+    assert ids == ["d", "c", "b", "a"]
+
+
+def test_sort_name_asc_and_desc(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    assert _ids(c, "?sort=name&dir=asc") == ["a", "b", "c", "d"]
+    assert _ids(c, "?sort=name&dir=desc") == ["d", "c", "b", "a"]
+
+
+def test_sort_duration(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    # durations: c=120k, a=300k, d=600k, b=900k
+    assert _ids(c, "?sort=duration&dir=asc") == ["c", "a", "d", "b"]
+    assert _ids(c, "?sort=duration&dir=desc") == ["b", "d", "a", "c"]
+
+
+def test_state_filter(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    assert _ids(c, "?state=error") == ["b"]
+    assert _ids(c, "?state=done") == ["a"]  # trashed 't' also done but excluded
+
+
+def test_scene_filter(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    assert set(_ids(c, "?scene=2")) == {"c", "d"}
+    assert set(_ids(c, "?scene=1")) == {"a", "b"}  # 't' scene 1 but trashed
+
+
+def test_trash_view_inclusion(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    assert _ids(c, "?view=trash") == ["t"]
+
+
+def test_query_combines_with_filter(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    # q matches Bravo (error) and would also match nothing else in scene 2
+    assert _ids(c, "?q=bravo&state=error") == ["b"]
+    assert _ids(c, "?q=note&scene=2") == ["c"]
+
+
+def test_invalid_params_fall_back(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    # bogus sort/dir/state/scene/view must not 500 and behave like defaults
+    r = c.get("/api/files?sort=bogus&dir=sideways&state=nope&scene=abc&view=weird")
+    assert r.status_code == 200
+    assert [f["id"] for f in r.json()["files"]] == ["d", "c", "b", "a"]
+
+
+def test_date_filter_uses_workspace_timezone_and_inclusive_days(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    _set_timezone(c, "Asia/Taipei")
+    rows = {
+        "before": "2026-07-15T15:59:59+00:00",
+        "lower": "2026-07-15T16:00:00+00:00",
+        "upper": "2026-07-16T15:59:59.999+00:00",
+        "after": "2026-07-16T16:00:00+00:00",
+    }
+    with session_scope() as session:
+        session.add_all(
+            PlaudFile(
+                id=file_id,
+                filename=file_id,
+                status=FileStatus.done,
+                start_time_ms=_ms(timestamp),
+                duration_ms=60_000,
+            )
+            for file_id, timestamp in rows.items()
+        )
+
+    assert _ids(c, "?date_from=2026-07-16&date_to=2026-07-16") == [
+        "upper",
+        "lower",
+    ]
+
+
+def test_date_filter_respects_dst_local_day_boundary(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    _set_timezone(c, "America/New_York")
+    rows = {
+        "before": "2026-03-08T04:59:59+00:00",
+        "lower": "2026-03-08T05:00:00+00:00",
+        "upper": "2026-03-09T03:59:59.999+00:00",
+        "after": "2026-03-09T04:00:00+00:00",
+    }
+    with session_scope() as session:
+        session.add_all(
+            PlaudFile(
+                id=file_id,
+                filename=file_id,
+                status=FileStatus.done,
+                start_time_ms=_ms(timestamp),
+                duration_ms=60_000,
+            )
+            for file_id, timestamp in rows.items()
+        )
+
+    assert _ids(c, "?date_from=2026-03-08&date_to=2026-03-08") == [
+        "upper",
+        "lower",
+    ]
+
+
+def test_duration_filter_is_inclusive_and_excludes_unknown_duration(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add_all(
+            [
+                PlaudFile(
+                    id="zero",
+                    filename="Zero",
+                    status=FileStatus.done,
+                    start_time_ms=6_000,
+                    duration_ms=0,
+                ),
+                PlaudFile(
+                    id="decimal",
+                    filename="Decimal",
+                    status=FileStatus.done,
+                    start_time_ms=7_000,
+                    duration_ms=90_000,
+                ),
+                PlaudFile(
+                    id="unknown",
+                    filename="Unknown",
+                    status=FileStatus.done,
+                    start_time_ms=8_000,
+                    duration_ms=None,
+                ),
+            ]
+        )
+
+    assert _ids(c, "?min_duration_minutes=2&max_duration_minutes=10") == ["d", "c", "a"]
+    assert _ids(c, "?min_duration_minutes=1.5&max_duration_minutes=1.5") == ["decimal"]
+    assert _ids(c, "?max_duration_minutes=0") == ["zero"]
+
+
+def test_invalid_ranges_are_safe_and_visible(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+
+    assert _ids(c, "?date_from=bad&min_duration_minutes=nan") == ["d", "c", "b", "a"]
+    assert _ids(c, "?min_duration_minutes=-1&max_duration_minutes=inf") == [
+        "d",
+        "c",
+        "b",
+        "a",
+    ]
+    assert _ids(c, "?date_from=2026-07-17&date_to=2026-07-16") == []
+    assert _ids(c, "?min_duration_minutes=10&max_duration_minutes=2") == []
+
+    date_page = c.get("/?date_from=2026-07-17&date_to=2026-07-16")
+    duration_page = c.get("/?min_duration_minutes=10&max_duration_minutes=2")
+    assert 'class="filter-menu" open' in date_page.text
+    assert 'role="alert">Start date must not follow end date.' in date_page.text
+    assert 'role="alert">Minimum duration must not exceed maximum duration.' in duration_page.text
+
+
+def test_empty_filtered_library_summarizes_and_clears_active_filters(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+
+    page = c.get(
+        "/?q=missing&sort=name&dir=asc&state=done&scene=1&origin=plaud&"
+        "date_from=1970-01-01&date_to=1970-01-01&"
+        "min_duration_minutes=2&max_duration_minutes=5"
+    )
+
+    assert page.status_code == 200
+    assert '<p class="empty-title filtered-empty-title">No recordings match these filters.</p>' in page.text
+    summary = page.text.split('<ul class="active-filter-list"', 1)[1].split("</ul>", 1)[0]
+    for label in (
+        "Search: missing",
+        "State: done",
+        "Source: Plaud recorder",
+        "Comes from: Plaud cloud",
+        "From: 1970-01-01",
+        "To: 1970-01-01",
+        "Minimum: 2.0 minutes",
+        "Maximum: 5.0 minutes",
+    ):
+        assert label in summary
+    assert 'aria-label="Active filters"' in page.text
+    assert (
+        'class="btn sec filtered-empty-reset" href="/?sort=name&amp;dir=asc&amp;view=all"'
+        in page.text
+    )
+    assert "Clear all filters" in page.text
+
+
+def test_extreme_iso_dates_do_not_overflow_html_or_api(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+
+    for query in ("date_from=0001-01-01", "date_to=9999-12-31"):
+        api = c.get(f"/api/files?{query}")
+        page = c.get(f"/?{query}")
+        assert api.status_code == 200
+        assert page.status_code == 200
+        assert [item["id"] for item in api.json()["files"]] == ["d", "c", "b", "a"]
+
+
+def test_unknown_source_legacy_plaud_and_uncategorized_counts_match(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile, Tag
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        tag = Tag(name="Tagged")
+        session.add(tag)
+        session.flush()
+        legacy = PlaudFile(
+            id="legacy",
+            filename="Legacy Plaud",
+            status=FileStatus.done,
+            start_time_ms=2_000,
+            scene=None,
+            origin=None,
+        )
+        tagged = PlaudFile(
+            id="tagged",
+            filename="Tagged only",
+            status=FileStatus.done,
+            start_time_ms=1_000,
+            scene=3,
+            origin="local",
+        )
+        tagged.tags.append(tag)
+        session.add_all([legacy, tagged])
+
+    assert _ids(c, "?scene=unknown") == ["legacy"]
+    assert _ids(c, "?origin=plaud") == ["legacy"]
+    assert _ids(c, "?view=uncategorized") == ["legacy"]
+    page = c.get("/")
+    assert "Unknown capture source" in page.text
+    assert 'href="/?view=uncategorized"' in page.text
+    assert ">(1)</span>" in page.text.split('href="/?view=uncategorized"', 1)[1].split("</a>", 1)[0]
+
+
+def test_unknown_source_and_origin_facets_are_localized(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    preferences = c.get("/api/preferences/workspace").json()
+    assert c.put(
+        "/api/preferences/workspace",
+        json=preferences | {"locale": "zh-Hant-TW"},
+    ).status_code == 200
+    with session_scope() as session:
+        session.add(
+            PlaudFile(
+                id="unknown-source",
+                filename="Unknown source",
+                status=FileStatus.done,
+                scene=None,
+                origin=None,
+            )
+        )
+
+    page = c.get("/")
+    source_filters = page.text.split('<span class="lbl">來源</span>', 1)[1].split(
+        "</div>", 1
+    )[0]
+    origin_filters = page.text.split('<span class="lbl">來源類型</span>', 1)[1].split(
+        "</div>", 1
+    )[0]
+    assert "未知錄製來源" in source_filters
+    assert ">Unknown capture source" not in source_filters
+    assert "Plaud 雲端" in origin_filters
+
+
+def test_numbered_capture_source_labels_are_localized(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+
+    preferences = c.get("/api/preferences/workspace").json()
+    assert c.put(
+        "/api/preferences/workspace",
+        json=preferences | {"locale": "zh-Hant-TW"},
+    ).status_code == 200
+
+    # Scene 2 has no curated name, so it exercises the numbered fallback;
+    # scene 1 renders its curated name through the ordinary catalog path.
+    page = c.get("/?q=missing&scene=2")
+    assert page.status_code == 200
+    assert '>來源 2</span>' in page.text
+    assert 'title="音訊來源 2"' in page.text
+    assert "來源: 音訊來源 2" in page.text
+    assert "Capture source 2" not in page.text
+    assert ">Source 2</span>" not in page.text
+    assert "Plaud 錄音筆" in page.text
+    assert ">Plaud recorder" not in page.text
+
+
+def test_notification_action_labels_are_localized(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import Notification
+    from localplaud.db.session import session_scope
+
+    preferences = c.get("/api/preferences/workspace").json()
+    assert c.put(
+        "/api/preferences/workspace",
+        json=preferences | {"locale": "zh-Hant-TW"},
+    ).status_code == 200
+    with session_scope() as session:
+        session.add(Notification(title="Processing complete", body="Alpha meeting"))
+
+    page = c.get("/notifications")
+    assert page.status_code == 200
+    assert 'aria-label="標示為已讀"' in page.text  # unread item read-toggle
+    assert 'aria-label="關閉"' in page.text  # dismiss
+    assert 'aria-label="Mark read"' not in page.text
+    assert 'aria-label="Dismiss"' not in page.text
+
+
+def test_library_search_box_is_visible_and_preserves_filters(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+
+    page = c.get("/?q=Alpha&scene=1")
+    assert page.status_code == 200
+    # The search form is surfaced (no longer force-hidden) and reflects the query.
+    assert ".library-search { display:none; }" not in page.text
+    assert 'class="library-search search-field"' in page.text
+    assert 'name="q"' in page.text
+    assert 'value="Alpha"' in page.text
+    # Active source filter travels with the query as a hidden field so submitting
+    # the box keeps the combined filter state instead of dropping to plain search.
+    search_form = page.text.split('class="library-search search-field"', 1)[1].split("</form>", 1)[0]
+    assert '<input type="hidden" name="scene" value="1">' in search_form
+
+
+def test_bulk_toolbar_accessible_names_are_localized(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+
+    preferences = c.get("/api/preferences/workspace").json()
+    assert c.put(
+        "/api/preferences/workspace",
+        json=preferences | {"locale": "zh-Hant-TW"},
+    ).status_code == 200
+
+    page = c.get("/")
+    assert page.status_code == 200
+    # Bulk toolbar and row/select controls carry Traditional Chinese accessible names.
+    assert 'aria-label="整理動作"' in page.text  # bulk-action select
+    assert 'aria-label="資料夾或標籤"' in page.text  # bulk-target select
+    assert 'aria-label="選取本頁所有錄音"' in page.text  # header select-all
+    assert 'aria-label="選取錄音 Alpha meeting"' in page.text  # row-select
+    assert 'aria-label="錄音庫整理"' in page.text  # orgbox region
+    # No English fallbacks leak into the Traditional Chinese shell.
+    assert 'aria-label="Organization action"' not in page.text
+    assert 'aria-label="Folder or tag"' not in page.text
+    assert 'aria-label="Select all visible recordings"' not in page.text
+    assert 'aria-label="Select ' not in page.text
+    assert 'aria-label="Library organization"' not in page.text
+
+
+def test_literal_wildcards_do_not_expand_title_search(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add_all(
+            [
+                PlaudFile(id="percent", filename="100% ready", status=FileStatus.done),
+                PlaudFile(id="underscore", filename="plan_v2", status=FileStatus.done),
+                PlaudFile(id="plain", filename="ordinary", status=FileStatus.done),
+            ]
+        )
+
+    assert _ids(c, "?q=%25") == ["percent"]
+    assert _ids(c, "?q=_") == ["underscore"]
+
+
+def test_index_page_renders_table_and_controls(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    r = c.get("/")
+    assert r.status_code == 200
+    page = with_assets(c, r)
+    # Plaud-style file table: header row with sortable columns, list rows.
+    assert 'class="file-table-head"' in r.text and 'class="file-list"' in r.text
+    assert 'class="sort-link on" aria-current="true" href=' in r.text
+    assert ".file-row:hover, .file-row:focus-within, .file-row.is-selected { background: var(--c-hover); }" in page
+    assert ".file-row:hover .row-check, .file-row .row-check:checked, .file-row .row-check:focus-visible" in page
+    assert "Bravo call" in r.text
+    assert "Trash" in r.text  # trash view link
+    assert "Plaud recorder" in r.text  # curated capture-source facet
+    # Unnamed scene codes fall back to numbered labels. Sidebar source items
+    # stay distinguishable at rail width: short visible label, full label
+    # preserved on the link for hover/assistive context.
+    assert "Capture source 2" in r.text
+    assert ">Source 2</span>" in r.text
+    assert 'title="Capture source 2"' in r.text
+    # Mobile rows are title-first two-line rows: no per-cell column labels;
+    # duration and recorded date collapse into one muted meta line.
+    assert "content:attr(data-label)" not in page
+    assert 'data-label="Name"' not in r.text
+    assert '<span class="row-dur">' in r.text and '<span class="row-date">' in r.text
+    assert '<span class="row-meta-mobile">' in r.text
+    assert ".file-row .row-meta-mobile { display: flex; align-items: center; color: var(--c-text-2); font-size: 14px;" in page
+    assert ".file-table-head { display: none; }" in page
+    assert 'id="select-all-mobile" type="checkbox">Select visible' in r.text
+    assert 'id="mobile-sort" aria-label="Sort recordings"' in r.text
+    assert "[all, mobileAll].filter(Boolean).forEach(control =>" in r.text
+    assert "mobileSort?.addEventListener('change'" in r.text
+    assert "window.addEventListener('pageshow', syncMobileSortFromLocation" in r.text
+    assert "new Option(window.localplaudT('No folder'), '')" in r.text
+    # Blank folder/tag creation localizes the native required-field bubble.
+    assert "nameField.setCustomValidity(tr('Enter a name'))" in r.text
+    assert 'id="app-view" hx-history-elt' in r.text
+    assert 'id="recording-file-list"' not in r.text
+    assert 'href="/file/b?return_to=%2F"' in r.text
+    assert 'class="icon-btn filter-close"' in r.text
+    assert "event.key === 'Escape' && filterMenu?.open" in r.text
+    assert "filterReturnFocus?.isConnected ? filterReturnFocus : filterTrigger" in r.text
+    # Unhealthy rows carry a processing-state chip; done rows stay clean.
+    assert '<span class="state state-attention">Needs attention</span>' in r.text
+    assert 'name="date_from"' in r.text and 'name="date_to"' in r.text
+    assert 'name="min_duration_minutes"' in r.text
+    assert 'name="max_duration_minutes"' in r.text
+
+
+def test_filter_urls_and_detail_filelist_preserve_range_state(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    query = (
+        "sort=name&dir=asc&state=done&scene=1&date_from=1970-01-01&"
+        "date_to=1970-01-01&min_duration_minutes=2&max_duration_minutes=5"
+    )
+    page = c.get(f"/?{query}")
+    assert page.status_code == 200
+    assert "Alpha meeting" in page.text and "Bravo call" not in page.text
+
+    hrefs = [unescape(value) for value in re.findall(r'href="([^"]+)"', page.text)]
+    duration_sort = next(value for value in hrefs if "sort=duration" in value)
+    duration_params = parse_qs(urlsplit(duration_sort).query)
+    expected = {
+        "state": ["done"],
+        "scene": ["1"],
+        "date_from": ["1970-01-01"],
+        "date_to": ["1970-01-01"],
+        "min_duration_minutes": ["2.0"],
+        "max_duration_minutes": ["5.0"],
+    }
+    for key, value in expected.items():
+        assert duration_params[key] == value
+
+    clear_match = re.search(r'class="range-clear" href="([^"]+)"', page.text)
+    assert clear_match is not None
+    clear_ranges = unescape(clear_match.group(1))
+    clear_params = parse_qs(urlsplit(clear_ranges).query)
+    assert clear_params["state"] == ["done"] and clear_params["scene"] == ["1"]
+
+    return_to = f"/?{query}"
+    detail = c.get("/file/a", params={"return_to": return_to, "tab": "notes"})
+    assert detail.status_code == 200
+    assert 'data-recording-id="a"' in detail.text
+    assert 'data-recording-id="b"' not in detail.text
+    assert "tab=notes" in detail.text
+    for name, value in expected.items():
+        assert f'name="{name}" value="{value[0]}"' in detail.text
+
+
+def test_library_paginates_without_truncating_ask_scope(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add_all(
+            PlaudFile(
+                id=f"bulk-{index:03d}",
+                filename=f"Bulk recording {index:03d}",
+                status=FileStatus.done,
+                start_time_ms=10_000 + index,
+            )
+            for index in range(101)
+        )
+
+    first = c.get("/")
+    second = c.get("/?page=2")
+    ask = c.get("/?ask=true")
+    assert first.text.count('class="row-check checkbox row-select"') == 100
+    first_assets = with_assets(c, first)
+    assert ".file-row .row-title { font-size: 17px; line-height: 1.4; white-space: normal;" in first_assets
+    assert ".batch-bar { position: fixed;" in first_assets
+    assert 'class="sub pagination-summary">1–100 of 105</span>' in first.text
+    assert 'class="pagination-current" aria-current="page" aria-label="Page 1">1</span>' in first.text
+    assert 'data-page-nav href="http://testserver/?page=2" aria-label="Page 2">2</a>' in first.text
+    assert "Bulk recording 100" in first.text
+    assert "Alpha meeting" not in first.text
+    assert 'class="sub pagination-summary">101–105 of 105</span>' in second.text
+    assert 'aria-current="page" aria-label="Page 2">2</span>' in second.text
+    assert "Alpha meeting" in second.text
+    assert "Bulk recording 100" in ask.text and "Alpha meeting" in ask.text
+    assert "selected on this page" in first.text
+    assert 'id="page-change-backdrop" hidden' in first.text
+    assert 'role="alertdialog" aria-modal="true"' in first.text
+    assert "Changing pages clears the recordings selected on this page." in first.text
+    assert "pageChangeModal?.open(link, pageChangeCancel)" in first.text
+    assert "if (pendingPageUrl) window.location.href = pendingPageUrl" in first.text
+    assert "event.defaultPrevented || event.button !== 0 || event.metaKey" in first.text
+    assert "event.stopImmediatePropagation()" in first.text
+    assert "{capture:true,signal:cleanupController.signal}" in first.text
+
+    detail = c.get("/file/a", params={"return_to": "/?page=1", "tab": "mindmap"})
+    assert detail.status_code == 200
+    assert detail.text.count('data-recording-id="') == 101
+    assert 'data-recording-id="a"' in detail.text
+    assert "Selected recording" in detail.text
+    assert 'class="card on pinned-recording"' in detail.text
+    assert 'aria-label="Recording list pages"' in detail.text
+    assert '<span class="fl-page-label">1 / 2</span>' in detail.text
+    assert "data-replace-filelist" in detail.text
+    assert "return_to=%2F%3Fpage%3D2&amp;tab=mindmap" in detail.text
+    assert "!trigger?.closest?.('[data-replace-filelist]')" in with_assets(c, detail)
+
+
+def test_index_trash_view_shows_banner(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    r = c.get("/?view=trash")
+    assert r.status_code == 200
+    assert "Trashed thing" in r.text
+    assert "read-only recovery view" in r.text
+    assert "never deletes" in r.text
+
+
+def test_index_invalid_params_ok(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    _seed()
+    r = c.get("/?sort=xyz&dir=nope&state=bad&scene=notint&view=??")
+    assert r.status_code == 200
+
+
+def test_state_aliases_match_ops_card_buckets_exactly(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    statuses = {
+        "s-done": FileStatus.done,
+        "s-error": FileStatus.error,
+        "s-partial": FileStatus.partial,
+        "s-processing": FileStatus.processing,
+        "s-downloading": FileStatus.downloading,
+        "s-downloaded": FileStatus.downloaded,
+        "s-discovered": FileStatus.discovered,
+        "s-metadata": FileStatus.metadata_only,
+    }
+    with session_scope() as s:
+        for rid, status in statuses.items():
+            s.add(PlaudFile(id=rid, filename=rid, status=status,
+                            duration_ms=1000, start_time_ms=0))
+
+    def ids(state):
+        return {f["id"] for f in c.get(f"/api/files?state={state}").json()["files"]}
+
+    # Each aggregate alias filters exactly the statuses its displayed count
+    # sums, so a clicked number always lands on that many rows. discovered is
+    # queued for automatic download, so it is pending work, not manual import.
+    assert ids("generating") == {"s-processing", "s-downloading", "s-downloaded", "s-discovered"}
+    assert ids("active") == {"s-processing", "s-downloading"}
+    assert ids("queued") == {"s-downloaded", "s-discovered"}
+    assert ids("attention") == {"s-error", "s-partial"}
+    assert ids("cloud") == {"s-metadata"}
+    assert ids("done") == {"s-done"}
+
+    page = c.get("/")
+    card = page.text.split('data-testid="ops-card"', 1)[1].split("</div>", 1)[0]
+    # Only actively running work is "generating"; the downloaded backlog is
+    # honestly labelled as awaiting processing.
+    assert '<a class="ops-stat" href="/?state=active"><strong>2</strong> generating</a>' in card
+    assert '<a class="ops-stat" href="/?state=queued"><strong>2</strong> awaiting processing</a>' in card
+    assert '<a class="ops-stat" href="/?state=attention"><strong class="ops-attn">2</strong> need attention</a>' in card
+    assert '<a class="ops-stat" href="/?state=cloud"><strong>1</strong> in cloud</a>' in card
+    assert '<a class="ops-stat" href="/?state=done"><strong>1</strong> ready</a>' in card
+
+
+def test_ops_card_cloud_only_is_not_all_caught_up(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="c-done", filename="Done", status=FileStatus.done,
+                        duration_ms=1000, start_time_ms=0))
+        s.add(PlaudFile(id="c-cloud", filename="Cloud", status=FileStatus.metadata_only,
+                        duration_ms=1000, start_time_ms=0))
+
+    card = c.get("/").text.split('data-testid="ops-card"', 1)[1].split("</div>", 1)[0]
+    assert "Cloud-only recordings await import" in card
+    assert "All caught up" not in card
+    assert '<a class="ops-stat" href="/?state=cloud"><strong>1</strong> in cloud</a>' in card
+
+
+def test_discovered_only_workspace_counts_as_pending_not_manual_import(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="d-only", filename="Just discovered", status=FileStatus.discovered,
+                        duration_ms=1000, start_time_ms=0))
+
+    card = c.get("/").text.split('data-testid="ops-card"', 1)[1].split("</div>", 1)[0]
+    # The poller downloads discovered rows automatically: pending, never
+    # presented as awaiting a manual import — but with nothing running it is
+    # awaiting processing, not "generating".
+    assert '<a class="ops-stat" href="/?state=queued"><strong>1</strong> awaiting processing</a>' in card
+    assert "generating" not in card
+    assert "in cloud" not in card
+    assert "Cloud-only recordings await import" not in card
+    assert "View system status" in card
+
+
+def test_home_generating_tile_matches_destination_with_trashed_pending_row(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="p-live", filename="Pending live", status=FileStatus.processing,
+                        duration_ms=1000, start_time_ms=0))
+        s.add(PlaudFile(id="p-trash", filename="Pending trashed", status=FileStatus.processing,
+                        duration_ms=1000, start_time_ms=0, is_trash=True))
+
+    destination_rows = len(c.get("/api/files?state=generating").json()["files"])
+    home = c.get("/home").text
+    tile = home.split('class="home-card" href="/?state=generating"', 1)[1].split("</a>", 1)[0]
+    import re as _re
+
+    tile_count = int(_re.search(r'class="home-count" data-count>(\d+)<', tile).group(1))
+    # The tile's number equals its linked destination: trashed pending rows
+    # are excluded from both.
+    assert destination_rows == 1
+    assert tile_count == destination_rows
+
+
+def test_attention_view_offers_reprocess_all(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import FileStatus, PlaudFile
+    from localplaud.db.session import session_scope
+
+    with session_scope() as s:
+        s.add(PlaudFile(id="p1", filename="p1", status=FileStatus.partial, duration_ms=1000, start_time_ms=0))
+        s.add(PlaudFile(id="e1", filename="e1", status=FileStatus.error, duration_ms=1000, start_time_ms=0))
+        s.add(PlaudFile(id="d1", filename="d1", status=FileStatus.done, duration_ms=1000, start_time_ms=0))
+
+    attention = c.get("/?state=attention").text
+    assert 'id="attention-retry-button" data-statuses="error,partial"' in attention
+    assert "<strong>2 recordings did not finish processing</strong>" in attention
+    assert 'data-statuses="partial"' in c.get("/?state=partial").text
+    # Not offered where it would act on rows the user is not looking at.
+    assert 'id="attention-retry-button"' not in c.get("/").text
+    assert 'id="attention-retry-button"' not in c.get("/?state=done").text
+    assert 'id="attention-retry-button"' not in c.get("/?state=attention&q=p1").text
+    assert "State: Needs attention" in attention

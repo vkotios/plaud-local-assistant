@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}{{ t('Templates') }} — localplaud{% endblock %}
+{% macro template_card(template, rank=None) -%}
+<article class="sf-tcard" data-template-key="{{ template.key }}">
+  {% if rank %}<span class="sf-tcard-rank">No.{{ rank }}</span>{% endif %}
+  <span class="sf-tcard-icon" style="--tc:{{ template.glyph.color }}">{{ icon(template.glyph.icon, 'lg') }}</span>
+  <h3 class="sf-tcard-title"><button type="button" class="sf-tcard-open" data-sf-template-open="{{ template.key }}">{{ template.name }}</button></h3>
+  <p class="sf-tcard-desc">{{ template.description }}</p>
+  <div class="sf-tcard-foot">
+    {% if template.usage_count %}<span title="{{ t('Notes generated with this template') }}">{{ icon('file-text', 'xs') }} {{ template.usage_count }}</span><span aria-hidden="true">•</span>{% endif %}
+    <span class="sf-tcard-author">{{ t(template.author) }}</span>
+    <span class="sf-badge">{{ t(template.provenance_label) }} · v{{ template.version }}</span>
+  </div>
+</article>
+{%- endmacro %}
+{% macro carousel(items, label, ranked=false) -%}
+<div class="sf-carousel-wrap" data-sf-carousel-wrap>
+  <button class="sf-carousel-nav prev" type="button" data-sf-carousel-step="-1" aria-label="{{ t('Previous templates') }}" aria-controls="{{ label }}" hidden>{{ icon('chevron-left', 'sm') }}</button>
+  <div class="sf-carousel" id="{{ label }}" data-sf-carousel>{% for template in items %}{{ template_card(template, loop.index if ranked else None) }}{% endfor %}</div>
+  <button class="sf-carousel-nav next" type="button" data-sf-carousel-step="1" aria-label="{{ t('Next templates') }}" aria-controls="{{ label }}" hidden>{{ icon('chevron-right', 'sm') }}</button>
+</div>
+{%- endmacro %}
+{% block body %}
+<main class="main"><div class="content" data-surface="templates"><div class="sf-templates-page">
+  <header class="sf-page-head">
+    <div><h1 class="sf-large-title">{{ t('Templates') }}</h1><p class="sf-muted sf-page-sub">{{ t('Structured notes with immutable versions and reproducible prompts.') }}</p></div>
+    <div class="sf-page-actions">
+      <form method="get" action="/templates" class="sf-search-field sf-template-search" role="search">
+        {{ icon('search', 'sm') }}
+        <input type="hidden" name="tab" value="{{ tab }}">
+        <input type="search" name="q" value="{{ q }}" aria-label="{{ t('Search templates, scenarios, or categories') }}" placeholder="{{ t('Try “Meeting”') }}" data-sf-template-filter>
+      </form>
+      <button class="btn" id="new-template" type="button" data-sf-template-create>{{ icon('pencil', 'sm') }}<span>{{ t('Create template') }}</span></button>
+    </div>
+  </header>
+  <nav class="sf-tabs" aria-label="{{ t('Template views') }}">
+    <a href="/templates?tab=my" class="{% if tab=='my' %}on{% endif %}" {% if tab=='my' %}aria-current="page"{% endif %}>{{ t('My templates') }}</a>
+    <a href="/templates?tab=explore" class="{% if tab=='explore' %}on{% endif %}" {% if tab=='explore' %}aria-current="page"{% endif %}>{{ t('Discover') }}</a>
+  </nav>
+
+  {% if tab == 'my' %}
+    {% if recent_templates %}
+    <section class="sf-tsection" aria-labelledby="sf-recent-templates">
+      <h2 class="sf-section-title" id="sf-recent-templates">{{ t('Recently used') }}</h2>
+      {{ carousel(recent_templates, 'sf-recent-carousel') }}
+    </section>
+    {% endif %}
+    <section class="sf-tsection" aria-labelledby="sf-my-templates">
+      <h2 class="sf-section-title" id="sf-my-templates">{{ t('My templates') }}</h2>
+      <div class="sf-tgrid">
+        <button type="button" class="sf-tcard sf-tcard-create" data-sf-template-create>{{ icon('pencil', 'lg') }}<span>{{ t('Create template') }}</span></button>
+        {% for template in personal_templates %}{{ template_card(template) }}{% endfor %}
+      </div>
+      {% if not personal_templates %}<p class="sf-muted sf-tempty">{% if q %}{{ t('No templates match this view.') }}{% else %}{{ t('Copy a template from Discover or create your own. Every edit becomes a new version, and notes keep the exact version they used.') }}{% endif %} <a href="/templates?tab=explore">{{ t('Browse Discover') }}</a></p>{% endif %}
+    </section>
+  {% else %}
+    <div class="sf-chiprow" role="list" aria-label="{{ t('Categories') }}">
+      <a role="listitem" class="sf-catchip {% if not category %}on{% endif %}" href="/templates?tab=explore{% if q %}&amp;q={{ q|urlencode }}{% endif %}" {% if not category %}aria-current="true"{% endif %}>{{ icon('grid', 'sm') }}{{ t('All') }}</a>
+      {% for item in categories %}<a role="listitem" class="sf-catchip {% if category==item.name %}on{% endif %}" href="/templates?tab=explore&amp;category={{ item.name|urlencode }}{% if q %}&amp;q={{ q|urlencode }}{% endif %}" {% if category==item.name %}aria-current="true"{% endif %}><span style="color:{{ item.glyph.color }}">{{ icon(item.glyph.icon, 'sm') }}</span>{{ t(item.name) }}</a>{% endfor %}
+    </div>
+    {% if catalog_sections %}
+      {% for section in catalog_sections %}
+      <section class="sf-tsection" aria-labelledby="sf-section-{{ loop.index }}">
+        <div class="sf-section-head"><h2 class="sf-section-title" id="sf-section-{{ loop.index }}">{{ t(section.title) }}</h2>{% if section.category %}<a class="sf-view-all" href="/templates?tab=explore&amp;category={{ section.category|urlencode }}">{{ t('View all') }} {{ icon('chevron-right', 'sm') }}</a>{% endif %}</div>
+        {{ carousel(section['items'], 'sf-section-carousel-' ~ loop.index, section.ranked) }}
+      </section>
+      {% endfor %}
+    {% elif catalog_templates %}
+      <div class="sf-tgrid sf-tgrid-results">{% for template in catalog_templates %}{{ template_card(template) }}{% endfor %}</div>
+    {% else %}
+      <div class="empty sf-tempty-state">{{ icon('template', 'lg') }}<strong>{{ t('No templates match this view.') }}</strong><a class="btn sec" href="/templates?tab=explore">{{ t('Clear filters') }}</a></div>
+    {% endif %}
+    <p class="sf-muted sf-catalog-note">{{ t('Discover lists the templates bundled with this workspace. Nothing is fetched from an online community.') }}</p>
+  {% endif %}
+</div></div></main>
+
+<dialog class="sf-dialog sf-dialog-lg" id="template-detail" aria-labelledby="template-detail-title" data-sf-template-detail>
+  <div class="sf-sheet-grab" aria-hidden="true"></div>
+  <div class="sf-dialog-head sf-dialog-head-plain"><span></span><button class="sf-icon-btn" type="button" data-sf-dialog-close aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+  <div class="sf-dialog-body sf-tdetail">
+    <div class="sf-tdetail-hero"><span class="sf-tcard-icon" data-sf-detail-icon></span><h2 id="template-detail-title" data-sf-detail-title></h2><p class="sf-tdetail-meta" data-sf-detail-meta></p></div>
+    <section><h3>{{ t('Description') }}</h3><p data-sf-detail-description></p></section>
+    <section><h3>{{ t('Provenance') }}</h3><dl class="sf-tdetail-facts" data-sf-detail-facts></dl></section>
+    <section><h3>{{ t('Note structure / instructions') }}</h3><pre class="sf-prompt" data-sf-detail-prompt></pre></section>
+    <details class="sf-prompt-system" data-sf-detail-system-wrap><summary>{{ t('System prompt') }}</summary><pre class="sf-prompt" data-sf-detail-system></pre></details>
+  </div>
+  <div class="sf-dialog-foot">
+    <button class="btn sec sf-btn-danger" type="button" data-sf-template-archive>{{ icon('trash', 'sm') }}{{ t('Archive') }}</button>
+    <span class="sf-spacer"></span>
+    <button class="btn sec" type="button" data-sf-template-duplicate>{{ icon('copy', 'sm') }}{{ t('Duplicate to edit') }}</button>
+    <button class="btn template-copy" type="button" data-sf-template-copy>{{ icon('plus', 'sm') }}{{ t('Add to My templates') }}</button>
+    <button class="btn template-edit" type="button" data-sf-template-edit>{{ icon('pencil', 'sm') }}{{ t('Edit') }}</button>
+  </div>
+  <div class="sf-dialog-status" data-sf-detail-status role="status" aria-live="polite"></div>
+</dialog>
+
+<dialog class="sf-dialog sf-dialog-lg" id="template-editor" aria-labelledby="template-modal-title" data-sf-template-editor>
+  <div class="sf-sheet-grab" aria-hidden="true"></div>
+  <form id="template-form" class="sf-editor" novalidate>
+    <div class="sf-dialog-head"><h2 id="template-modal-title">{{ t('Create template') }}</h2><button class="sf-icon-btn" type="button" data-sf-editor-cancel aria-label="{{ t('Close') }}">{{ icon('x') }}</button></div>
+    <div class="sf-dialog-body">
+      <p class="sf-notice" data-sf-version-note hidden></p>
+      <label class="sf-field">{{ t('Template name') }}<input name="name" required maxlength="80" autocomplete="off"></label>
+      <label class="sf-field">{{ t('Note structure / instructions') }}<textarea name="instructions" required rows="9" maxlength="20000" placeholder="{{ t('Describe the sections, headings, and level of detail the note should contain.') }}"></textarea><span class="sf-help">{{ t('Write the structure you want, for example: Summary, Decisions, Action items with owners, Open questions.') }}</span></label>
+      <fieldset class="sf-fieldset"><legend>{{ t('Output mode') }}</legend>
+        <label class="sf-radio"><input type="radio" name="prompt_mode" value="structured" checked><span><strong>{{ t('Structured') }}</strong><small>{{ t('localplaud wraps your instructions with its note format and full-transcript coverage rules.') }}</small></span></label>
+        <label class="sf-radio"><input type="radio" name="prompt_mode" value="direct"><span><strong>{{ t('Direct') }}</strong><small>{{ t('Your instructions are sent as the complete prompt.') }}</small></span></label>
+      </fieldset>
+      <details class="sf-advanced"><summary>{{ t('Advanced') }}</summary>
+        <label class="sf-field">{{ t('System prompt') }}<textarea name="system_prompt" rows="5" maxlength="20000"></textarea></label>
+        <label class="sf-field">{{ t('Key') }}<input name="key" pattern="[a-z0-9][a-z0-9-]{0,63}" maxlength="64" autocomplete="off" spellcheck="false"><span class="sf-help">{{ t('Stable identifier used by AutoFlow and the API. Lowercase letters, numbers, and hyphens.') }}</span></label>
+      </details>
+      <div id="template-form-status" class="sf-form-status" role="status" aria-live="polite"></div>
+    </div>
+    <div class="sf-dialog-foot"><button class="btn sec" id="template-cancel" type="button" data-sf-editor-cancel>{{ t('Cancel') }}</button><button class="btn" type="submit" data-sf-editor-save>{{ t('Save template') }}</button></div>
+  </form>
+</dialog>
+<script type="application/json" id="sf-template-data">{{ template_items|tojson }}</script>
+{% endblock %}

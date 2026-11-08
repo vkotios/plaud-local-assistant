@@ -1,0 +1,35 @@
+NOTICE
+======
+
+This product repository (plaud-local-assistant / Plaud-local) is based on
+localplaud (https://github.com/skyhong2002/localplaud), licensed under the MIT
+License. See LICENSE and ATTRIBUTION.md.
+
+Plaud-local product overlays (inference-gateway-manager client wiring, Fedora
+deploy docs, and future adapters) are Copyright (c) 2026 Vasileios Kotios and
+contributors, also under MIT unless a file states otherwise.
+
+---------------------------------------------------------------------------
+Bluetooth / OpenPlod (future — Phase 4)
+---------------------------------------------------------------------------
+
+No Bluetooth, OpenPlod, or openplaud-derived protocol code is included in this
+tree yet. When a BLE adapter is introduced:
+
+- Preserve MIT notices for OpenPlod contributions.
+- Complete openplaud provenance / licence compliance review before distributing
+  adapted protocol code.
+- Update this NOTICE and ATTRIBUTION.md with concrete upstream commits and
+  third-party notices.
+- Do not redistribute Plaud SDK AAR binaries or trademarks.
+
+Until that review lands, BLE remains out of scope for this foundation phase.
+
+---------------------------------------------------------------------------
+Private / reverse-engineered Plaud APIs
+---------------------------------------------------------------------------
+
+Private or reverse-engineered Plaud session/API clients are permanently out of
+scope for Plaud-local cloud sync. Official Open API (and official cloud MCP for
+ingest) are the only supported cloud paths. Do not add clients derived from
+Applaud, plaud-tools, plaud-toolkit, PlaudNotes, or similar private stacks.

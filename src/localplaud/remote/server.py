@@ -1,0 +1,664 @@
+"""Authenticated durable localplaud-worker v1 API and stage executor."""
+
+from __future__ import annotations
+
+import base64
+import functools
+import hashlib
+import hmac
+import json
+import os
+import tempfile
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+
+import httpx
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import defer
+
+from ..asr.base import AsrResourceError, Segment, Transcript, Word
+from ..config import get_settings
+from ..db.models import RemoteJob
+from ..db.session import session_scope
+from ..llm.base import LLMOutputInvalid, LLMTransientError
+from ..plaud.common import _assert_safe_fetch_url
+from .protocol import (
+    ArtifactDescriptor,
+    CancelResponse,
+    HandshakeResponse,
+    InputReference,
+    JobResponse,
+    JobStage,
+    JobStatus,
+    JobSubmitRequest,
+    StageCapability,
+    WorkerError,
+    WorkerRuntime,
+)
+
+# This host has a single GPU. Serialize stage execution so concurrent job
+# submissions (e.g. a controller running two recordings in parallel) never run
+# two GPU stages at once — concurrent pyannote/torch calls deadlock on one card.
+_GPU_LOCK = threading.Lock()
+
+router = APIRouter(prefix="/api/worker/v1", tags=["remote-worker"])
+_bearer = HTTPBearer(auto_error=False)
+
+
+@contextmanager
+def gpu_admission_lock():
+    """Keep host watchdog maintenance mutually exclusive with job admission."""
+    import fcntl
+
+    from sqlalchemy.engine import make_url
+
+    url = make_url(get_settings().store.database_url)
+    if url.get_backend_name() != "sqlite" or url.database in {None, ":memory:"}:
+        yield
+        return
+    path = Path(str(url.database) + ".gpu-maintenance.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HTTPException(
+                status_code=503, detail="worker GPU maintenance in progress",
+                headers={"Retry-After": "120"},
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _admit_job():
+    with gpu_admission_lock():
+        yield
+
+
+def _authorize(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),  # noqa: B008
+) -> None:
+    expected = os.environ.get("LOCALPLAUD_WORKER_TOKEN")
+    if not expected:
+        raise HTTPException(status_code=503, detail="remote worker token is not configured")
+    supplied = (
+        credentials.credentials if credentials and credentials.scheme.lower() == "bearer" else ""
+    )
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="invalid worker token")
+
+
+def _descriptor(job_id: str, artifact: dict) -> ArtifactDescriptor:
+    return ArtifactDescriptor(
+        name=artifact["name"],
+        media_type=artifact["media_type"],
+        size=artifact["size"],
+        sha256=artifact["sha256"],
+        download_url=f"/api/worker/v1/jobs/{job_id}/artifacts/{artifact['name']}",
+    )
+
+
+def _response(row: RemoteJob) -> JobResponse:
+    return JobResponse(
+        job_id=row.id,
+        idempotency_key=row.idempotency_key,
+        stage=row.stage,
+        status=row.status,
+        progress=row.progress,
+        artifacts=[_descriptor(row.id, item) for item in row.artifacts or []],
+        error=row.error,
+    )
+
+
+def _decode_input(ref: InputReference) -> bytes:
+    if ref.kind == "inline_json":
+        data = json.dumps(ref.value, ensure_ascii=False, separators=(",", ":")).encode()
+    elif ref.kind == "inline_base64":
+        data = base64.b64decode(str(ref.value), validate=True)
+    else:
+        _assert_safe_fetch_url(str(ref.value))
+        with httpx.Client(timeout=120, follow_redirects=False) as client:
+            response = client.get(str(ref.value))
+            response.raise_for_status()
+            data = response.content
+    if ref.sha256 and not hmac.compare_digest(hashlib.sha256(data).hexdigest(), ref.sha256):
+        raise ValueError(f"input checksum mismatch: {ref.name}")
+    return data
+
+
+def _transcript(value: bytes) -> Transcript:
+    payload = json.loads(value)
+    segments = []
+    for item in payload.get("segments", []):
+        words = [Word(**word) for word in item.get("words", [])]
+        segments.append(Segment(**(item | {"words": words})))
+    return Transcript(
+        segments=segments,
+        language=payload.get("language"),
+        duration=payload.get("duration"),
+        provider=payload.get("provider", "remote"),
+        model=payload.get("model"),
+        has_speakers=payload.get("has_speakers", False),
+    )
+
+
+def _artifact(name: str, media_type: str, data: bytes) -> dict:
+    return {
+        "name": name,
+        "media_type": media_type,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "data_base64": base64.b64encode(data).decode(),
+    }
+
+
+def _execute(request: JobSubmitRequest) -> list[dict]:
+    inputs = {item.name: _decode_input(item) for item in request.inputs}
+    settings = get_settings().model_copy(deep=True)
+    if request.model:
+        if request.stage == JobStage.transcribe:
+            # Existing queued jobs retain their explicitly selected model.
+            if request.model == settings.asr.qwen.model:
+                settings.asr.provider = "qwen"
+            elif request.model == settings.asr.faster_whisper.model:
+                settings.asr.provider = "faster-whisper"
+            cfg = getattr(settings.asr, settings.asr.provider.replace("-", "_"))
+            if hasattr(cfg, "model"):
+                cfg.model = request.model
+        elif request.stage == JobStage.diarize:
+            if request.model == "nvidia/Nemotron-3-Diarization":
+                settings.diarize.provider = "nemotron"
+            elif request.model.startswith("pyannote/"):
+                settings.diarize.provider = "pyannote"
+            settings.diarize.model = request.model
+        elif request.stage in {JobStage.summarize, JobStage.mind_map, JobStage.outline}:
+            cfg = getattr(settings.llm, settings.llm.provider.replace("-", "_"))
+            if hasattr(cfg, "model"):
+                cfg.model = request.model
+        elif request.stage == JobStage.embed:
+            cfg = getattr(settings.embeddings, settings.embeddings.provider.replace("-", "_"))
+            if hasattr(cfg, "model"):
+                cfg.model = request.model
+    if request.stage == JobStage.transcribe:
+        from ..worker.transcribe import run_asr, segments_to_json
+
+        if "vad" in request.options:
+            # A stage-scoped speech recovery choice, captured by the durable
+            # request/profile and its idempotency key; never change host defaults.
+            from ..config import VadConfig
+
+            settings.asr.vad = VadConfig.model_validate(
+                settings.asr.vad.model_dump() | request.options["vad"]
+            )
+        applied_speech: dict = {}
+        if request.options.get("language"):
+            # Per-recording Custom language; part of the idempotency key.
+            settings.asr.language = str(request.options["language"])
+            applied_speech["language"] = settings.asr.language
+        suffix = request.options.get("suffix", ".wav")
+        with tempfile.NamedTemporaryFile(suffix=suffix) as audio:
+            audio.write(inputs["audio"])
+            audio.flush()
+            transcript = run_asr(Path(audio.name), settings)
+        payload = {
+            "segments": segments_to_json(transcript),
+            "language": transcript.language,
+            "duration": transcript.duration,
+            "provider": transcript.provider,
+            "model": transcript.model,
+            "has_speakers": transcript.has_speakers,
+            "processing_metadata": transcript.processing_metadata,
+            "applied_speech_overrides": applied_speech,
+        }
+        return [_artifact("transcript.json", "application/json", json.dumps(payload).encode())]
+    transcript = _transcript(inputs["transcript"])
+    if request.stage == JobStage.diarize:
+        from ..worker.diarize import diarize
+        from ..worker.transcribe import segments_to_json
+
+        applied_speech = {
+            key: request.options[key]
+            for key in ("num_speakers", "min_speakers", "max_speakers")
+            if key in request.options
+        }
+        for key, value in applied_speech.items():
+            setattr(settings.diarize, key, int(value) if value else None)
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            audio.write(inputs["audio"])
+            audio.flush()
+            result = diarize(Path(audio.name), transcript, settings.diarize)
+        payload = {
+            "segments": segments_to_json(result),
+            "has_speakers": result.has_speakers,
+            "model": settings.diarize.model,
+            "applied_speech_overrides": applied_speech,
+        }
+    elif request.stage == JobStage.summarize:
+        from ..worker.summarize import _llm_provider_model, generate_recording_title, summarize
+        from ..worker.title_policy import TITLE_PROMPT_VERSION
+
+        if request.options.get("title_only"):
+            provider, model = _llm_provider_model(settings)
+            payload = {
+                "title": generate_recording_title(transcript, settings),
+                "provider": provider,
+                "model": model,
+                "title_prompt_version": TITLE_PROMPT_VERSION,
+            }
+        else:
+            from ..config import PipelineConfig
+
+            note_options = {
+                key: request.options[key]
+                for key in (
+                    "note_quality",
+                    "note_single_pass_chars",
+                    "note_evidence_chunk_chars",
+                    "note_repair_attempts",
+                )
+                if key in request.options
+            }
+            settings.pipeline = PipelineConfig.model_validate(
+                settings.pipeline.model_dump() | note_options
+            )
+            checkpoint_key = hashlib.sha256(request.idempotency_key.encode()).hexdigest()
+            payload = summarize(
+                transcript,
+                settings,
+                request.options.get("template"),
+                context=request.options.get("note_context"),
+                checkpoint_dir=Path(settings.poller.download_dir).parent
+                / "note-checkpoints"
+                / checkpoint_key,
+            )
+    elif request.stage == JobStage.mind_map:
+        from ..worker.mindmap import generate_mind_map
+
+        payload = generate_mind_map(transcript, settings, request.options.get("summary_md"))
+    elif request.stage == JobStage.outline:
+        from ..worker.outline import generate_outline
+
+        payload = generate_outline(
+            transcript, settings, duration_ms=request.options.get("duration_ms")
+        )
+    elif request.stage == JobStage.embed:
+        from ..worker.index import build_chunks, embed_chunks
+
+        chunks = build_chunks(transcript)
+        blobs, embedder_name, dim = embed_chunks(chunks, settings)
+        payload = {
+            "chunks": chunks,
+            "vectors_base64": [base64.b64encode(blob).decode() for blob in blobs],
+            # Attest the model the controller requested (its catalog id), not the
+            # embedder's internal name (e.g. "ollama:bge-m3"), so the controller's
+            # returned-model check accepts the result.
+            "model": request.model or embedder_name,
+            "dim": dim,
+        }
+    else:  # pragma: no cover - enum keeps this unreachable
+        raise ValueError(f"unsupported stage: {request.stage}")
+    return [_artifact("result.json", "application/json", json.dumps(payload).encode())]
+
+
+def release_job_inputs(row: RemoteJob) -> None:
+    """Keep terminal-job provenance and results without retaining uploaded payloads.
+
+    Terminal manifests are audit records, not executable requests. A failed job
+    receives a fresh complete manifest when the controller resubmits it.
+    """
+    if row.status not in {JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled}:
+        raise ValueError("cannot release inputs for an unfinished worker job")
+    manifest = dict(row.input_manifest or {})
+    manifest["inputs"] = [
+        {key: value for key, value in item.items() if key != "value"}
+        for item in manifest.get("inputs", [])
+    ]
+    manifest["input_payloads_released"] = True
+    row.input_manifest = manifest
+
+
+def execute_job(job_id: str) -> None:
+    from ..maintenance import get_gate
+
+    if get_gate().request() is not None:
+        _defer_for_maintenance(job_id)
+        return False
+    # Waiters have not started a stage. Recheck admission after the GPU lock:
+    # maintenance leaves their durable input intact for explicit later resume.
+    with _GPU_LOCK:
+        result = get_gate().queued(_execute_admitted_job, job_id)
+        if result is False:
+            _defer_for_maintenance(job_id)
+        return result
+
+
+def _defer_for_maintenance(job_id):
+    with session_scope() as session:
+        row = session.get(RemoteJob, job_id)
+        if row is not None and row.status in {JobStatus.queued, JobStatus.running}:
+            row.options = dict(row.options or {}) | {"_maintenance_deferred": True}
+
+
+class DeferredScanUnavailable(RuntimeError):
+    """No execution began: only the initial deferred-job lookup failed."""
+
+
+def resume_deferred_jobs():
+    try:
+        with session_scope() as session:
+            ids = list(session.scalars(select(RemoteJob.id).where(
+                RemoteJob.status.in_([JobStatus.queued, JobStatus.running]),
+                RemoteJob.options["_maintenance_deferred"].as_boolean().is_(True),
+            )))
+    except Exception:
+        raise DeferredScanUnavailable("Deferred job lookup unavailable") from None
+    for job_id in ids:
+        execute_job(job_id)
+
+
+def _execute_admitted_job(job_id: str) -> None:
+    with session_scope() as session:
+        row = session.get(RemoteJob, job_id)
+        if row is None or row.status not in {JobStatus.queued, JobStatus.running}:
+            return
+        if row.cancel_requested:
+            row.status, row.progress = JobStatus.cancelled, 1.0
+            row.completed_at = datetime.now(UTC)
+            release_job_inputs(row)
+            return
+        row.status, row.progress = JobStatus.running, 0.05
+        row.started_at = row.started_at or datetime.now(UTC)
+        row.attempts += 1
+        request = JobSubmitRequest.model_validate(row.input_manifest)
+    try:
+        artifacts = _execute(request)
+        with session_scope() as session:
+            row = session.get(RemoteJob, job_id)
+            if row.cancel_requested:
+                row.status, row.progress = JobStatus.cancelled, 1.0
+            else:
+                row.artifacts = artifacts
+                row.status, row.progress = JobStatus.succeeded, 1.0
+            row.completed_at = datetime.now(UTC)
+            release_job_inputs(row)
+    except Exception as exc:  # noqa: BLE001 - persisted structured worker failure
+        with session_scope() as session:
+            row = session.get(RemoteJob, job_id)
+            row.status, row.progress = JobStatus.failed, 1.0
+            resource = isinstance(exc, AsrResourceError)
+            row.error = WorkerError(
+                code="worker_resource_exhausted" if resource else "stage_execution_failed",
+                message=str(exc),
+                retryable=resource
+                or isinstance(
+                    exc, (httpx.TimeoutException, LLMTransientError, LLMOutputInvalid, OSError)
+                ),
+            ).model_dump(mode="json")
+            row.completed_at = datetime.now(UTC)
+            release_job_inputs(row)
+
+
+def resume_pending_jobs() -> None:
+    with session_scope() as session:
+        ids = list(
+            session.scalars(
+                select(RemoteJob.id).where(
+                    RemoteJob.status.in_([JobStatus.queued, JobStatus.running])
+                )
+            )
+        )
+    for job_id in ids:
+        execute_job(job_id)
+
+
+@functools.lru_cache(maxsize=1)
+def _static_runtime() -> dict:
+    """Device facts that do not change while the worker process runs."""
+    import platform
+
+    from ..providers.hardware import _memory_bytes, _nvidia_gpus
+    from ..system_info import package_version
+
+    system = platform.system()
+    gpus = _nvidia_gpus()
+    if gpus:
+        device = ", ".join(
+            f"{gpu['name']} ({gpu['memory_mb']} MB)" if gpu.get("memory_mb") else gpu["name"]
+            for gpu in gpus
+        )
+    else:
+        device = f"{system} {platform.machine()}".strip() or None
+    memory = _memory_bytes(system)
+    return {
+        "software_version": package_version(),
+        "device": os.environ.get("LOCALPLAUD_WORKER_DEVICE") or device,
+        "memory_total_mb": memory // (1024 * 1024) if memory else None,
+    }
+
+
+def _worker_runtime() -> WorkerRuntime:
+    counts = {JobStatus.queued: 0, JobStatus.running: 0}
+    try:
+        with session_scope() as session:
+            for status in session.scalars(
+                select(RemoteJob.status).where(
+                    RemoteJob.status.in_([JobStatus.queued, JobStatus.running])
+                )
+            ):
+                counts[JobStatus(status)] += 1
+    except Exception:  # noqa: BLE001 - runtime facts are advisory
+        return WorkerRuntime(**_static_runtime())
+    return WorkerRuntime(
+        **_static_runtime(),
+        queued_jobs=counts[JobStatus.queued],
+        running_jobs=counts[JobStatus.running],
+    )
+
+
+@router.get("/capabilities", response_model=HandshakeResponse, dependencies=[Depends(_authorize)])
+def capabilities():
+    settings = get_settings()
+    return HandshakeResponse(
+        worker_id=os.environ.get("LOCALPLAUD_WORKER_ID", "local-worker"),
+        runtime=_worker_runtime(),
+        capabilities=[
+            StageCapability(
+                stage="transcribe",
+                models=[
+                    getattr(
+                        getattr(settings.asr, settings.asr.provider.replace("-", "_")),
+                        "model",
+                        settings.asr.provider,
+                    )
+                ],
+            ),
+            StageCapability(stage="diarize", models=[settings.diarize.model]),
+            StageCapability(
+                stage="summarize",
+                models=[
+                    getattr(
+                        getattr(settings.llm, settings.llm.provider), "model", settings.llm.provider
+                    )
+                ],
+            ),
+            StageCapability(
+                stage="mind_map",
+                models=[
+                    getattr(
+                        getattr(settings.llm, settings.llm.provider), "model", settings.llm.provider
+                    )
+                ],
+            ),
+            StageCapability(
+                stage="outline",
+                models=[
+                    getattr(
+                        getattr(settings.llm, settings.llm.provider.replace("-", "_")),
+                        "model",
+                        settings.llm.provider,
+                    )
+                ],
+            ),
+            StageCapability(
+                stage="embed",
+                models=[
+                    getattr(
+                        getattr(settings.embeddings, settings.embeddings.provider),
+                        "model",
+                        settings.embeddings.provider,
+                    )
+                ],
+            ),
+        ],
+    )
+
+
+@router.post(
+    "/jobs", response_model=JobResponse,
+    dependencies=[Depends(_authorize), Depends(_admit_job)],
+)
+def submit_job(request: JobSubmitRequest, background: BackgroundTasks):
+    from ..worker.note_policy import NOTE_PROMPT_VERSION
+    from ..worker.title_policy import TITLE_PROMPT_VERSION
+
+    if request.stage == JobStage.outline:
+        from ..worker.outline import PROMPT_VERSION
+
+        if request.options.get("prompt_version", PROMPT_VERSION) != PROMPT_VERSION:
+            raise HTTPException(status_code=409, detail="outline prompt version is unsupported")
+    title_only = request.stage == JobStage.summarize and request.options.get("title_only")
+    if (
+        request.stage == JobStage.summarize
+        and not title_only
+        and request.options.get("note_prompt_version", NOTE_PROMPT_VERSION) != NOTE_PROMPT_VERSION
+    ):
+        raise HTTPException(status_code=409, detail="note prompt version is unsupported")
+    if (
+        title_only
+        and request.options.get("title_prompt_version", TITLE_PROMPT_VERSION)
+        != TITLE_PROMPT_VERSION
+    ):
+        raise HTTPException(status_code=409, detail="title prompt version is unsupported")
+    with session_scope() as session:
+        existing = session.scalar(
+            select(RemoteJob).where(RemoteJob.idempotency_key == request.idempotency_key)
+        )
+        if existing is not None:
+            outdated_title = False
+            outdated_note = False
+            if title_only and existing.status == JobStatus.succeeded:
+                try:
+                    artifact = next(a for a in existing.artifacts if a["name"] == "result.json")
+                    payload = json.loads(base64.b64decode(artifact["data_base64"]))
+                    outdated_title = payload.get("title_prompt_version") != TITLE_PROMPT_VERSION
+                except (KeyError, StopIteration, ValueError):
+                    outdated_title = True
+            if (
+                request.stage == JobStage.summarize
+                and not title_only
+                and existing.status == JobStatus.succeeded
+            ):
+                try:
+                    artifact = next(a for a in existing.artifacts if a["name"] == "result.json")
+                    payload = json.loads(base64.b64decode(artifact["data_base64"]))
+                    outdated_note = (payload.get("coverage") or {}).get(
+                        "note_prompt_version"
+                    ) != NOTE_PROMPT_VERSION
+                except (KeyError, StopIteration, ValueError, AttributeError, TypeError):
+                    outdated_note = True
+            if existing.status != JobStatus.failed and not outdated_title and not outdated_note:
+                return _response(existing)
+            # A failure is not a durable result. Re-run the job on resubmit so
+            # one transient error (an LLM timeout, an OOM) can't poison the
+            # idempotency cache and fail every controller retry instantly.
+            existing.status, existing.progress = JobStatus.queued, 0.0
+            existing.error = None
+            existing.artifacts = []
+            existing.cancel_requested = False
+            existing.started_at = None
+            existing.completed_at = None
+            existing.input_manifest = request.model_dump(mode="json")
+            existing.options = {key: value for key, value in request.options.items()
+                                if key != "_maintenance_deferred"}
+            response = _response(existing)
+            job_id = existing.id
+            background.add_task(execute_job, job_id)
+            return response
+        row = RemoteJob(
+            id=uuid.uuid4().hex,
+            idempotency_key=request.idempotency_key,
+            stage=request.stage,
+            model=request.model,
+            input_manifest=request.model_dump(mode="json"),
+            options={key: value for key, value in request.options.items()
+                     if key != "_maintenance_deferred"},
+        )
+        session.add(row)
+        try:
+            session.flush()
+        except IntegrityError:
+            session.rollback()
+            existing = session.scalar(
+                select(RemoteJob).where(RemoteJob.idempotency_key == request.idempotency_key)
+            )
+            if existing is None:
+                raise
+            return _response(existing)
+        response = _response(row)
+        job_id = row.id
+    background.add_task(execute_job, job_id)
+    return response
+
+
+@router.get("/jobs/{job_id}", response_model=JobResponse, dependencies=[Depends(_authorize)])
+def job_status(job_id: str):
+    with session_scope() as session:
+        # Progress polling must not read/parse the uploaded audio on every
+        # request. Inputs stay durable for recovery, but are not response data.
+        row = session.get(
+            RemoteJob, job_id, options=[defer(RemoteJob.input_manifest, raiseload=True)]
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return _response(row)
+
+
+@router.post(
+    "/jobs/{job_id}/cancel", response_model=CancelResponse, dependencies=[Depends(_authorize)]
+)
+def cancel_job(job_id: str):
+    with session_scope() as session:
+        row = session.get(RemoteJob, job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if row.status in {JobStatus.queued, JobStatus.running}:
+            row.cancel_requested = True
+            if row.status == JobStatus.queued:
+                row.status, row.progress = JobStatus.cancelled, 1.0
+                row.completed_at = datetime.now(UTC)
+                release_job_inputs(row)
+        return CancelResponse(job_id=row.id, status=row.status)
+
+
+@router.get("/jobs/{job_id}/artifacts/{name}", dependencies=[Depends(_authorize)])
+def download_artifact(job_id: str, name: str):
+    with session_scope() as session:
+        row = session.get(
+            RemoteJob, job_id, options=[defer(RemoteJob.input_manifest, raiseload=True)]
+        )
+        artifact = next(
+            (item for item in (row.artifacts if row else []) if item["name"] == name), None
+        )
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        data = base64.b64decode(artifact["data_base64"])
+        return Response(data, media_type=artifact["media_type"])

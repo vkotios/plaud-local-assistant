@@ -1,0 +1,192 @@
+"""Independent discovery and processing loops for the owned background service."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+
+from ..maintenance import MaintenancePaused, get_gate
+from .claims import processing_owner
+
+log = logging.getLogger(__name__)
+
+
+class DaemonJobs:
+    """Independent discovery and bounded, continuously refilled recording slots."""
+
+    def __init__(self, settings, owner: str, scheduler):
+        self.settings = settings
+        self.owner = owner
+        self.scheduler = scheduler
+        self.stopped = threading.Event()
+        self.sync_lock = threading.Lock()
+        self.work_lock = threading.Lock()
+        self.reconcile_lock = threading.Lock()
+        self.workers = max(1, settings.pipeline.concurrency)
+        self.pool = ThreadPoolExecutor(max_workers=self.workers) if self.workers > 1 else None
+        self.inflight = set()
+        self.job_settings = settings.model_copy(deep=True)
+        self.job_settings.pipeline.concurrency = 1
+        self.job_settings.pipeline.files_per_cycle = 1
+
+    def install(self):
+        from ..poller.poll import _DAEMON_HEARTBEAT_INTERVAL_SECONDS
+
+        self.scheduler.add_job(
+            self.heartbeat,
+            "interval",
+            seconds=_DAEMON_HEARTBEAT_INTERVAL_SECONDS,
+            id="daemon-heartbeat",
+            max_instances=1,
+            coalesce=True,
+        )
+        self.scheduler.add_job(
+            self.work,
+            "interval",
+            seconds=min(30, self.settings.poller.interval_seconds),
+            id="worker",
+            max_instances=1,
+            coalesce=True,
+            next_run_time=datetime.now(UTC),
+        )
+        # Startup skips the library-wide note index reconcile so the Web App
+        # comes up quickly; run it now, off the request path, then daily.
+        self.scheduler.add_job(
+            self.reconcile_index,
+            "interval",
+            hours=24,
+            id="index-reconcile",
+            max_instances=1,
+            coalesce=True,
+            next_run_time=datetime.now(UTC),
+        )
+        if self.settings.poller.enabled:
+            self.scheduler.add_job(
+                self.sync,
+                "interval",
+                seconds=self.settings.poller.interval_seconds,
+                id="sync",
+                max_instances=1,
+                coalesce=True,
+                next_run_time=datetime.now(UTC),
+            )
+
+    def reconcile_index(self):
+        from .knowledge_index import reconcile_knowledge_documents
+
+        def reconcile():
+            return reconcile_knowledge_documents(self.settings)
+
+        return self._run(self.reconcile_lock, reconcile)
+
+    def heartbeat(self):
+        from ..poller.poll import refresh_daemon_owner
+
+        if not refresh_daemon_owner(self.owner):
+            self.stopped.set()
+            log.error("Daemon ownership lost; discovery and automatic processing paused")
+
+    def _run(self, lock, operation):
+        if self.stopped.is_set() or not lock.acquire(blocking=False):
+            return None
+        try:
+            if self.stopped.is_set():
+                return None
+            with get_gate().activity(), processing_owner(self.owner):
+                return operation()
+        except MaintenancePaused:
+            return None
+        except Exception:
+            log.exception(
+                "Automatic %s failed; the next scheduled attempt remains enabled",
+                operation.__name__,
+            )
+            return None
+        finally:
+            lock.release()
+
+    def sync(self):
+        from ..poller.poll import poll_once
+
+        if not self.settings.poller.enabled:
+            return None
+
+        def discover():
+            result = poll_once(self.settings)
+            # Wake an idle worker immediately after downloads, even if the next
+            # periodic queue check is not due. A busy worker stays single-flight.
+            if not self.stopped.is_set():
+                self.scheduler.modify_job("worker", next_run_time=datetime.now(UTC))
+            return result
+
+        return self._run(self.sync_lock, discover)
+
+    def request_sync(self):
+        """Run the scheduled poll now (downloads queued uploads, wakes the worker)."""
+        if self.settings.poller.enabled and not self.stopped.is_set():
+            self.scheduler.modify_job("sync", next_run_time=datetime.now(UTC))
+
+    def work(self):
+        from ..cli import process_automatic_pending
+
+        def process():
+            return process_automatic_pending(self.settings, daemon_owner=self.owner)
+
+        if self.pool is None:
+            return self._run(self.work_lock, process)
+        if (self.stopped.is_set() or get_gate().request() is not None
+                or not self.work_lock.acquire(blocking=False)):
+            return None
+        try:
+            self.inflight = {future for future in self.inflight if not future.done()}
+            # Include Web/maintenance claims in the capacity calculation. Futures
+            # without a claim yet also occupy a slot, preventing over-dispatch.
+            available = self.workers - max(len(self.inflight), self.active_recordings())
+            for _ in range(max(0, available)):
+                self.inflight.add(self.pool.submit(self._parallel_cycle))
+            return max(0, available)
+        finally:
+            self.work_lock.release()
+
+    def active_recordings(self):
+        from sqlalchemy import func, select
+
+        from ..db.models import PlaudFile
+        from ..db.session import session_scope
+        from ..db.tenancy import system_scope
+
+        # GPU and model capacity is shared, so count claims in every workspace.
+        with system_scope(), session_scope() as session:
+            return (
+                session.scalar(
+                    select(func.count())
+                    .select_from(PlaudFile)
+                    .where(
+                        PlaudFile.processing_token.is_not(None),
+                        PlaudFile.processing_lease_until > datetime.now(UTC),
+                    )
+                )
+                or 0
+            )
+
+    def _parallel_cycle(self):
+        from ..cli import process_automatic_pending
+
+        if self.stopped.is_set():
+            return
+        try:
+            # Each slot selects one recording afresh. A long-running sibling
+            # never prevents a free slot from taking a newly uploaded recording.
+            with get_gate().activity(), processing_owner(self.owner):
+                process_automatic_pending(self.job_settings, daemon_owner=self.owner)
+        except MaintenancePaused:
+            return None
+        except Exception:
+            log.exception("Automatic processing slot failed; later dispatch remains enabled")
+
+    def shutdown(self):
+        self.stopped.set()
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)

@@ -1,0 +1,586 @@
+"""Editable, versioned note templates and per-recording selection."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy import create_engine, inspect, text
+
+
+def _client(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    import localplaud.db.session as db_session
+    from localplaud.config import get_settings
+
+    monkeypatch.setenv("LOCALPLAUD_STORE__DATABASE_URL", f"sqlite:///{tmp_path / 'notes.db'}")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_Session", None)
+    get_settings(reload=True)
+    from localplaud.api.app import app
+    from localplaud.db.session import init_db
+
+    init_db()
+    return TestClient(app)
+
+
+def test_note_template_migration_is_additive_and_idempotent(tmp_path):
+    from localplaud.db.migrations import migrate_note_template_schema
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE plaud_files (id VARCHAR(64) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE summaries (id INTEGER PRIMARY KEY)"))
+        connection.execute(text("INSERT INTO plaud_files (id) VALUES ('kept')"))
+    assert set(migrate_note_template_schema(engine)) == {
+        "plaud_files.note_template_key",
+        "summaries.template_version",
+        "summaries.template_snapshot",
+    }
+    assert migrate_note_template_schema(engine) == []
+    inspector = inspect(engine)
+    assert "note_template_key" in {
+        column["name"] for column in inspector.get_columns("plaud_files")
+    }
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT id FROM plaud_files")) == "kept"
+
+
+def test_builtin_bootstrap_and_versioned_crud(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    builtins = client.get("/api/note-templates").json()["templates"]
+    assert {row["key"] for row in builtins} == {
+        "plaud-autopilot",
+        "plaud-key-metrics",
+        "plaud-intent-analysis",
+        "plaud-meeting-narrative",
+        "plaud-lecture-deep-dive",
+        "plaud-research-interview",
+        "plaud-interview",
+        "plaud-full-transcript",
+        "plaud-meeting-minutes",
+        "plaud-meeting-highlights",
+    }
+    assert all(row["provenance"] == "plaud-web-readonly" for row in builtins)
+    assert all(row["version"] == 1 for row in builtins)
+    profile_id = client.get("/api/providers/profiles").json()["profiles"][0]["id"]
+
+    created = client.post(
+        "/api/note-templates",
+        json={
+            "key": "research-interview",
+            "name": "Research interview",
+            "system_prompt": "Stay faithful.",
+            "instructions": "# Topic\n\n## Evidence",
+            "execution_profile_id": profile_id,
+        },
+    )
+    assert created.status_code == 201
+    assert client.post("/api/note-templates", json=created.json()).status_code == 409
+
+    sync_calls: list[bool] = []
+    monkeypatch.setattr(
+        "localplaud.worker.knowledge_index.sync_knowledge_documents",
+        lambda _session: sync_calls.append(True),
+    )
+    version = client.put(
+        "/api/note-templates/research-interview",
+        json={
+            "name": "Research interview",
+            "system_prompt": "Stay strictly faithful.",
+            "instructions": "# Topic\n\n## Findings\n\n## Evidence",
+        },
+    )
+    assert version.status_code == 201
+    assert version.json()["version"] == 2
+    assert version.json()["execution_profile_id"] == profile_id
+    assert sync_calls == [True]
+    active = client.get("/api/note-templates").json()["templates"]
+    assert next(row for row in active if row["key"] == "research-interview")["version"] == 2
+    history = client.get("/api/note-templates?include_history=true").json()["templates"]
+    assert [row["version"] for row in history if row["key"] == "research-interview"] == [2, 1]
+    assert client.delete("/api/note-templates/plaud-autopilot").status_code == 409
+
+
+def test_bootstrap_archives_removed_builtin_templates(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import NoteTemplate, PlaudFile
+    from localplaud.db.session import session_scope
+    from localplaud.worker.summary_templates import bootstrap_note_templates
+
+    with session_scope() as session:
+        session.add(
+            NoteTemplate(
+                key="removed-builtin",
+                version=1,
+                name="Removed builtin",
+                system_prompt="",
+                instructions="# Old",
+                is_builtin=True,
+                is_active=True,
+            )
+        )
+        session.add(PlaudFile(id="legacy-template", note_template_key="removed-builtin"))
+
+    with session_scope() as session:
+        bootstrap_note_templates(session)
+
+    templates = client.get("/api/note-templates").json()["templates"]
+    assert "removed-builtin" not in {row["key"] for row in templates}
+    with session_scope() as session:
+        assert session.get(PlaudFile, "legacy-template").note_template_key == "plaud-autopilot"
+
+
+def test_bootstrap_versions_stale_builtin_to_exact_plaud_snapshot(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    from sqlalchemy import select
+
+    from localplaud.db.models import NoteTemplate
+    from localplaud.db.session import session_scope
+    from localplaud.worker.summary_templates import TEMPLATES, bootstrap_note_templates
+
+    with session_scope() as session:
+        current = session.scalar(
+            select(NoteTemplate).where(
+                NoteTemplate.key == "plaud-autopilot",
+                NoteTemplate.is_active.is_(True),
+            )
+        )
+        current.instructions = "locally authored stale substitute"
+
+    with session_scope() as session:
+        bootstrap_note_templates(session)
+
+    history = client.get("/api/note-templates?include_history=true").json()["templates"]
+    autopilot = [row for row in history if row["key"] == "plaud-autopilot"]
+    assert [row["version"] for row in autopilot] == [2, 1]
+    assert autopilot[0]["is_active"] is True
+    assert autopilot[0]["instructions"] == TEMPLATES["plaud-autopilot"].instructions
+    assert autopilot[0]["provenance"] == "plaud-web-readonly"
+    assert autopilot[1]["is_active"] is False
+
+
+def test_catalog_metadata_and_copy_to_my_space(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    meeting = next(
+        row
+        for row in client.get("/api/note-templates").json()["templates"]
+        if row["key"] == "plaud-meeting-minutes"
+    )
+    assert meeting["category"] == "Work"
+    assert meeting["scenario"] == "Meetings"
+    assert meeting["provenance"] == "plaud-web-readonly"
+    copied = client.post(
+        "/api/note-templates/plaud-meeting-minutes/copy",
+        json={"key": "my-meeting", "name": "My meeting"},
+    )
+    assert copied.status_code == 201
+    assert copied.json()["provenance"] == "personal-copy"
+    assert copied.json()["category"] == "Work"
+    assert copied.json()["scenario"] == "Meetings"
+    assert copied.json()["description"] == meeting["description"]
+    assert copied.json()["system_prompt"] == meeting["system_prompt"]
+    assert copied.json()["prompt_mode"] == meeting["prompt_mode"] == "direct"
+    assert (
+        client.post(
+            "/api/note-templates/plaud-meeting-minutes/copy",
+            json={"key": "my-meeting", "name": "Duplicate"},
+        ).status_code
+        == 409
+    )
+
+
+def test_plaud_recent_templates_are_bootstrapped_as_direct_snapshots(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    templates = {row["key"]: row for row in client.get("/api/note-templates").json()["templates"]}
+
+    autopilot = templates["plaud-autopilot"]
+    assert autopilot["name"] == "智能總結"
+    assert autopilot["prompt_mode"] == "direct"
+    assert autopilot["provenance"] == "plaud-web-readonly"
+    assert autopilot["instructions"].startswith("Autopilot\n")
+    assert autopilot["system_prompt"] == ""
+
+    copied = client.post(
+        "/api/note-templates/plaud-autopilot/copy",
+        json={"key": "my-autopilot", "name": "我的智能總結"},
+    )
+    assert copied.status_code == 201
+    assert copied.json()["prompt_mode"] == "direct"
+
+    version = client.put(
+        "/api/note-templates/my-autopilot",
+        json={
+            "name": "我的智能總結",
+            "system_prompt": "",
+            "instructions": autopilot["instructions"],
+        },
+    )
+    assert version.status_code == 201
+    assert version.json()["prompt_mode"] == "direct"
+
+
+def test_templates_workspace_search_and_tabs(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    page = client.get("/templates")
+    assert page.status_code == 200
+    assert "My templates" in page.text and "Discover" in page.text
+    assert 'data-sf-template-create' in page.text
+    assert 'id="template-form"' in page.text
+    explore = client.get("/templates?tab=explore")
+    assert "Add to My templates" in explore.text
+    assert "重構會議為紀要、行動事項與決策" in explore.text
+    education = client.get("/templates?tab=explore&category=Education")
+    assert "深度詳盡的演講細節、引言與概念" in education.text
+    assert "會議紀要" not in education.text
+    searched = client.get("/templates?tab=explore&q=研究訪談")
+    assert "研究訪談" in searched.text and "完整轉錄" not in searched.text
+
+
+def test_template_discovery_metadata_migration(monkeypatch, tmp_path):
+    from localplaud.db.migrations import migrate_note_template_schema
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-template-catalog.db'}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE note_templates (id INTEGER PRIMARY KEY)"))
+    migrated = migrate_note_template_schema(engine)
+    assert set(migrated) == {
+        "note_templates.category",
+        "note_templates.scenario",
+        "note_templates.description",
+        "note_templates.author",
+        "note_templates.provenance",
+        "note_templates.popularity",
+        "note_templates.prompt_mode",
+    }
+    assert migrate_note_template_schema(engine) == []
+
+
+def test_legacy_note_template_schema_is_rebuilt_without_losing_prompts(tmp_path):
+    from sqlalchemy import inspect
+
+    from localplaud.db.migrations import migrate_legacy_note_template_schema
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-note-templates.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """CREATE TABLE note_templates (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR(64) NOT NULL UNIQUE,
+                    system_prompt TEXT NOT NULL,
+                    instructions TEXT NOT NULL,
+                    description TEXT,
+                    category VARCHAR(80),
+                    scenario VARCHAR(80),
+                    author VARCHAR(120),
+                    provenance VARCHAR(32) NOT NULL,
+                    popularity INTEGER,
+                    version INTEGER NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    created_at DATETIME NOT NULL
+                )"""
+            )
+        )
+        connection.execute(
+            text(
+                """INSERT INTO note_templates
+                    (id, name, system_prompt, instructions, provenance, version, enabled, created_at)
+                    VALUES (7, 'Meeting Notes', 'system', 'instructions', 'builtin', 2, 1, CURRENT_TIMESTAMP)"""
+            )
+        )
+
+    assert migrate_legacy_note_template_schema(engine) == ["note_templates"]
+    columns = {item["name"] for item in inspect(engine).get_columns("note_templates")}
+    assert {"key", "is_builtin", "is_active"} <= columns
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT id, key, version, system_prompt, instructions, is_builtin, is_active "
+                "FROM note_templates"
+            )
+        ).one()
+    assert tuple(row) == (7, "meeting-notes", 2, "system", "instructions", 1, 1)
+    assert migrate_legacy_note_template_schema(engine) == []
+
+
+def test_legacy_note_template_migration_preserves_valid_profile(tmp_path):
+    from localplaud.db.migrations import migrate_legacy_note_template_schema
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-note-profile.db'}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE execution_profiles (id INTEGER PRIMARY KEY)"))
+        connection.execute(text("INSERT INTO execution_profiles (id) VALUES (12)"))
+        connection.execute(
+            text("""
+            CREATE TABLE note_templates (
+                id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL,
+                system_prompt TEXT NOT NULL, instructions TEXT NOT NULL,
+                execution_profile_id INTEGER, created_at DATETIME NOT NULL
+            )
+        """)
+        )
+        connection.execute(
+            text("""
+            INSERT INTO note_templates (
+                id, name, system_prompt, instructions, execution_profile_id, created_at
+            ) VALUES (1, 'Custom', 'system', 'instructions', 12, CURRENT_TIMESTAMP)
+        """)
+        )
+
+    assert migrate_legacy_note_template_schema(engine) == ["note_templates"]
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(text("SELECT execution_profile_id FROM note_templates WHERE id = 1"))
+            == 12
+        )
+
+
+def test_legacy_note_template_migration_rejects_unmapped_user_settings(tmp_path):
+    from localplaud.db.migrations import migrate_legacy_note_template_schema
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-note-settings.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text("""
+            CREATE TABLE note_templates (
+                id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL,
+                system_prompt TEXT NOT NULL, instructions TEXT NOT NULL,
+                language VARCHAR(16), execution_profile_id INTEGER,
+                created_at DATETIME NOT NULL
+            )
+        """)
+        )
+        connection.execute(
+            text("""
+            INSERT INTO note_templates (
+                id, name, system_prompt, instructions, language, created_at
+            ) VALUES (1, 'Custom', 'system', 'instructions', 'zh-TW', CURRENT_TIMESTAMP)
+        """)
+        )
+
+    with pytest.raises(RuntimeError, match="cannot preserve.*language"):
+        migrate_legacy_note_template_schema(engine)
+    columns = {item["name"] for item in inspect(engine).get_columns("note_templates")}
+    assert "language" in columns and "key" not in columns
+
+
+def test_recording_selection_marks_notes_stale_and_archive_resets(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import PlaudFile, StageName, StageRun, StageStatus
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(PlaudFile(id="r1", filename="Recording"))
+        session.add(
+            StageRun(
+                file_id="r1",
+                stage=StageName.summarize,
+                status=StageStatus.completed,
+            )
+        )
+    client.post(
+        "/api/note-templates",
+        json={
+            "key": "custom",
+            "name": "Custom",
+            "system_prompt": "Faithful notes only.",
+            "instructions": "# Note\n\n## Details",
+        },
+    )
+    selected = client.put("/api/files/r1/note-template", json={"key": "custom"})
+    assert selected.status_code == 200
+    detail = client.get("/file/r1")
+    assert detail.status_code == 200
+    assert 'id="note-template-select"' in detail.text
+    assert "Custom · v1" in detail.text
+    with session_scope() as session:
+        row = session.get(PlaudFile, "r1")
+        assert row.note_template_key == "custom"
+        run = next(item for item in row.stage_runs if item.stage == StageName.summarize)
+        assert run.status == StageStatus.pending
+        assert run.detail["stale"] is True
+    assert client.delete("/api/note-templates/custom").status_code == 200
+    with session_scope() as session:
+        assert session.get(PlaudFile, "r1").note_template_key is None
+
+
+def test_template_version_and_archive_read_active_row_after_library_fence(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import NoteTemplate
+
+    created = client.post(
+        "/api/note-templates",
+        json={
+            "key": "serialized",
+            "name": "Version one",
+            "system_prompt": "Version one system.",
+            "instructions": "Version one instructions.",
+        },
+    )
+    assert created.status_code == 201
+
+    def advance_to_v2(session):
+        session.query(NoteTemplate).filter(NoteTemplate.key == "serialized").update(
+            {"is_active": False}, synchronize_session="fetch"
+        )
+        session.add(
+            NoteTemplate(
+                key="serialized",
+                version=2,
+                name="Version two",
+                system_prompt="Version two system.",
+                instructions="Version two instructions.",
+                category="Latest category",
+                scenario="Latest scenario",
+                description="Latest description",
+                author="Latest author",
+                provenance="personal",
+                is_builtin=False,
+                is_active=True,
+            )
+        )
+        session.flush()
+
+    monkeypatch.setattr(
+        "localplaud.api.note_templates.lock_library_profile_change",
+        advance_to_v2,
+    )
+    monkeypatch.setattr(
+        "localplaud.worker.knowledge_index.sync_knowledge_documents",
+        lambda _session: [],
+    )
+    version = client.put(
+        "/api/note-templates/serialized",
+        json={
+            "name": "Version three",
+            "system_prompt": "Version three system.",
+            "instructions": "Version three instructions.",
+        },
+    )
+    assert version.status_code == 201
+    assert version.json()["version"] == 3
+    assert version.json()["category"] == "Latest category"
+    assert version.json()["description"] == "Latest description"
+
+    def advance_to_v4(session):
+        session.query(NoteTemplate).filter(NoteTemplate.key == "serialized").update(
+            {"is_active": False}, synchronize_session="fetch"
+        )
+        session.add(
+            NoteTemplate(
+                key="serialized",
+                version=4,
+                name="Version four",
+                system_prompt="Version four system.",
+                instructions="Version four instructions.",
+                is_builtin=False,
+                is_active=True,
+            )
+        )
+        session.flush()
+
+    monkeypatch.setattr(
+        "localplaud.api.note_templates.lock_library_profile_membership_change",
+        advance_to_v4,
+    )
+    archived = client.delete("/api/note-templates/serialized")
+    assert archived.status_code == 200
+    assert not any(
+        row["key"] == "serialized" for row in client.get("/api/note-templates").json()["templates"]
+    )
+
+
+def test_recording_template_change_rejects_active_provider_reservation(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    from localplaud.db.models import PlaudFile, ProviderCostReservation
+    from localplaud.db.session import session_scope
+
+    with session_scope() as session:
+        session.add(PlaudFile(id="reserved", note_template_key="default"))
+        session.add(
+            ProviderCostReservation(
+                id="template-dispatch",
+                scope_key="file:reserved",
+                file_id="reserved",
+                operation="summarize",
+                status="active",
+                lease_until=datetime.now(UTC) + timedelta(minutes=5),
+                profile_fingerprint="f" * 64,
+            )
+        )
+
+    response = client.put("/api/files/reserved/note-template", json={"key": "meeting"})
+
+    assert response.status_code == 409
+    assert "provider request" in response.json()["detail"]
+    with session_scope() as session:
+        assert session.get(PlaudFile, "reserved").note_template_key == "default"
+
+
+def test_settings_renders_template_editor(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    page = client.get("/settings")
+    assert page.status_code == 200
+    assert "Note templates" in page.text
+    assert 'id="note-template-form"' in page.text
+    assert "Default" in page.text
+
+
+def test_summarize_persists_exact_template_snapshot(monkeypatch, tmp_path):
+    _client(monkeypatch, tmp_path)
+    from localplaud.asr.base import Segment, Transcript
+    from localplaud.config import get_settings
+    from localplaud.worker import summarize
+
+    class FakeLlm:
+        def complete(self, *args, **kwargs):
+            return "# Result\n\n## Findings\n- grounded"
+
+    monkeypatch.setattr(summarize, "build_llm", lambda settings: FakeLlm())
+    settings = get_settings().model_copy(deep=True)
+    settings.pipeline.note_quality = "legacy"
+    result = summarize.summarize(
+        Transcript(segments=[Segment(start=0, end=1, text="Evidence")]),
+        settings,
+        template_override={
+            "key": "worker-safe",
+            "version": 3,
+            "name": "Worker safe",
+            "system_prompt": "Do not invent.",
+            "instructions": "# Result\n\n## Findings",
+        },
+    )
+    assert result["template"] == "worker-safe"
+    assert result["template_version"] == 3
+    assert result["template_snapshot"]["system_prompt"] == "Do not invent."
+
+
+def test_template_authorship_is_truthful_without_plaud_branding(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    builtins = client.get("/api/note-templates").json()["templates"]
+    # Bundled prompts are Plaud Web snapshots: provenance stays explicit,
+    # but they are never presented as authored by Plaud itself.
+    assert {row["author"] for row in builtins} == {"Adapted from Plaud"}
+    created = client.post(
+        "/api/note-templates",
+        json={"key": "mine", "name": "Mine", "system_prompt": "", "instructions": "Summary"},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["author"] == "Local workspace"
+    html = client.get("/templates?tab=explore").text
+    assert 'sf-tcard-author">Plaud<' not in html
+    assert 'sf-tcard-author">Adapted from Plaud<' in html
+
+
+def test_rule_sentence_never_shows_raw_template_keys():
+    from localplaud.automations import rule_sentence
+
+    rule = {"trigger": {}, "actions": {"note_template_key": "plaud-research-interview"}}
+    sentence = rule_sentence(rule, names={"template": {}})
+    assert "plaud-research-interview" not in sentence
+    assert "研究訪談" in sentence
+    unknown = rule_sentence({"trigger": {}, "actions": {"note_template_key": "plaud-team-sync"}})
+    assert "plaud-" not in unknown and "Team sync" in unknown

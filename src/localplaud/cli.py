@@ -1,0 +1,942 @@
+"""localplaud command-line interface."""
+
+from __future__ import annotations
+
+import itertools
+import json
+import os
+import sys
+import time
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from .config import get_settings
+from .logging import setup_logging
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Self-hosted Plaud clone — mirror your recordings and process them locally.",
+)
+auth_app = typer.Typer(help="Manage your Plaud session.")
+app.add_typer(auth_app, name="auth")
+console = Console()
+
+
+@app.callback()
+def _main(verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging.")):
+    setup_logging("DEBUG" if verbose else None)
+
+
+# --------------------------------------------------------------------------- #
+# setup
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def init():
+    """Create the local database and data directories."""
+    from .db.session import init_db
+
+    init_db()
+    settings = get_settings()
+    console.print(f"[green]✓[/] Database ready at [bold]{settings.store.database_url}[/]")
+    console.print(f"[green]✓[/] Audio dir: [bold]{settings.poller.download_dir}[/]")
+
+
+@app.command("prepare-independent")
+def prepare_independent(
+    force: bool = typer.Option(
+        False, "--force", help="Re-scan even when the migration marker already exists."
+    ),
+):
+    """Preserve Plaud imports and requeue cloud-derived files for local ASR."""
+    from .db.migrations import prepare_independent_mode
+    from .db.models import Base
+    from .db.session import get_engine
+
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    counts = prepare_independent_mode(engine, force=force)
+    console.print(
+        "[green]✓[/] Independent-mode preparation: "
+        f"[bold]{counts['requeued']}[/] requeued, "
+        f"{counts['summaries']} legacy summaries relabelled, "
+        f"{counts['chunks']} stale chunks removed."
+    )
+
+
+@app.command("acceptance-check")
+def acceptance_check(
+    file_id: str = typer.Argument(help="Recording ID to audit."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+):
+    """Audit one recording against the subscription-independence product gate."""
+    from .acceptance import subscription_independence_report
+    from .db.session import init_db
+
+    init_db()
+    try:
+        report = subscription_independence_report(file_id)
+    except LookupError as exc:
+        if json_output:
+            # The --json contract holds even for a missing recording:
+            # machine-readable stdout, never human prose.
+            typer.echo(
+                json.dumps(
+                    {
+                        "schema": "localplaud-subscription-independence/v1",
+                        "file_id": file_id,
+                        "passed": False,
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    if json_output:
+        # Plain stdout, never Rich: automation parses this even when the
+        # environment forces color (FORCE_COLOR would inject ANSI codes).
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        table = Table(title=f"Subscription independence · {file_id}")
+        table.add_column("Check")
+        table.add_column("Result")
+        table.add_column("Evidence")
+        for item in report["checks"]:
+            table.add_row(
+                item["name"],
+                "[green]PASS[/]" if item["passed"] else "[red]FAIL[/]",
+                item["detail"],
+            )
+        console.print(table)
+        console.print("[green]PASS[/]" if report["passed"] else "[red]FAIL[/]")
+    if not report["passed"]:
+        raise typer.Exit(1)
+
+
+@auth_app.command("check")
+def auth_check():
+    """Verify your Plaud session works (whoami against the configured provider)."""
+    from .plaud import make_plaud_client
+    from .plaud.common import PlaudAuthError
+
+    settings = get_settings()
+    try:
+        with make_plaud_client(settings.plaud) as client:
+            me = client.check_auth()
+        console.print(
+            f"[green]✓[/] Authenticated to Plaud cloud "
+            f"([bold]{settings.plaud.provider}[/] provider)."
+        )
+        data = me.get("data", me) if isinstance(me, dict) else None
+        if isinstance(data, dict):
+            for key in ("id", "email", "nickname"):
+                if data.get(key):
+                    console.print(f"  {key}: [dim]{data[key]}[/]")
+    except PlaudAuthError as exc:
+        console.print(f"[red]✗ Auth failed:[/] {exc}")
+        raise typer.Exit(1) from exc
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]✗ Error:[/] {exc}")
+        raise typer.Exit(1) from exc
+
+
+@auth_app.command("login")
+def auth_login():
+    """Sign in to the official Plaud Open API (one-time browser OAuth).
+
+    Uses native S256 PKCE, opens your browser, and saves an auto-refreshing
+    token set compatible with the official Plaud CLI. No Node.js is required.
+    """
+    settings = get_settings()
+    from .plaud.oauth import OAuthError, native_login
+
+    console.print("Opening Plaud authorization in your browser…")
+    try:
+        tokens_path = native_login(
+            settings.plaud.official,
+            show_manual_url=lambda url: console.print(
+                f"Could not open a browser. Open this URL manually:\n[link={url}]{url}[/link]"
+            ),
+        )
+    except OAuthError as exc:
+        console.print(f"[red]✗ Login failed:[/] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]✓[/] Signed in; tokens saved to [bold]{tokens_path}[/].")
+    auth_check()
+
+
+# --------------------------------------------------------------------------- #
+# sync + processing
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def poll(
+    once: bool = typer.Option(False, "--once", help="Poll a single time and exit."),
+):
+    """Poll the Plaud cloud and download new/updated recordings."""
+    from .poller.poll import poll_once
+
+    settings = get_settings()
+    while True:
+        try:
+            poll_once(settings)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]poll error:[/] {exc}")
+        if once:
+            break
+        time.sleep(settings.poller.interval_seconds)
+
+
+@app.command()
+def work(
+    once: bool = typer.Option(False, "--once", help="Process the backlog once and exit."),
+    force: bool = typer.Option(
+        False, "--force", help="Recompute all stages, ignoring cached artifacts."
+    ),
+):
+    """Run the local pipeline on downloaded recordings."""
+    from .worker.knowledge_index import process_pending_documents
+    from .worker.pipeline import process_pending
+    from .worker.reindex import process_pending_reindexes
+
+    settings = get_settings()
+    while True:
+        try:
+            n = process_pending(settings, force=force)
+            transcript_count = process_pending_reindexes(settings)
+            note_count = process_pending_documents(settings)
+            console.print(
+                f"Processed {n} file(s), reindexed {transcript_count} transcript(s), "
+                f"indexed {note_count} note document(s)."
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]work error:[/] {exc}")
+        if once:
+            break
+        time.sleep(max(30, settings.poller.interval_seconds // 2))
+
+
+@app.command()
+def export(
+    file_id: str = typer.Argument(..., help="Recording id (see `localplaud ls`)."),
+    out: str = typer.Option(
+        None, "--out", "-o", help="Output path (default: alongside the audio)."
+    ),
+):
+    """Export a recording's transcript + summaries to a Markdown file."""
+    from .exporter import export_to_file
+
+    try:
+        path = export_to_file(file_id, out)
+    except ValueError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]✓[/] Exported to [bold]{path}[/]")
+
+
+@app.command()
+def run():
+    """Poll on a schedule, process when enabled, and serve the Web App."""
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    from .ask_threads import recover_ask_request_claims
+    from .db.session import init_db
+    from .maintenance import get_gate
+    from .poller.poll import (
+        register_daemon_owner,
+        release_daemon_owner,
+        reset_inflight,
+    )
+    from .providers.usage import recover_provider_dispatch_reservations
+    from .service_signals import ServiceSignals
+    from .worker.daemon import DaemonJobs
+
+    # Under launchd the log files otherwise fill with thousands of
+    # carriage-returned "Loading weights" progress bars per model load.
+    if not sys.stderr.isatty():
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+    jobs = None
+
+    def stop_dispatch():
+        if jobs is not None:
+            jobs.stopped.set()
+
+    # Keep these handlers installed through owner release, including Uvicorn's
+    # signal replay and repeated supervisor signals while workers are draining.
+    with ServiceSignals(stop_dispatch) as stop:
+        settings = get_settings()
+        # The daemon reconciles the note index off the request path.
+        init_db(reconcile_index=False)
+        if stop.requested:
+            return
+        try:
+            daemon_owner, previous_owner = register_daemon_owner()
+        except RuntimeError as exc:
+            console.print(f"[red]✗[/] {exc}")
+            raise typer.Exit(1) from exc
+        scheduler = None
+        try:
+            from .db.tenancy import system_scope
+
+            with system_scope():
+                reset_inflight(force=True, previous_owner=previous_owner)
+                recover_ask_request_claims(previous_owner)
+                recover_provider_dispatch_reservations(previous_owner)
+            if stop.requested:
+                return
+            scheduler = BackgroundScheduler()
+            jobs = DaemonJobs(settings, daemon_owner, scheduler)
+            maintenance = get_gate()
+            maintenance.start_reporting("main")
+            jobs.install()
+            if stop.requested:
+                return
+            scheduler.start()
+            from .api.app import app as web_app
+
+            web_app.state.daemon_jobs = jobs
+            console.print("[green]✓[/] poller + worker ready; starting web UI…")
+            if not stop.requested:
+                _serve(
+                    settings,
+                    database_initialized=True,
+                    managed_daemon=True,
+                    service_stop=stop,
+                )
+        finally:
+            # Mark the scope first: a first signal during normal cleanup must
+            # not reenter jobs.stopped.set() while its lock is held here.
+            stop.request_stop()
+            stop_dispatch()
+            try:
+                if scheduler is not None and scheduler.running:
+                    scheduler.shutdown(wait=True)
+            finally:
+                try:
+                    if jobs is not None:
+                        jobs.shutdown()
+                finally:
+                    get_gate().wait_for_idle()
+                    release_daemon_owner(daemon_owner)
+                    get_gate().close()
+
+
+def run_processing_cycle(settings, *, daemon_owner: str | None = None) -> int:
+    """Keep downloaded recordings moving even when Plaud synchronization fails."""
+    from .poller.poll import poll_once
+
+    try:
+        poll_once(settings)
+    except Exception as exc:  # noqa: BLE001 - ingestion must not gate local recovery
+        console.print(f"[yellow]sync error:[/] {exc}")
+    return process_automatic_pending(settings, daemon_owner=daemon_owner)
+
+
+_workspace_turn = itertools.count()
+
+
+def process_automatic_pending(settings=None, *, daemon_owner: str | None = None) -> int:
+    """Process each workspace's queue when its durable preference allows it.
+
+    Called without a workspace (the daemon), workspaces take turns starting
+    the batch so one large library cannot starve another. Called inside a
+    workspace scope, only that workspace is processed.
+    """
+    from .db.session import session_scope
+    from .db.tenancy import scope_is_bound, workspace_scope
+    from .workspaces import all_workspace_ids
+
+    settings = settings or get_settings()
+    if scope_is_bound():
+        return _process_workspace_pending(settings, daemon_owner=daemon_owner)
+    with session_scope() as session:
+        workspace_ids = all_workspace_ids(session)
+    if not workspace_ids:
+        return 0
+    start = next(_workspace_turn) % len(workspace_ids)
+    count = 0
+    for workspace_id in workspace_ids[start:] + workspace_ids[:start]:
+        with workspace_scope(workspace_id):
+            count += _process_workspace_pending(settings, daemon_owner=daemon_owner)
+        if count >= settings.pipeline.files_per_cycle:
+            break
+    return count
+
+
+def _process_workspace_pending(settings, *, daemon_owner: str | None = None) -> int:
+    from .db.session import session_scope
+    from .preferences import get_workspace_preferences
+    from .worker.claims import processing_owner
+    from .worker.knowledge_index import process_pending_documents
+    from .worker.pipeline import process_pending
+    from .worker.reindex import process_pending_reindexes
+
+    with session_scope() as session:
+        enabled = get_workspace_preferences(session)["auto_process_new_recordings"]
+    if not enabled:
+        return 0
+    with processing_owner(daemon_owner):
+        count = process_pending(settings, limit=settings.pipeline.files_per_cycle)
+        if settings.pipeline.auto_process_untranscribed_only:
+            # Speaker matching can invalidate a new recording after its main
+            # pipeline finished. Resume that index without draining old backfills
+            # or regenerating notes after a name edit.
+            process_pending_reindexes(
+                settings, limit=settings.pipeline.files_per_cycle, recent_only=True
+            )
+            return count
+        process_pending_reindexes(settings, limit=settings.pipeline.files_per_cycle)
+        process_pending_documents(
+            settings, limit=settings.pipeline.files_per_cycle * 4, reconcile=False
+        )
+    return count
+
+
+# --------------------------------------------------------------------------- #
+# query
+# --------------------------------------------------------------------------- #
+
+
+@app.command("ls")
+def list_files(limit: int = typer.Option(30, help="Max rows.")):
+    """List synced recordings and their local status."""
+    from sqlalchemy import select
+
+    from .db.models import PlaudFile
+    from .db.session import session_scope
+
+    table = Table(title="Recordings")
+    for col in ("id", "filename", "status", "trans", "summary"):
+        table.add_column(col)
+    with session_scope() as session:
+        rows = session.scalars(
+            select(PlaudFile).order_by(PlaudFile.start_time_ms.desc()).limit(limit)
+        )
+        for r in rows:
+            transcript = (
+                r.local_transcript
+                if get_settings().pipeline.artifact_mode == "independent"
+                else r.transcript
+            )
+            table.add_row(
+                r.id[:10],
+                r.display_title[:32],
+                r.status.value,
+                "✓" if transcript else "",
+                "✓" if any(s.source == "local" for s in r.summaries) else "",
+            )
+    console.print(table)
+
+
+@app.command()
+def ask(question: str = typer.Argument(..., help="A question about your recordings.")):
+    """Ask a question across all your transcripts (Q&A)."""
+    from .worker.qa import answer
+
+    res = answer(question)
+    console.print(f"\n[bold]{res['answer']}[/]\n")
+    if res["sources"]:
+        console.print("[dim]Sources:[/]")
+        for s in res["sources"][:5]:
+            console.print(f"  • {s['filename']} [dim](score {s['score']:.2f})[/]")
+
+
+@app.command()
+def status():
+    """Show a count of recordings by local processing status."""
+    from sqlalchemy import func, select
+
+    from .db.models import FileStatus, PlaudFile
+    from .db.session import session_scope
+
+    table = Table(title="Pipeline status")
+    table.add_column("status")
+    table.add_column("count", justify="right")
+    with session_scope() as session:
+        counts = dict(
+            session.execute(select(PlaudFile.status, func.count()).group_by(PlaudFile.status)).all()
+        )
+    for st in FileStatus:
+        table.add_row(st.value, str(counts.get(st, 0)))
+    console.print(table)
+
+
+@app.command()
+def reprocess(
+    file_id: str = typer.Argument(..., help="Recording id to re-run the pipeline on."),
+    force: bool = typer.Option(
+        False,
+        "--force/--resume",
+        help="Resume from existing artifacts (default) or recompute all stages.",
+    ),
+):
+    """Re-run the local pipeline on one recording."""
+    from .db.models import FileStatus, PlaudFile
+    from .db.session import session_scope
+    from .worker.pipeline import process_file, processing_claim_active, reset_pipeline_retry
+
+    with session_scope() as session:
+        r = session.get(PlaudFile, file_id)
+        if r is None:
+            console.print(f"[red]✗[/] no such file: {file_id}")
+            raise typer.Exit(1)
+        if not r.audio_path:
+            console.print(f"[red]✗[/] {file_id} has no downloaded audio")
+            raise typer.Exit(1)
+        if processing_claim_active(r):
+            console.print(f"[yellow]✗[/] {file_id} is already processing")
+            raise typer.Exit(1)
+        r.status = FileStatus.downloaded
+        reset_pipeline_retry(r)
+    process_file(file_id, force=force)
+    console.print(f"[green]✓[/] reprocessed {file_id}")
+
+
+@app.command(name="reprocess-all")
+def reprocess_all(
+    mode: str = typer.Option("resume", "--mode", help="resume | force | derived_only"),
+    status: list[str] = typer.Option(  # noqa: B008
+        None, "--status", help="Only recordings in this status (repeatable)."
+    ),
+    limit: int | None = typer.Option(
+        None, "--limit", help="Cap how many are queued (newest first)."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be queued; change nothing."
+    ),
+):
+    """Queue the whole library for reprocessing; the worker loop drains it.
+
+    ``--mode resume`` reruns only missing/failed stages, ``force`` recomputes
+    everything (including ASR), and ``derived_only`` regenerates just notes, mind
+    maps, and the index — the cheap way to refresh summaries and titles.
+    """
+    from .worker.pipeline import queue_library_reprocess
+
+    try:
+        result = queue_library_reprocess(
+            mode=mode, statuses=status or None, limit=limit, dry_run=dry_run
+        )
+    except ValueError as exc:
+        console.print(f"[red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    prefix = "(dry-run) " if dry_run else ""
+    console.print(
+        f"[green]✓[/] {prefix}mode={result['mode']} queued={result['queued']} "
+        f"skipped={result['skipped']} processing={result['processing']} "
+        f"no_audio={result['no_audio']}"
+    )
+
+
+@app.command(name="backfill-titles")
+def backfill_titles(
+    force: bool = typer.Option(False, "--force", help="Overwrite existing generated titles too."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would change; write nothing."),
+    limit: int | None = typer.Option(
+        None, "--limit", help="Cap the number of recordings changed (newest first)."
+    ),
+):
+    """Fill in locally generated titles from existing AI artifacts.
+
+    Every recording with a local transcript gets a distinct generated-title
+    artifact. A manual rename remains display-preferred and is never changed.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from .db.models import PlaudFile
+    from .db.models import Summary as SummaryRow
+    from .db.session import session_scope
+    from .worker.pipeline import _clean_generated_title, _generated_title_candidate
+
+    default_template = get_settings().pipeline.summary_template
+    changed = skipped = 0
+    with session_scope() as session:
+        rows = session.scalars(
+            select(PlaudFile)
+            .where(PlaudFile.transcripts.any(source="local"))
+            .order_by(PlaudFile.created_at.desc())
+        ).all()
+        for r in rows:
+            if limit is not None and changed >= limit:
+                break
+            # A legacy template label such as ``Autopilot`` is populated but is
+            # not a useful AI title, so include it in the normal (non-force)
+            # repair pass.
+            if _clean_generated_title(r.generated_title) and not force:
+                skipped += 1
+                continue
+            summaries = list(
+                session.scalars(
+                    select(SummaryRow)
+                    .where(SummaryRow.file_id == r.id, SummaryRow.source == "local")
+                    .order_by(SummaryRow.id.desc())
+                )
+            )
+
+            # Prefer the primary note's explicit title, then any explicit title
+            # or H1 (including a mind-map heading), before a prose fallback.
+            def title_quality(item) -> int:
+                if _clean_generated_title(item.title):
+                    return 0
+                if any(
+                    line.strip().startswith("# ") for line in (item.content_md or "").splitlines()
+                ):
+                    return 1
+                return 2
+
+            ranked = sorted(
+                summaries,
+                key=lambda item: (
+                    title_quality(item),
+                    item.template != default_template,
+                    item.template == "mind_map",
+                ),
+            )
+            selected = next(
+                (
+                    (summary, _generated_title_candidate(summary.title, summary.content_md))
+                    for summary in ranked
+                    if _generated_title_candidate(summary.title, summary.content_md)
+                ),
+                None,
+            )
+            summary, title = selected if selected is not None else (None, None)
+            if not title:
+                skipped += 1
+                continue
+            console.print(f"  {r.id[:12]}  {r.display_title!r} → {title!r}")
+            if not dry_run:
+                r.generated_title = title
+                r.generated_title_provider = summary.llm_provider
+                r.generated_title_model = summary.model
+                r.generated_title_at = datetime.now(UTC)
+            changed += 1
+    prefix = "(dry-run) " if dry_run else ""
+    console.print(f"[green]✓[/] {prefix}titles set: {changed}, skipped: {skipped}")
+
+
+@app.command(name="backfill-tags")
+def backfill_tags(
+    force: bool = typer.Option(
+        False, "--force", help="Re-tag even recordings already auto-tagged."
+    ),
+    limit: int | None = typer.Option(
+        None, "--limit", help="Cap recordings processed (newest first)."
+    ),
+):
+    """Auto-tag existing recordings from their summaries (topics/people/orgs).
+
+    Uses the Mac's local LLM to read each recording's default-note summary and
+    attach a few typed tags. Only adds tags (never removes), so manual edits are
+    preserved. Recordings already auto-tagged are skipped unless ``--force``.
+    """
+    from sqlalchemy import select
+
+    from .db.models import PlaudFile
+    from .db.models import Summary as SummaryRow
+    from .db.session import session_scope
+    from .worker.tagging import apply_auto_tags
+
+    settings = get_settings()
+    template = settings.pipeline.summary_template
+    processed = tagged = 0
+    with session_scope() as session:
+        rows = session.scalars(select(PlaudFile).order_by(PlaudFile.created_at.desc())).all()
+        for r in rows:
+            if limit is not None and processed >= limit:
+                break
+            if r.auto_tagged_at is not None and not force:
+                continue
+            summary = session.scalar(
+                select(SummaryRow)
+                .where(
+                    SummaryRow.file_id == r.id,
+                    SummaryRow.template == template,
+                    SummaryRow.source == "local",
+                )
+                .order_by(SummaryRow.id.desc())
+            )
+            if summary is None or not (summary.content_md or "").strip():
+                continue
+            result = apply_auto_tags(session, r.id, summary.content_md, settings, force=force)
+            processed += 1
+            if result.get("applied"):
+                tagged += 1
+                console.print(f"  {r.id[:12]}  +{result['applied']}  {result.get('tags')}")
+    console.print(f"[green]✓[/] processed {processed}, newly tagged {tagged}")
+
+
+@app.command()
+def doctor():
+    """Check the environment: ffmpeg, configured providers, and Plaud auth."""
+    settings = get_settings()
+    table = Table(title="localplaud doctor")
+    table.add_column("check")
+    table.add_column("result")
+
+    def row(name: str, ok: bool, detail: str = ""):
+        mark = "[green]✓[/]" if ok else "[red]✗[/]"
+        table.add_row(name, f"{mark} {detail}".strip())
+
+    from .worker.convert import ffmpeg_available
+
+    row(
+        "ffmpeg",
+        ffmpeg_available(),
+        "on PATH" if ffmpeg_available() else "missing (needed to transcode)",
+    )
+
+    from .worker.diarize import health as diarization_health
+
+    diarize_ok, diarize_detail = diarization_health(settings.diarize)
+    row(f"diarization:{settings.diarize.provider}", diarize_ok, diarize_detail)
+
+    try:
+        from .asr.registry import build_provider
+
+        p = build_provider(settings.asr.provider, settings.asr)
+        health = getattr(p, "health", None)
+        if callable(health):
+            ok, detail = health()
+            row(f"asr:{settings.asr.provider}", ok, detail)
+        else:
+            row(f"asr:{settings.asr.provider}", p.available())
+    except Exception as exc:  # noqa: BLE001
+        row(f"asr:{settings.asr.provider}", False, str(exc)[:60])
+
+    try:
+        from .llm.base import build_llm
+
+        provider = build_llm(settings.llm)
+        health = getattr(provider, "health", None)
+        if callable(health):
+            ok, detail = health()
+            row(f"llm:{settings.llm.provider}", ok, detail)
+        else:
+            row(f"llm:{settings.llm.provider}", provider.available())
+    except Exception as exc:  # noqa: BLE001
+        row(f"llm:{settings.llm.provider}", False, str(exc)[:60])
+
+    if settings.pipeline.polish:
+        try:
+            from .llm.opencode_go import OpenCodeGoLLM
+
+            ok, detail = OpenCodeGoLLM(settings.llm.opencode_go).health()
+            row("correct:opencode-go", ok, detail)
+        except Exception as exc:  # noqa: BLE001
+            row("correct:opencode-go", False, str(exc)[:60])
+
+    try:
+        from .embeddings.base import build_embedder
+
+        provider = build_embedder(settings.embeddings)
+        health = getattr(provider, "health", None)
+        if callable(health):
+            ok, detail = health()
+            row(f"embeddings:{settings.embeddings.provider}", ok, detail)
+        else:
+            row(f"embeddings:{settings.embeddings.provider}", provider.available())
+    except Exception as exc:  # noqa: BLE001
+        row(f"embeddings:{settings.embeddings.provider}", False, str(exc)[:60])
+
+    if settings.plaud.provider == "official":
+        from .plaud.oauth import OfficialTokenStore
+
+        st = OfficialTokenStore(
+            settings.plaud.official.tokens_path, settings.plaud.official.refresh_url
+        ).status()
+        row(
+            "plaud auth (official)",
+            st["ok"],
+            st["detail"] if st["ok"] else "run `localplaud auth login`",
+        )
+    elif settings.plaud.provider == "mcp":
+        try:
+            from .plaud import make_plaud_client
+
+            with make_plaud_client(settings.plaud) as client:
+                client.check_auth()
+            row("plaud auth (mcp)", True, "official MCP OAuth and read tool verified")
+        except Exception as exc:  # noqa: BLE001
+            row("plaud auth (mcp)", False, str(exc)[:60])
+
+    console.print(table)
+
+
+@app.command()
+def serve():
+    """Serve the web UI only (no polling)."""
+    _serve(get_settings())
+
+
+def _serve(
+    settings,
+    *,
+    database_initialized: bool = False,
+    managed_daemon: bool = False,
+    service_stop=None,
+):
+    import logging
+
+    import uvicorn
+
+    class _DropHealthzAccessLogs(logging.Filter):
+        """Keep uptime-monitor /healthz probes out of the access log."""
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            message = record.getMessage()
+            return "/healthz" not in message and "/auth/google/callback" not in message
+
+    logging.getLogger("uvicorn.access").addFilter(_DropHealthzAccessLogs())
+
+    target = "localplaud.api.app:app"
+    if database_initialized or managed_daemon:
+        from .api.app import app as web_app
+
+        web_app.state.database_initialized = database_initialized
+        web_app.state.managed_daemon = managed_daemon
+        target = web_app
+    options = dict(host=settings.api.host, port=settings.api.port, log_level="info")
+    if service_stop is None:
+        uvicorn.run(target, **options)
+    else:
+        from contextlib import contextmanager
+
+        class ManagedServer(uvicorn.Server):
+            @contextmanager
+            def capture_signals(self):
+                with super().capture_signals():
+                    # A signal during app/config preparation belongs to the
+                    # outer scope. Transfer it after Uvicorn installs handlers,
+                    # closing the gap before its first signal capture.
+                    if service_stop.requested:
+                        self.should_exit = True
+                    yield
+
+            def handle_exit(self, sig, frame):
+                # Stop new daemon dispatch at first capture, before HTTP drains.
+                service_stop.request_stop()
+                # Managed cleanup stays cooperative on every TERM/INT, even
+                # after a transferred startup stop. Uvicorn's second-INT policy
+                # skips task/lifespan drain; retain its restore/replay instead.
+                self._captured_signals.append(sig)
+                self.should_exit = True
+
+        ManagedServer(uvicorn.Config(target, **options)).run()
+
+
+@app.command("benchmark-speech")
+def benchmark_speech_command(
+    manifest: str = typer.Argument(help="Version-1 JSON manifest of user-owned audio and references."),
+    profile_id: int | None = typer.Option(None, "--profile-id", help="Local execution-profile database ID."),
+    speech_config: str | None = typer.Option(None, "--speech-config", help="JSON ASR/VAD/align/diarize configuration."),
+    output: str | None = typer.Option(None, "--output", help="Save complete JSON report (private)."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of the readable table."),
+):
+    """Evaluate speech locally, without uploading audio or modifying library artifacts."""
+    from pathlib import Path
+
+    from .benchmark_speech import benchmark, configuration
+
+    try:
+        explicit = json.loads(Path(speech_config).read_text()) if speech_config else None
+        settings, alignment, provenance = configuration(
+            get_settings(), profile_id=profile_id, explicit=explicit
+        )
+        report = benchmark(Path(manifest), settings, alignment, provenance)
+    except (ValueError, OSError, KeyError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    serialized = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
+    if output:
+        destination = Path(output)
+        # Reference inputs are never valid report destinations.
+        from .benchmark_speech import load_manifest
+
+        protected = {Path(manifest).resolve()}
+        if speech_config:
+            protected.add(Path(speech_config).resolve())
+        for item in load_manifest(Path(manifest)):
+            protected.add(item["audio"].resolve())
+        original = json.loads(Path(manifest).read_text())
+        for item in original["recordings"]:
+            for key in ("text_file", "rttm"):
+                if key in item["reference"]:
+                    protected.add((Path(manifest).parent / item["reference"][key]).resolve())
+        if destination.resolve() in protected:
+            raise typer.BadParameter("report output must not overwrite audio or reference inputs")
+        destination.write_text(serialized + "\n")
+    if json_output:
+        print(serialized)
+    else:
+        table = Table(title="Local speech benchmark")
+        for column in ("Recording", "CER", "Mixed WER/MER", "DER", "Time MAE (s)", "RTF", "Peak CPU MiB", "Indicators"):
+            table.add_column(column, overflow="fold", min_width=9 if column == "Recording" else None)
+
+        def number(value, percent=False):
+            return "—" if value is None else f"{value * (100 if percent else 1):.3f}" + ("%" if percent else "")
+
+        for row in report["recordings"] + [{"id": "Aggregate", "metrics": report["aggregate"],
+                                            "execution": report["aggregate"], **report["aggregate"]}]:
+            if "error" in row:
+                table.add_row(row["id"], "FAILED", "", "", "", "", "", row["error"])
+                continue
+            metrics = row["metrics"]
+            hallucination = metrics["hallucination"]
+            loops = hallucination.get("recordings_with_loops", len(hallucination.get("repeated_ngram_loops", [])))
+            silence = hallucination.get("recordings_with_non_speech_text", len(hallucination.get("text_in_non_speech") or []))
+            memory = row["execution"].get("peak_memory_bytes")
+            table.add_row(row["id"], number(metrics["cer"]["rate"], True), number(metrics["mer"]["rate"], True),
+                          number((metrics.get("der") or {}).get("rate"), True),
+                          number((metrics.get("timestamps") or {}).get("mean_absolute_seconds")),
+                          number(row.get("real_time_factor")), number(memory / 2**20 if memory is not None else None),
+                          f"loops={loops}, non-speech={silence}")
+        console.print(table)
+    if report["aggregate"]["failed"]:
+        raise typer.Exit(1)
+
+
+@app.command("recover-owner-password")
+def recover_owner_password_command():
+    """Set an existing owner's local password from a private interactive prompt."""
+    from .api.accounts import recover_owner_password
+    from .db.session import init_db
+
+    init_db()
+    password = typer.prompt("New owner password (12–256 characters)", hide_input=True, confirmation_prompt=True)
+    try:
+        recover_owner_password(password)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo("Owner password updated; all previous sessions revoked.")
+
+
+@app.command("recover-account-password")
+def recover_account_password_command(username: str = typer.Argument(...)):
+    """Recover an existing account from a trusted local operator terminal."""
+    from .api.accounts import recover_account_password
+    from .db.session import init_db
+
+    init_db()
+    password = typer.prompt("New password (12–256 characters)", hide_input=True, confirmation_prompt=True)
+    try:
+        recover_account_password(password, username=username)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    typer.echo("Password updated; all previous sessions revoked.")
+
+
+if __name__ == "__main__":
+    app()

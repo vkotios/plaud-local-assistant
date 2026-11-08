@@ -1,0 +1,63 @@
+# localplaud — NVIDIA CUDA image (profile: gpu).
+#
+# Runs local faster-whisper + pyannote diarization on the GPU.
+# Requires the NVIDIA container toolkit on the host
+# (scripts/deploy/bootstrap.sh --gpu sets it up).
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
+
+# Ubuntu 22.04 ships Python 3.10; get 3.12 from the deadsnakes PPA.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev \
+        ffmpeg curl git build-essential \
+        libcudnn8=8.9.7.29-1+cuda12.2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# WhisperX 3.4 pins CTranslate2 4.4, whose CUDA backend still links against
+# cuDNN 8. The CUDA 12.8 base provides cuDNN 9 for PyTorch/pyannote, so keep
+# the versioned cuDNN 8 runtime alongside it for faster-whisper. The SONAMEs
+# differ and both runtimes are intentionally required by this combined image.
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /build
+COPY pyproject.toml ./
+
+# Pin a pyannote 4-compatible CUDA pair before installing localplaud. Without
+# this, pip replaces an older torch with an unrelated latest CUDA wheel. Build
+# a minimal package first so dependency layers remain cached when only app code
+# or documentation changes; the real package is installed without dependency
+# resolution below.
+RUN printf '# localplaud\n' > README.md \
+    && mkdir -p src/localplaud \
+    && touch src/localplaud/__init__.py \
+    && pip install torch==2.8.0 torchaudio==2.8.0 \
+        --index-url https://download.pytorch.org/whl/cu128 \
+    && pip install ".[faster-whisper,forced-align,diarize,vad,cloud,local-llm]" \
+    && pip install torchcodec==0.7 \
+    && rm -rf src
+
+COPY README.md ./
+COPY src ./src
+RUN pip install --no-deps --force-reinstall .
+
+RUN useradd --create-home --uid 1000 localplaud
+WORKDIR /app
+RUN mkdir -p /app/data && chown -R localplaud:localplaud /app
+USER localplaud
+
+VOLUME /app/data
+# The container sits behind Caddy; bind all interfaces inside it.
+ENV LOCALPLAUD_API__HOST=0.0.0.0
+EXPOSE 8080
+
+CMD ["localplaud", "run"]
