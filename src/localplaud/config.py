@@ -90,6 +90,21 @@ class PollerConfig(BaseModel):
     max_concurrent_downloads: int = 2
 
 
+class IngestConfig(BaseModel):
+    """Unified multi-source ingest orchestrator (Phase 3).
+
+    Safe defaults: orchestrator on, dedupe links duplicates, never deletes or
+    overwrites originals. Disable to fall back to poller + upload-only paths.
+    """
+
+    enabled: bool = True
+    # off | link | reject_new — never silent-delete.
+    dedupe_mode: Literal["off", "link", "reject_new"] = "link"
+    hash_on_ingest: bool = True
+    # Reserved hook for acoustic fingerprints; no algorithm ships in Phase 3.
+    fingerprint_hook: bool = False
+
+
 class StoreConfig(BaseModel):
     database_url: str = "sqlite:///./data/localplaud.db"
     # Plaud remains the durable raw-audio source. Once every enabled pipeline
@@ -587,6 +602,7 @@ class Settings(BaseSettings):
 
     plaud: PlaudConfig = Field(default_factory=PlaudConfig)
     poller: PollerConfig = Field(default_factory=PollerConfig)
+    ingest: IngestConfig = Field(default_factory=IngestConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     asr: AsrConfig = Field(default_factory=AsrConfig)

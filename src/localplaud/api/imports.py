@@ -96,6 +96,10 @@ def import_plaud_audio_status(file_id: str) -> dict:
 
 @_upload_router.post("/local/audio", status_code=201)
 def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
+    from ..config import get_settings
+    from ..ingest.hashing import content_sha256_of_path
+    from ..ingest.orchestrator import annotate_existing_file, ingest_upload_file
+
     original_name = Path(file.filename or "audio").name
     extension = Path(original_name).suffix.lower().lstrip(".")
     if extension not in _ALLOWED_EXTENSIONS:
@@ -104,9 +108,11 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
             status_code=415,
             detail="unsupported audio/video format",
         )
+    settings = get_settings()
     file_id = f"local-{uuid4().hex}"
     destination = None
     written = 0
+    probe = _AudioProbe(None, "unavailable")
     try:
         destination = file_dir(file_id) / f"audio.{extension}"
         with destination.open("wb") as output:
@@ -118,12 +124,55 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
         if not written:
             raise HTTPException(status_code=422, detail="audio file is empty")
         probe = _probe_audio(destination)
+        filename = Path(original_name).stem or "Imported audio"
+        if settings.ingest.enabled:
+            # Orchestrator owns row creation + dedupe; drop the staging id dir
+            # only after a successful handoff that copied or linked elsewhere.
+            result = ingest_upload_file(
+                source_path=destination,
+                filename=filename,
+                filesize=written,
+                duration_ms=probe.duration_ms,
+                metadata={
+                    "origin": "local",
+                    "original_filename": original_name,
+                    "media_probe": probe.status,
+                },
+                settings=settings,
+                already_in_library_dir=False,
+            )
+            if result.outcome in {"reused", "linked_duplicate", "rejected_duplicate"}:
+                with suppress(OSError):
+                    destination.unlink(missing_ok=True)
+                    destination.parent.rmdir()
+            elif result.file_id and result.file_id != file_id:
+                # Created under a new id; staging path was copied — clean staging.
+                with suppress(OSError):
+                    if destination.exists():
+                        destination.unlink(missing_ok=True)
+                        destination.parent.rmdir()
+            return {
+                "id": result.file_id,
+                "filename": filename,
+                "filesize": written,
+                "duration_ms": probe.duration_ms,
+                "status": "downloaded",
+                "media_probe": probe.status,
+                "outcome": result.outcome,
+                "duplicate_of": result.duplicate_of,
+                "content_sha256": result.content_sha256,
+                "source_transport": result.source_transport or "upload",
+            }
+
+        digest = (
+            content_sha256_of_path(destination) if settings.ingest.hash_on_ingest else None
+        )
         now = datetime.now(UTC)
         with session_scope() as session:
             session.add(
                 PlaudFile(
                     id=file_id,
-                    filename=Path(original_name).stem or "Imported audio",
+                    filename=filename,
                     fullname=original_name,
                     filesize=written,
                     duration_ms=probe.duration_ms,
@@ -132,12 +181,23 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
                     audio_path=str(destination),
                     downloaded_at=now,
                     origin="local",
+                    source_transport="upload",
+                    content_sha256=digest,
+                    dedupe_status="original",
                     raw={
                         "origin": "local",
                         "original_filename": original_name,
                         "media_probe": probe.status,
                     },
                 )
+            )
+            annotate_existing_file(
+                session,
+                file_id=file_id,
+                transport="upload",
+                provider="local",
+                external_id=None,
+                content_sha256=digest,
             )
     except BaseException:
         if destination is not None:
@@ -154,6 +214,7 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
         "duration_ms": probe.duration_ms,
         "status": "downloaded",
         "media_probe": probe.status,
+        "source_transport": "upload",
     }
 
 

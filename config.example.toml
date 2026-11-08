@@ -35,6 +35,15 @@ include_trash = false
 download_dir = "./data/audio"    # where downloaded .opus files land
 max_concurrent_downloads = 2
 
+# Unified multi-source ingest + library dedupe (Phase 3). Safe defaults:
+# link duplicates; never silent-delete or overwrite originals. Set enabled=false
+# to fall back to poller + upload-only paths.
+[ingest]
+enabled = true
+dedupe_mode = "link"             # off | link | reject_new
+hash_on_ingest = true
+fingerprint_hook = false         # reserved; no acoustic fingerprint ships yet
+
 [store]
 database_url = "sqlite:///./data/localplaud.db"
 # Keep local uploads forever. When enabled, completed Plaud-backed recordings

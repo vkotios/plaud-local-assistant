@@ -146,6 +146,7 @@ def _init_db_locked(engine: Engine, *, reconcile_index: bool = True) -> dict[str
         migrate_generated_title_columns,
         migrate_import_schema,
         migrate_incremental_import_schema,
+        migrate_ingest_dedupe_schema,
         migrate_knowledge_index_schema,
         migrate_legacy_note_template_schema,
         migrate_legacy_provider_profile_schema,
@@ -198,6 +199,7 @@ def _init_db_locked(engine: Engine, *, reconcile_index: bool = True) -> dict[str
     migrate_speech_override_column(engine)
     migrate_import_schema(engine)
     migrate_incremental_import_schema(engine)
+    migrate_ingest_dedupe_schema(engine)
     migrate_knowledge_index_schema(engine)
     migrate_vocabulary_schema(engine)
     migrate_share_link_options_schema(engine)

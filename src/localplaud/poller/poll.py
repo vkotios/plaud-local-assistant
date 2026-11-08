@@ -298,9 +298,27 @@ def sync_file_list(
                             dto, settings, catalog_initialized=catalog_initialized
                         ),
                         origin="plaud",
+                        source_transport="cloud",
+                        dedupe_status="original",
                     )
                     _apply_dto(row, dto)
                     session.add(row)
+                    session.flush()
+                    from ..db.tenancy import (
+                        DEFAULT_WORKSPACE_ID,
+                        current_workspace_id,
+                        plaud_file_id,
+                    )
+                    from ..ingest.orchestrator import annotate_existing_file
+
+                    workspace_id = row.workspace_id or current_workspace_id() or DEFAULT_WORKSPACE_ID
+                    annotate_existing_file(
+                        session,
+                        file_id=dto.id,
+                        transport="cloud",
+                        provider="plaud",
+                        external_id=plaud_file_id(workspace_id, dto.id),
+                    )
                     new_count += 1
                     if overlong:
                         log.info(
@@ -832,6 +850,26 @@ def _download_one(
                 fresh.error = None
             fresh.download_token = None
             fresh.download_lease_until = None
+            # Phase 3 provenance: hash + transport without changing download claims.
+            if fresh.source_transport is None:
+                fresh.source_transport = "cloud"
+            if settings.ingest.hash_on_ingest and not fresh.content_sha256:
+                from ..ingest.hashing import content_sha256_of_path
+
+                fresh.content_sha256 = content_sha256_of_path(final_path)
+            if fresh.dedupe_status is None and fresh.duplicate_of is None:
+                fresh.dedupe_status = "original"
+            from ..db.tenancy import plaud_file_id
+            from ..ingest.orchestrator import annotate_existing_file
+
+            annotate_existing_file(
+                session,
+                file_id=file_id,
+                transport="cloud",
+                provider="plaud",
+                external_id=plaud_file_id(fresh.workspace_id, file_id),
+                content_sha256=fresh.content_sha256,
+            )
         if settings.pipeline.cloud_import_enabled:
             # The official client already fetched (and cached) the detail
             # payload for the presigned URL. Explicit migration mode may retain

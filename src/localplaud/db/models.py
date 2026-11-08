@@ -81,6 +81,8 @@ class WorkspaceOwned:
 # through these, so their extra predicate never needs its own index.
 _INDEXED_WORKSPACE_TABLES = {
     "plaud_files",
+    "recording_external_ids",
+    "ingest_jobs",
     "folders",
     "tags",
     "vocabulary_terms",
@@ -355,6 +357,16 @@ class PlaudFile(WorkspaceOwned, Base):
         DateTime(timezone=True), default=None, index=True
     )
     origin: Mapped[str] = mapped_column(String(32), default="plaud", index=True)
+    # Phase 3 ingest provenance: transport is distinct from legacy origin
+    # (plaud/local). Values: cloud | upload | filesystem | ble.
+    source_transport: Mapped[str | None] = mapped_column(String(32), default=None, index=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), default=None, index=True)
+    # Optional acoustic fingerprint hook; unused until a real backend is wired.
+    audio_fingerprint: Mapped[str | None] = mapped_column(String(128), default=None, index=True)
+    # Soft link to the canonical library row. Never cascades deletes.
+    duplicate_of: Mapped[str | None] = mapped_column(String(64), default=None, index=True)
+    # original | linked_duplicate | rejected_duplicate (informational)
+    dedupe_status: Mapped[str | None] = mapped_column(String(32), default=None)
     folder_id: Mapped[int | None] = mapped_column(
         ForeignKey("folders.id", ondelete="SET NULL"), default=None, index=True
     )
@@ -415,6 +427,11 @@ class PlaudFile(WorkspaceOwned, Base):
     folder: Mapped[Folder | None] = relationship(back_populates="recordings")
     tags: Mapped[list[Tag]] = relationship(
         secondary=recording_tags, back_populates="recordings", order_by="Tag.id"
+    )
+    external_ids: Mapped[list[RecordingExternalId]] = relationship(
+        back_populates="file",
+        cascade="all, delete-orphan",
+        order_by="RecordingExternalId.id",
     )
 
     @property
@@ -1039,6 +1056,59 @@ class ImportRun(WorkspaceOwned, Base):
     summary_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class RecordingExternalId(WorkspaceOwned, Base):
+    """Stable external identity for a library recording across transports.
+
+    Examples: Plaud cloud file id; BLE ``serial:sessionId``; filesystem path key.
+    """
+
+    __tablename__ = "recording_external_ids"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    file_id: Mapped[str] = mapped_column(
+        ForeignKey("plaud_files.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32))  # plaud | local | ble | filesystem
+    transport: Mapped[str] = mapped_column(String(32))  # cloud | upload | filesystem | ble
+    external_id: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    file: Mapped[PlaudFile] = relationship(back_populates="external_ids")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "provider",
+            "transport",
+            "external_id",
+            name="uq_recording_external_identity",
+        ),
+    )
+
+
+class IngestJob(WorkspaceOwned, Base):
+    """Journal entry for orchestrated ingest (resume/retry safety)."""
+
+    __tablename__ = "ingest_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    backend: Mapped[str] = mapped_column(String(32), default="upload")
+    transport: Mapped[str] = mapped_column(String(32), default="upload")
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    outcome: Mapped[str | None] = mapped_column(String(32), default=None)
+    file_id: Mapped[str | None] = mapped_column(String(64), default=None, index=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), default=None, index=True)
+    external_key: Mapped[str | None] = mapped_column(String(320), default=None, index=True)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
     error: Mapped[str | None] = mapped_column(Text, default=None)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
