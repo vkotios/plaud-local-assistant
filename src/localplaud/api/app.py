@@ -91,6 +91,7 @@ from .backups import router as backups_router
 from .completion_feed import PATH as completion_path
 from .completion_feed import router as completion_router
 from .imports import router as imports_router
+from .ingest import router as ingest_router
 from .integrations import router as integrations_router
 from .media import audio_file_response
 from .note_templates import _item as note_template_item
@@ -131,9 +132,11 @@ async def _lifespan(app: FastAPI):
         init_db()
     from ..db.tenancy import system_scope
     from ..imports import recover_interrupted_imports
+    from ..ingest import recover_interrupted_ingest_jobs
 
     with system_scope():
         recover_interrupted_imports()
+        recover_interrupted_ingest_jobs()
     with session_scope() as session:
         auto_process = get_workspace_preferences(session)["auto_process_new_recordings"]
     if (auto_process and not getattr(app.state, "managed_daemon", False)
@@ -164,6 +167,7 @@ app.include_router(note_templates_router)
 app.include_router(notes_router)
 app.include_router(outline_router)
 app.include_router(imports_router)
+app.include_router(ingest_router)
 app.include_router(integrations_router)
 app.include_router(automations_router)
 app.include_router(backups_router)

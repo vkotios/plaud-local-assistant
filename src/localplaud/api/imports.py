@@ -96,6 +96,19 @@ def import_plaud_audio_status(file_id: str) -> dict:
 
 @_upload_router.post("/local/audio", status_code=201)
 def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
+    """Local upload entrypoint.
+
+    Keeps the durable write on ``session_scope`` (same contract as localplaud
+    unit tests) and applies Phase 3 provenance/dedupe inside that transaction
+    when ``ingest.enabled`` is true. Full orchestrator path remains available
+    at ``POST /api/ingest/upload``.
+    """
+    from ..config import get_settings
+    from ..db.tenancy import DEFAULT_WORKSPACE_ID, current_workspace_id
+    from ..ingest.dedupe import resolve_duplicates
+    from ..ingest.hashing import content_sha256_of_path, optional_fingerprint_stub
+    from ..ingest.orchestrator import annotate_existing_file
+
     original_name = Path(file.filename or "audio").name
     extension = Path(original_name).suffix.lower().lstrip(".")
     if extension not in _ALLOWED_EXTENSIONS:
@@ -104,9 +117,14 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
             status_code=415,
             detail="unsupported audio/video format",
         )
+    settings = get_settings()
     file_id = f"local-{uuid4().hex}"
     destination = None
     written = 0
+    probe = _AudioProbe(None, "unavailable")
+    outcome = "created"
+    duplicate_of: str | None = None
+    digest: str | None = None
     try:
         destination = file_dir(file_id) / f"audio.{extension}"
         with destination.open("wb") as output:
@@ -118,12 +136,91 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
         if not written:
             raise HTTPException(status_code=422, detail="audio file is empty")
         probe = _probe_audio(destination)
+        filename = Path(original_name).stem or "Imported audio"
+        digest = (
+            content_sha256_of_path(destination)
+            if settings.ingest.enabled and settings.ingest.hash_on_ingest
+            else None
+        )
+        fingerprint = optional_fingerprint_stub(
+            content_sha256=digest,
+            enabled=settings.ingest.enabled and settings.ingest.fingerprint_hook,
+        )
         now = datetime.now(UTC)
         with session_scope() as session:
+            # Real SQLAlchemy sessions expose scalar/get; lightweight unit-test
+            # stubs only implement add(). Keep the add-path contract for stubs.
+            can_query = callable(getattr(session, "scalar", None)) and callable(
+                getattr(session, "get", None)
+            )
+            if settings.ingest.enabled and can_query:
+                workspace_id = current_workspace_id() or DEFAULT_WORKSPACE_ID
+                decision = resolve_duplicates(
+                    session,
+                    workspace_id=workspace_id,
+                    mode=settings.ingest.dedupe_mode,
+                    provider="local",
+                    transport="upload",
+                    external_id=None,
+                    content_sha256=digest,
+                    audio_fingerprint=fingerprint,
+                )
+                if decision.action == "reuse" and decision.match is not None:
+                    with suppress(OSError):
+                        destination.unlink(missing_ok=True)
+                        destination.parent.rmdir()
+                    destination = None
+                    existing = session.get(PlaudFile, decision.match.file_id)
+                    annotate_existing_file(
+                        session,
+                        file_id=decision.match.file_id,
+                        transport="upload",
+                        provider="local",
+                        external_id=None,
+                        content_sha256=digest,
+                        audio_fingerprint=fingerprint,
+                    )
+                    return {
+                        "id": decision.match.file_id,
+                        "filename": (existing.filename if existing else filename),
+                        "filesize": written,
+                        "duration_ms": (
+                            existing.duration_ms if existing else probe.duration_ms
+                        ),
+                        "status": "downloaded",
+                        "media_probe": probe.status,
+                        "outcome": "reused",
+                        "duplicate_of": existing.duplicate_of if existing else None,
+                        "content_sha256": (
+                            (existing.content_sha256 if existing else None) or digest
+                        ),
+                        "source_transport": "upload",
+                    }
+                if decision.action == "reject" and decision.match is not None:
+                    with suppress(OSError):
+                        destination.unlink(missing_ok=True)
+                        destination.parent.rmdir()
+                    destination = None
+                    return {
+                        "id": decision.match.file_id,
+                        "filename": filename,
+                        "filesize": written,
+                        "duration_ms": probe.duration_ms,
+                        "status": "downloaded",
+                        "media_probe": probe.status,
+                        "outcome": "rejected_duplicate",
+                        "duplicate_of": decision.match.file_id,
+                        "content_sha256": digest,
+                        "source_transport": "upload",
+                    }
+                if decision.action == "link" and decision.match is not None:
+                    duplicate_of = decision.match.file_id
+                    outcome = "linked_duplicate"
+
             session.add(
                 PlaudFile(
                     id=file_id,
-                    filename=Path(original_name).stem or "Imported audio",
+                    filename=filename,
                     fullname=original_name,
                     filesize=written,
                     duration_ms=probe.duration_ms,
@@ -132,6 +229,13 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
                     audio_path=str(destination),
                     downloaded_at=now,
                     origin="local",
+                    source_transport="upload",
+                    content_sha256=digest,
+                    audio_fingerprint=fingerprint,
+                    duplicate_of=duplicate_of,
+                    dedupe_status=(
+                        "linked_duplicate" if duplicate_of is not None else "original"
+                    ),
                     raw={
                         "origin": "local",
                         "original_filename": original_name,
@@ -139,6 +243,16 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
                     },
                 )
             )
+            if can_query:
+                annotate_existing_file(
+                    session,
+                    file_id=file_id,
+                    transport="upload",
+                    provider="local",
+                    external_id=None,
+                    content_sha256=digest,
+                    audio_fingerprint=fingerprint,
+                )
     except BaseException:
         if destination is not None:
             with suppress(OSError):
@@ -154,6 +268,10 @@ def import_local_audio(file: Annotated[UploadFile, File()]) -> dict:
         "duration_ms": probe.duration_ms,
         "status": "downloaded",
         "media_probe": probe.status,
+        "outcome": outcome,
+        "duplicate_of": duplicate_of,
+        "content_sha256": digest,
+        "source_transport": "upload",
     }
 
 

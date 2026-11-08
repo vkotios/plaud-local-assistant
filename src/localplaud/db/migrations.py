@@ -1941,3 +1941,260 @@ def _rebuild_account_roles(connection, accounts) -> None:
         accounts,
         select_columns={"role": "CASE WHEN role = 'owner' THEN 'owner' ELSE 'member' END"},
     )
+
+
+INGEST_DEDUPE_MIGRATION_KEY = "migration.ingest-dedupe.v1"
+
+
+def migrate_ingest_dedupe_schema(engine: Engine) -> list[str]:
+    """Add library dedupe / provenance columns and external-id + ingest-job tables.
+
+    Additive and idempotent. Existing independent-mode artifacts are untouched;
+    only recording-level provenance fields are backfilled where inferable.
+    """
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    migrated: list[str] = []
+
+    with engine.begin() as connection:
+        if "plaud_files" in tables:
+            columns = {item["name"] for item in inspector.get_columns("plaud_files")}
+            for column, type_ in (
+                ("source_transport", String(32)),
+                ("content_sha256", String(64)),
+                ("audio_fingerprint", String(128)),
+                ("duplicate_of", String(64)),
+                ("dedupe_status", String(32)),
+            ):
+                if column not in columns:
+                    rendered = type_.compile(dialect=engine.dialect)
+                    connection.execute(
+                        text(f"ALTER TABLE plaud_files ADD COLUMN {column} {rendered}")
+                    )
+                    migrated.append(f"plaud_files.{column}")
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_plaud_files_source_transport "
+                    "ON plaud_files (source_transport)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_plaud_files_content_sha256 "
+                    "ON plaud_files (content_sha256)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_plaud_files_audio_fingerprint "
+                    "ON plaud_files (audio_fingerprint)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_plaud_files_duplicate_of "
+                    "ON plaud_files (duplicate_of)"
+                )
+            )
+            # Backfill transport from legacy origin without rewriting artifacts.
+            connection.execute(
+                text(
+                    "UPDATE plaud_files SET source_transport = 'cloud' "
+                    "WHERE source_transport IS NULL AND origin = 'plaud'"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE plaud_files SET source_transport = 'upload' "
+                    "WHERE source_transport IS NULL AND origin = 'local'"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE plaud_files SET dedupe_status = 'original' "
+                    "WHERE dedupe_status IS NULL AND duplicate_of IS NULL"
+                )
+            )
+
+        if "recording_external_ids" not in tables:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE recording_external_ids (
+                        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        workspace_id INTEGER NOT NULL DEFAULT 1,
+                        file_id VARCHAR(64) NOT NULL,
+                        provider VARCHAR(32) NOT NULL,
+                        transport VARCHAR(32) NOT NULL,
+                        external_id VARCHAR(256) NOT NULL,
+                        created_at DATETIME,
+                        FOREIGN KEY(file_id) REFERENCES plaud_files (id) ON DELETE CASCADE,
+                        FOREIGN KEY(workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+                        CONSTRAINT uq_recording_external_identity
+                            UNIQUE (workspace_id, provider, transport, external_id)
+                    )
+                    """
+                    if engine.dialect.name == "sqlite"
+                    else """
+                    CREATE TABLE recording_external_ids (
+                        id SERIAL PRIMARY KEY,
+                        workspace_id INTEGER NOT NULL DEFAULT 1
+                            REFERENCES workspaces (id) ON DELETE CASCADE,
+                        file_id VARCHAR(64) NOT NULL
+                            REFERENCES plaud_files (id) ON DELETE CASCADE,
+                        provider VARCHAR(32) NOT NULL,
+                        transport VARCHAR(32) NOT NULL,
+                        external_id VARCHAR(256) NOT NULL,
+                        created_at TIMESTAMP WITH TIME ZONE,
+                        CONSTRAINT uq_recording_external_identity
+                            UNIQUE (workspace_id, provider, transport, external_id)
+                    )
+                    """
+                )
+            )
+            migrated.append("recording_external_ids")
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_recording_external_ids_file_id "
+                "ON recording_external_ids (file_id)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_recording_external_ids_workspace_id "
+                "ON recording_external_ids (workspace_id)"
+            )
+        )
+
+        if "ingest_jobs" not in tables:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE ingest_jobs (
+                        id VARCHAR(36) NOT NULL PRIMARY KEY,
+                        workspace_id INTEGER NOT NULL DEFAULT 1,
+                        backend VARCHAR(32) NOT NULL,
+                        transport VARCHAR(32) NOT NULL,
+                        status VARCHAR(20) NOT NULL,
+                        outcome VARCHAR(32),
+                        file_id VARCHAR(64),
+                        content_sha256 VARCHAR(64),
+                        external_key VARCHAR(320),
+                        detail JSON,
+                        error TEXT,
+                        started_at DATETIME,
+                        completed_at DATETIME,
+                        created_at DATETIME,
+                        updated_at DATETIME,
+                        FOREIGN KEY(workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE
+                    )
+                    """
+                    if engine.dialect.name == "sqlite"
+                    else """
+                    CREATE TABLE ingest_jobs (
+                        id VARCHAR(36) NOT NULL PRIMARY KEY,
+                        workspace_id INTEGER NOT NULL DEFAULT 1
+                            REFERENCES workspaces (id) ON DELETE CASCADE,
+                        backend VARCHAR(32) NOT NULL,
+                        transport VARCHAR(32) NOT NULL,
+                        status VARCHAR(20) NOT NULL,
+                        outcome VARCHAR(32),
+                        file_id VARCHAR(64),
+                        content_sha256 VARCHAR(64),
+                        external_key VARCHAR(320),
+                        detail JSONB,
+                        error TEXT,
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        created_at TIMESTAMP WITH TIME ZONE,
+                        updated_at TIMESTAMP WITH TIME ZONE
+                    )
+                    """
+                )
+            )
+            migrated.append("ingest_jobs")
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_ingest_jobs_status ON ingest_jobs (status)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_ingest_jobs_content_sha256 "
+                "ON ingest_jobs (content_sha256)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_ingest_jobs_external_key "
+                "ON ingest_jobs (external_key)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_ingest_jobs_workspace_id "
+                "ON ingest_jobs (workspace_id)"
+            )
+        )
+
+        # Seed Plaud cloud external ids for existing cloud-origin rows (once).
+        if "plaud_files" in tables:
+            kv_exists = "kv" in tables
+            already = False
+            if kv_exists:
+                row = connection.execute(
+                    text("SELECT value FROM kv WHERE key = :key"),
+                    {"key": INGEST_DEDUPE_MIGRATION_KEY},
+                ).first()
+                already = row is not None
+            if not already:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO recording_external_ids
+                            (workspace_id, file_id, provider, transport, external_id, created_at)
+                        SELECT
+                            workspace_id,
+                            id,
+                            'plaud',
+                            'cloud',
+                            id,
+                            CURRENT_TIMESTAMP
+                        FROM plaud_files
+                        WHERE origin = 'plaud'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM recording_external_ids rei
+                            WHERE rei.workspace_id = plaud_files.workspace_id
+                              AND rei.provider = 'plaud'
+                              AND rei.transport = 'cloud'
+                              AND rei.external_id = plaud_files.id
+                          )
+                        """
+                    )
+                )
+                if kv_exists:
+                    kv_columns = {
+                        item["name"] for item in inspector.get_columns("kv")
+                    }
+                    if "updated_at" in kv_columns:
+                        connection.execute(
+                            text(
+                                "INSERT INTO kv (key, value, updated_at) "
+                                "VALUES (:key, :value, CURRENT_TIMESTAMP)"
+                            ),
+                            {
+                                "key": INGEST_DEDUPE_MIGRATION_KEY,
+                                "value": json.dumps({"backfilled": True}),
+                            },
+                        )
+                    else:
+                        connection.execute(
+                            text("INSERT INTO kv (key, value) VALUES (:key, :value)"),
+                            {
+                                "key": INGEST_DEDUPE_MIGRATION_KEY,
+                                "value": json.dumps({"backfilled": True}),
+                            },
+                        )
+                migrated.append("recording_external_ids.plaud_cloud_backfill")
+
+    return migrated

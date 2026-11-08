@@ -4,8 +4,9 @@
 > [ATTRIBUTION.md](ATTRIBUTION.md). Local LLM traffic targets
 > [inference-gateway-manager](https://github.com/vkotios/inference-gateway-manager)
 > (`/v1`, concurrency 1, HTTP 409 busy retry) — [docs/deploy-fedora-igm.md](docs/deploy-fedora-igm.md).
-> Private/RE Plaud APIs and Bluetooth/OpenPlod code are out of scope for this
-> foundation phase.
+> Phase 3 adds unified ingest + library dedupe (link-by-default; BLE stub only) —
+> [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Private/RE Plaud APIs and
+> OpenPlod BLE protocol code remain out of scope until Phase 4.
 
 <p align="center">
   <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">
