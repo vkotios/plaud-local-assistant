@@ -71,4 +71,4 @@ webdataset==1.0.2
 Werkzeug==3.1.9
 whisper_normalizer==0.1.15
 wrapt==2.5.2
-xxhash==3.5.0
+xxhash==4.0.2
