@@ -1,0 +1,18 @@
+# Example Caddyfile for a Fedora host that runs Plaud-local natively on :8080
+# (uv run localplaud run) while Caddy terminates HTTPS.
+#
+# Usage:
+#   export DOMAIN=plaud.example.com ACME_EMAIL=you@example.com
+#   caddy run --config deploy/caddy/Caddyfile.host-native
+#
+# IGM (inference-gateway-manager) should remain on the host (e.g. :9000) and is
+# reached by localplaud via http://127.0.0.1:9000/v1 — do not put BLE or ROCm
+# engines behind this reverse proxy.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	reverse_proxy 127.0.0.1:8080
+}

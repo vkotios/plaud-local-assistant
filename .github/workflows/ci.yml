@@ -38,3 +38,77 @@ jobs:
       # Extras guidance (AMD/CPU, no CUDA assumption): docs/extras-matrix.md
       - name: Test
         run: uv run --no-sync pytest -q
+
+  # Phase 6 packaging: validate Compose core profile + optional bridge compile.
+  # Bridge compile evidence ≠ Note Pro transfer evidence (docs/ble-host.md).
+  compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare minimal env for smoke
+        run: |
+          cp .env.example .env
+          cp config.example.toml config.toml
+          # Loopback DOMAIN avoids ACME; smoke hits the published app port.
+          # .env must exist before `compose config` because services declare env_file.
+          sed -i 's/^DOMAIN=.*/DOMAIN=localhost/' .env
+          sed -i 's/^ACME_EMAIL=.*/ACME_EMAIL=ci@example.com/' .env
+          # Same operator step as docs/deploy-fedora.md: bind-mount ./data must be
+          # writable by image USER uid 1000 or init_db fails on schema.lock.
+          chmod +x scripts/deploy/prepare-data-dir.sh
+          ./scripts/deploy/prepare-data-dir.sh
+      - name: Validate compose core profile
+        run: |
+          docker compose --profile core config >/tmp/localplaud-core.yml
+          grep -q 'LOCALPLAUD_RUNTIME: docker' /tmp/localplaud-core.yml
+          grep -q 'localplaud-cpu' /tmp/localplaud-core.yml
+      - name: Compose up core (build + health)
+        run: |
+          # Mirrors the documented Fedora Docker path (profile core + smoke-test).
+          docker compose --profile core up -d --build localplaud-cpu
+          # Wait for /healthz on the host-published port
+          for i in $(seq 1 90); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8081/healthz >/dev/null; then
+              echo "healthy after ${i} attempts"
+              break
+            fi
+            sleep 2
+            if [ "$i" -eq 90 ]; then
+              echo "container status:" >&2
+              docker compose --profile core ps -a || true
+              docker compose --profile core logs --no-color localplaud-cpu || true
+              exit 1
+            fi
+          done
+          ./scripts/deploy/smoke-test.sh http://127.0.0.1:8081
+      - name: Doctor refuses BLE inside the core container
+        run: |
+          out="$(docker compose --profile core exec -T \
+            -e LOCALPLAUD_BLE__ENABLED=true \
+            localplaud-cpu localplaud doctor)"
+          echo "$out"
+          echo "$out" | grep -qi 'ble packaging'
+          echo "$out" | grep -qiE 'unsupported|not supported'
+      - name: Tear down
+        if: always()
+        run: docker compose --profile core down -v || true
+
+  plaud-bridge-packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build plaud-bridge when vendored (else skip)
+        run: |
+          # When Phase 4 has not merged the crate, this exits 0 with "skipped".
+          # When the crate is present, install rustup and compile (≠ transfer proof).
+          if [ -f vendor/openplod-ble/plaud-bridge/Cargo.toml ]; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            . "$HOME/.cargo/env"
+          fi
+          ./scripts/packaging/build-plaud-bridge.sh

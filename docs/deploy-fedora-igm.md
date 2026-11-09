@@ -3,10 +3,12 @@
 Primary operator OS for Plaud-local is **Fedora/Linux**. Local text inference
 goes through **inference-gateway-manager (IGM)** as an OpenAI-compatible client.
 Windows 11 is supported in v1 via **WSL2 or Docker**, not as a native first-class
-host.
+host — see [windows.md](windows.md).
 
-This overlay complements upstream [deploy.md](deploy.md). It does **not** replace
-IGM’s own install docs.
+For the clean core install path (native **or** Docker `core`), start with
+[deploy-fedora.md](deploy-fedora.md). Platform overview:
+[platform-matrix.md](platform-matrix.md). This page is the IGM client wiring
+overlay only. It does **not** replace IGM’s own install docs.
 
 ## Architecture (client, not engine manager)
 
@@ -76,18 +78,19 @@ cp .env.example .env                # fill LOCALPLAUD_LLM__AI_GATEWAY__API_KEY
 uv run localplaud run
 ```
 
-Docker remains valid for the **core** app (`docker compose --profile cpu …`).
-Do not assume GPU/ROCm or Bluetooth work inside the default containers.
+Docker remains valid for the **core** app
+(`docker compose --profile core …` — `cpu` is an alias). Do not assume GPU/ROCm
+or Bluetooth work inside the default containers. On AMD Strix Halo, keep ROCm
+engines inside IGM and **do not** use Compose `--profile gpu` (NVIDIA/CUDA).
 
 ## Windows 11 (v1 policy)
 
-- Run the core app under **WSL2 (Fedora/Ubuntu)** or Docker Desktop.
-- Point `base_url` at an IGM instance reachable from that environment
-  (localhost forwarded, or LAN host running IGM on Fedora).
-- Native Windows is **not** promised for v1.
+See [windows.md](windows.md). Short form: WSL2/Docker only; native Win not
+promised; BLE not an acceptance path under WSL.
 
 ## Out of scope here
 
-- Bluetooth / OpenPlod host requirements (Phase 4; see NOTICE).
+- Bluetooth host packaging — [ble-host.md](ble-host.md) (protocol stays Phase 4).
 - Private/RE Plaud API sync clients (permanently rejected).
 - Reimplementing IGM engine management inside this repository.
+- Optional Obsidian export (not confirmed by owner).

@@ -1,10 +1,22 @@
-# localplaud — one compose file, three hardware profiles. Pick ONE per host:
+# localplaud / Plaud-local — one compose file, hardware profiles. Pick ONE app
+# profile per host:
 #
-#   docker compose --profile cpu up -d --build   # CPU box / cloud VM — use a cloud ASR provider
-#   docker compose --profile gpu up -d --build   # NVIDIA host — local faster-whisper on CUDA
+#   docker compose --profile core up -d --build   # RECOMMENDED Fedora/CPU core
+#   docker compose --profile cpu up -d --build    # alias of core (same image)
+#   docker compose --profile gpu up -d --build    # NVIDIA host ONLY — not AMD
 #   docker compose --profile gpu --profile ollama up -d --build
-#                                                # NVIDIA ASR + optional local text generation
-#   docker compose --profile mac up -d --build   # Apple Silicon — see the note below
+#   docker compose --profile mac up -d --build    # Apple Silicon cloud-ASR box
+#
+# AMD Strix Halo / Fedora primary path: use `core` (or native install) and point
+# LLM traffic at inference-gateway-manager (ROCm lives in IGM — do NOT use the
+# CUDA `gpu` profile on AMD-only hosts). See docs/deploy-fedora.md,
+# docs/extras-matrix.md, docs/platform-matrix.md.
+#
+# !!! BLE / Bluetooth Note Pro !!!
+# Default containers do NOT support BLE. There is no BlueZ/D-Bus radio bridge
+# in these images. Enabling LOCALPLAUD_BLE__ENABLED=true here will fail loudly
+# in `localplaud doctor`. Run BLE on the host (docs/ble-host.md). File import
+# and official Open API sync remain the supported in-container ingest paths.
 #
 # Before first start:
 #   cp .env.example .env                 # DOMAIN, ACME_EMAIL, Plaud cookie, API keys
@@ -27,7 +39,11 @@ x-localplaud: &localplaud
   env_file: .env
   environment:
     HF_TOKEN: ${LOCALPLAUD_DIARIZE__HF_TOKEN:-}
+    # Packaging marker: doctor refuses BLE when this is set / detected.
+    LOCALPLAUD_RUNTIME: docker
   volumes:
+    # Host ./data must be writable by uid 1000 (image USER). Run
+    # scripts/deploy/prepare-data-dir.sh before first up — see docs/deploy-fedora.md.
     - ./data:/app/data
     - ./config.toml:/app/config.toml:ro
     - model_cache:/home/localplaud/.cache
@@ -42,15 +58,19 @@ x-localplaud: &localplaud
         - app
 
 services:
+  # `core` is the Plaud-local Fedora/CPU recommended profile; `cpu` is kept as
+  # an upstream-compatible alias for the same slim cloud-oriented image.
   localplaud-cpu:
     <<: *localplaud
-    profiles: ["cpu"]
+    profiles: ["core", "cpu"]
     build:
       context: .
       dockerfile: Dockerfile
       # Slim, cloud-only image: no faster-whisper/torch (pointless on a CPU box
       # and very slow to build on weak ARM). Use cloud ASR/LLM/embeddings —
-      # set the providers + API keys in .env / config.toml.
+      # set the providers + API keys in .env / config.toml. On Fedora+AMD,
+      # prefer native faster-whisper CPU + IGM instead of this slim image's
+      # cloud ASR default — see docs/deploy-fedora.md.
       args:
         EXTRAS: "cloud"
 
@@ -93,7 +113,7 @@ services:
 
   caddy:
     image: caddy:2
-    profiles: ["cpu", "gpu", "mac"]
+    profiles: ["core", "cpu", "gpu", "mac"]
     ports:
       - "80:80"
       - "443:443"

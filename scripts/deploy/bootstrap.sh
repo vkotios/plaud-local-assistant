@@ -10,6 +10,8 @@
 #   scripts/deploy/bootstrap.sh --gpu    # ... plus NVIDIA container toolkit
 #
 # Supported: Debian/Ubuntu (apt), macOS (checks Docker Desktop, prints guidance).
+# Fedora operators: prefer ./scripts/deploy/bootstrap-fedora.sh and
+# docs/deploy-fedora.md (Compose --profile core; no CUDA assumption).
 set -euo pipefail
 
 WANT_GPU=false

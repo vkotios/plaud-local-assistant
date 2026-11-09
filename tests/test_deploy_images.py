@@ -39,3 +39,12 @@ def test_optional_ollama_runtime_is_private_and_persistent():
 def test_cuda_image_installs_selectable_forced_alignment_runtime():
     dockerfile = Path("Dockerfile.cuda").read_text()
     assert "forced-align" in dockerfile
+
+
+def test_runtime_images_include_procps_for_maintenance_ps():
+    """`localplaud run` requires /bin/ps (maintenance.process_birth)."""
+    cpu = Path("Dockerfile").read_text()
+    cuda = Path("Dockerfile.cuda").read_text()
+    assert "procps" in cpu
+    assert "procps" in cuda
+    assert "ffmpeg curl procps" in cpu
