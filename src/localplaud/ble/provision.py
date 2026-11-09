@@ -126,6 +126,12 @@ def _describe_plaud_error(status: int, detail: str) -> str:
 
 def _default_fetcher(url: str, init: dict[str, Any]) -> Mapping[str, Any]:
     headers = dict(init.get("headers") or {})
+    # Cloudflare on platform-*.plaud.ai returns opaque 1010 without a UA.
+    headers.setdefault(
+        "User-Agent",
+        "localplaud-ble/0.1 (+https://github.com/vkotios/plaud-local-assistant)",
+    )
+    headers.setdefault("Accept", "application/json")
     body = init.get("body")
     data = None if body is None else (body if isinstance(body, bytes) else str(body).encode("utf-8"))
     request = Request(url, data=data, headers=headers, method=init.get("method", "POST"))
@@ -137,11 +143,14 @@ def _default_fetcher(url: str, init: dict[str, Any]) -> Mapping[str, Any]:
             return payload
     except HTTPError as exc:
         detail = ""
+        raw = b""
         try:
-            err_body = json.loads(exc.read().decode("utf-8"))
+            raw = exc.read()
+            err_body = json.loads(raw.decode("utf-8"))
             if isinstance(err_body, dict) and isinstance(err_body.get("detail"), str):
                 detail = err_body["detail"]
         except Exception:  # noqa: BLE001
+            # Cloudflare interstitial (e.g. "error code: 1010") — keep empty detail.
             detail = ""
         raise ValueError(_describe_plaud_error(exc.code, detail)) from None
     except URLError as exc:
