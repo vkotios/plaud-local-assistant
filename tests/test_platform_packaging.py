@@ -104,10 +104,13 @@ def test_doctor_reports_runtime_and_ble_packaging(monkeypatch, tmp_path):
 
 
 def test_ble_packaging_status_container_ok_when_disabled(monkeypatch):
+    from localplaud.config import get_settings
     from localplaud.platform_runtime import ble_packaging_status
 
     monkeypatch.setenv("LOCALPLAUD_RUNTIME", "docker")
-    monkeypatch.delenv("LOCALPLAUD_BLE__ENABLED", raising=False)
+    # Explicit false + reload: prior tests may have left settings.ble.enabled=True.
+    monkeypatch.setenv("LOCALPLAUD_BLE__ENABLED", "false")
+    get_settings(reload=True)
     status = ble_packaging_status()
     assert status["ok"] is True
     assert status["in_container"] is True
