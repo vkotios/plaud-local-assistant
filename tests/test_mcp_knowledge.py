@@ -18,7 +18,10 @@ from plaud_local.mcp_knowledge.auth import (
 )
 from plaud_local.mcp_knowledge.server import SERVER_NAME, create_mcp
 from plaud_local.mcp_knowledge.tools import (
+    _MAX_CHARS_CAP,
+    _MIN_CHARS,
     READ_ONLY_TOOL_NAMES,
+    KnowledgeToolError,
     knowledge_ask,
     knowledge_get_notes,
     knowledge_get_provenance,
@@ -29,6 +32,28 @@ from plaud_local.mcp_knowledge.tools import (
     knowledge_list_tags,
     knowledge_search,
 )
+
+_PATH_LEAK_KEYS = frozenset(
+    {
+        "audio_path",
+        "wav_path",
+        "path",
+        "filepath",
+        "file_path",
+        "absolute_path",
+        "local_path",
+    }
+)
+
+
+def _assert_no_path_leakage(payload: object) -> None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            assert key not in _PATH_LEAK_KEYS, f"leaked path key: {key}"
+            _assert_no_path_leakage(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            _assert_no_path_leakage(item)
 
 
 def _fresh_db(monkeypatch, tmp_path, name="knowledge-mcp.db"):
@@ -66,6 +91,8 @@ def _seed_library():
             origin="local",
             source_transport="filesystem",
             content_sha256="abc123",
+            audio_path="/secret/data/local-recording.wav",
+            wav_path="/secret/data/local-recording.wav",
             start_time_ms=1_783_582_737_000,
             folder=folder,
             tags=[tag],
@@ -75,10 +102,28 @@ def _seed_library():
             filename="Plaud interview",
             origin="plaud",
             source_transport="cloud",
+            audio_path="/secret/data/cloud-recording.wav",
             start_time_ms=1_780_990_737_000,
         )
-        session.add_all([local, cloud])
+        trashed = PlaudFile(
+            id="trashed-recording",
+            filename="Gone meeting",
+            local_title="Trashed launch",
+            origin="local",
+            is_trash=True,
+            audio_path="/secret/data/trashed.wav",
+            start_time_ms=1_783_000_000_000,
+        )
+        session.add_all([local, cloud, trashed])
         session.flush()
+        session.add(
+            Summary(
+                file_id=trashed.id,
+                template="meeting",
+                source="local",
+                content_md="Should not appear in MCP list/search/get.",
+            )
+        )
         raw = Transcript(
             file_id=local.id,
             provider="test",
@@ -236,6 +281,98 @@ def test_search_ask_get_against_fixture_library(monkeypatch, tmp_path):
     assert "Grounded answer" in asked["answer"]
     assert asked["cloud_credentials_required"] is False
     assert asked["sources"]
+    assert asked["side_effects"] == ["provider_cost_reservations"]
+
+
+def test_rejects_invalid_and_path_like_file_ids(monkeypatch, tmp_path):
+    _fresh_db(monkeypatch, tmp_path)
+    _seed_library()
+    for bad_id in (
+        "../etc/passwd",
+        "/tmp/audio.wav",
+        "foo/bar",
+        "id with spaces",
+        "a" * 129,
+        "",
+        ".",
+        "..",
+    ):
+        with pytest.raises(KnowledgeToolError, match="valid recording ID"):
+            knowledge_get_recording(bad_id)
+        with pytest.raises(KnowledgeToolError, match="valid recording ID"):
+            knowledge_get_transcript(bad_id)
+        with pytest.raises(KnowledgeToolError, match="valid recording ID"):
+            knowledge_ask("q", file_id=bad_id)
+
+
+def test_pagination_and_max_chars_clamping(monkeypatch, tmp_path):
+    _fresh_db(monkeypatch, tmp_path)
+    _seed_library()
+    from localplaud.db.models import UserNote
+    from localplaud.db.session import session_scope
+
+    long_body = "α" * 5_000
+    with session_scope() as session:
+        session.add(
+            UserNote(
+                file_id="local-recording",
+                title="Long note",
+                content_md=long_body,
+            )
+        )
+
+    under = knowledge_get_notes("local-recording", max_chars=100, offset=0)
+    assert under["max_chars"] == _MIN_CHARS
+    assert len(under["content"]) == _MIN_CHARS
+    assert under["end_of_document"] is False
+    assert under["next_offset"] == _MIN_CHARS
+
+    page2 = knowledge_get_notes(
+        "local-recording", max_chars=_MIN_CHARS, offset=under["next_offset"]
+    )
+    assert page2["offset"] == _MIN_CHARS
+    full = knowledge_get_notes("local-recording", max_chars=_MAX_CHARS_CAP, offset=0)
+    assert full["content"].startswith(under["content"])
+    assert full["content"][under["next_offset"] :].startswith(page2["content"])
+
+    over = knowledge_get_notes("local-recording", max_chars=100_000, offset=0)
+    assert over["max_chars"] == _MAX_CHARS_CAP
+
+    with pytest.raises(KnowledgeToolError, match="offset"):
+        knowledge_get_notes("local-recording", offset=-1)
+    with pytest.raises(KnowledgeToolError, match="offset"):
+        knowledge_get_notes("local-recording", offset=over["total_chars"] + 1)
+
+
+def test_trash_excluded_and_payloads_omit_filesystem_paths(monkeypatch, tmp_path):
+    _fresh_db(monkeypatch, tmp_path)
+    _seed_library()
+
+    listed = knowledge_list_recordings(max_results=50)
+    ids = {row["id"] for row in listed["files"]}
+    assert "trashed-recording" not in ids
+    assert "local-recording" in ids
+
+    search = knowledge_search("Trashed")
+    assert all(hit["file_id"] != "trashed-recording" for hit in search["hits"])
+
+    with pytest.raises(KnowledgeToolError, match="recording not found"):
+        knowledge_get_recording("trashed-recording")
+    with pytest.raises(KnowledgeToolError, match="recording not found"):
+        knowledge_get_notes("trashed-recording")
+    with pytest.raises(KnowledgeToolError, match="recording not found"):
+        knowledge_get_provenance("trashed-recording")
+
+    recording = knowledge_get_recording("local-recording")
+    listed_again = knowledge_list_recordings()
+    folders = knowledge_list_folders()
+    tags = knowledge_list_tags()
+    provenance = knowledge_get_provenance("local-recording")
+    for payload in (recording, listed_again, folders, tags, provenance, search):
+        _assert_no_path_leakage(payload)
+        blob = json.dumps(payload)
+        assert "/secret/data/" not in blob
+        assert "audio_path" not in blob
 
 
 def test_mcp_tool_wrappers_return_json(monkeypatch, tmp_path):

@@ -4,6 +4,14 @@ All notable changes to localplaud are documented here. The project follows
 [Semantic Versioning](https://semver.org/); until 1.0, minor versions may include
 breaking configuration or schema changes, which are called out explicitly.
 
+## [Unreleased]
+
+### Knowledge
+- Product **local knowledge MCP** (`plaud-local-knowledge-mcp` /
+  `python -m plaud_local.mcp_knowledge`): read-only stdio tools for search, Ask,
+  list, transcript/notes, and provenance over the local library. Distinct from
+  the official `@plaud-ai/mcp` cloud ingest client. See [docs/mcp-knowledge.md](docs/mcp-knowledge.md).
+
 ## [0.1.0] - 2026-11-04
 
 First public release. localplaud replaces the Plaud Intelligence workflow after

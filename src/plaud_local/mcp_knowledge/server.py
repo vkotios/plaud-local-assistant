@@ -33,10 +33,12 @@ from .tools import (
 
 SERVER_NAME = "localplaud-knowledge"
 SERVER_INSTRUCTIONS = (
-    "Read-only local knowledge library for localplaud / Plaud-local. "
-    "Search, Ask, list, and fetch transcripts/notes/provenance from the local "
-    "SQLite library. Does not talk to Plaud cloud. Does not ingest recordings. "
-    "Not the official @plaud-ai/mcp cloud ingest server."
+    "Read-only knowledge tools over the localplaud / Plaud-local recording "
+    "library (SQLite + artifacts). Never calls Plaud cloud or @plaud-ai/mcp and "
+    "does not ingest recordings. Ask/semantic search use the app's configured "
+    "embed/Ask profile and may leave the machine if cloud or remote-worker "
+    "inference is opted in. knowledge_ask may write non-destructive "
+    "provider_cost_reservations accounting rows (same as Web Ask)."
 )
 
 
@@ -64,8 +66,10 @@ def create_mcp(*, allow_mutations: bool = False):
         name="knowledge_search",
         description=(
             "Search the local recording library (titles, transcripts, notes). "
-            "Lexical by default; set semantic=true when embeddings are available. "
-            "Never requires Plaud cloud credentials."
+            "Lexical by default; set semantic=true to use the app's configured "
+            "embed profile (may leave the machine if cloud/remote embeddings are "
+            "opted in). Never calls Plaud cloud or @plaud-ai/mcp; never requires "
+            "Plaud OAuth credentials."
         ),
     )
     def tool_search(
@@ -94,8 +98,11 @@ def create_mcp(*, allow_mutations: bool = False):
         name="knowledge_ask",
         description=(
             "Ask a grounded question over the local library (or one recording when "
-            "file_id is set). Uses local embeddings + configured LLM; never calls "
-            "Plaud cloud."
+            "file_id is set). Uses the app's configured embed/Ask profile — may "
+            "leave the machine if cloud or remote-worker inference is opted in. "
+            "Never calls Plaud cloud or @plaud-ai/mcp. Does not mutate library "
+            "content; may write non-destructive provider_cost_reservations "
+            "accounting rows (same as Web Ask)."
         ),
     )
     def tool_ask(question: str, file_id: str | None = None, top_k: int = 6) -> str:
@@ -216,8 +223,12 @@ def create_mcp(*, allow_mutations: bool = False):
             "read-only tools only; mutate tools remain absent.\n"
         )
 
-    # Sanity: registered names must stay within the documented read-only set.
-    _ = READ_ONLY_TOOL_NAMES
+    registered = {tool.name for tool in mcp._tool_manager.list_tools()}
+    if registered != READ_ONLY_TOOL_NAMES:
+        raise RuntimeError(
+            f"localplaud-knowledge tool registry mismatch: got {sorted(registered)}, "
+            f"expected {sorted(READ_ONLY_TOOL_NAMES)}"
+        )
     return mcp
 
 

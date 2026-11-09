@@ -8,8 +8,8 @@
 > [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Phase 5 adds a **local knowledge
 > MCP** (`plaud-local-knowledge-mcp`) over the local library — distinct from the
 > official `@plaud-ai/mcp` cloud ingest client —
-> [docs/mcp-knowledge.md](docs/mcp-knowledge.md). Private/RE Plaud APIs and
-> OpenPlod BLE protocol code remain out of scope on main until Phase 4 merges.
+> [docs/mcp-knowledge.md](docs/mcp-knowledge.md). Private/RE Plaud APIs remain
+> rejected; BLE Note Pro support is a separate experimental track.
 
 <p align="center">
   <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">

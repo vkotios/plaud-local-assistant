@@ -41,7 +41,9 @@ satisfy subscription-independence acceptance. See [plaud-api.md](plaud-api.md).
 
 ## Diagram 2 — Local knowledge MCP (product)
 
-Local library only. No Plaud cloud credentials. Read-only in v1.
+Tools read the **local** library SoR. No Plaud OAuth. Read-only library
+mutations in v1. Ask/semantic search still honor the app's configured inference
+profile (see Safety).
 
 ```text
 ┌────────────────────┐     stdio (default)             ┌──────────────────────────┐
@@ -70,7 +72,7 @@ uv sync --extra mcp
 # Point at your local library DB (same as the app):
 #   LOCALPLAUD_STORE__DATABASE_URL=sqlite:////path/to/localplaud.db
 uv run plaud-local-knowledge-mcp
-# or: python -m plaud_local.mcp_knowledge.server
+# or: python -m plaud_local.mcp_knowledge
 ```
 
 Example Cursor / MCP client config sketch:
@@ -98,8 +100,8 @@ in the knowledge MCP environment.
 
 | Tool | Purpose |
 | --- | --- |
-| `knowledge_search` | Lexical library search; optional `semantic=true` |
-| `knowledge_ask` | Grounded Ask (library or `file_id` scope) |
+| `knowledge_search` | Lexical library search; optional `semantic=true` via configured embed profile |
+| `knowledge_ask` | Grounded Ask (library or `file_id` scope) via configured Ask profile |
 | `knowledge_list_recordings` | Bounded recording metadata |
 | `knowledge_list_folders` | Folders + counts |
 | `knowledge_list_tags` | Tags + counts |
@@ -111,6 +113,9 @@ in the knowledge MCP environment.
 Destructive tools (delete, edit, reprocess, cloud write, device admin) are
 **absent** in v1. `--allow-mutations` is ignored and prints a warning.
 
+`knowledge_ask` does not mutate library content, but may write non-destructive
+`provider_cost_reservations` accounting rows (same path as Web Ask).
+
 ---
 
 ## Safety
@@ -119,8 +124,16 @@ Destructive tools (delete, edit, reprocess, cloud write, device admin) are
 - HTTP + Bearer is **deferred**; `plaud-local-knowledge-mcp --transport http` runs
   an auth-aware stub and exits. When HTTP ships, set
   `LOCALPLAUD_KNOWLEDGE_MCP_TOKEN` and keep auth fail-closed.
-- Responses advertise `cloud_credentials_required: false`.
+  `LOCALPLAUD_KNOWLEDGE_MCP_REQUIRE_AUTH=0` exists for local debugging only and
+  must be treated as **explicitly dangerous** if HTTP transport is ever bound to
+  a network interface.
+- Library data plane is local. Ask / optional semantic search use the app's
+  configured embed/Ask profile and **may leave the machine** if cloud or
+  remote-worker inference is opted in. They never call Plaud cloud or
+  `@plaud-ai/mcp`, and responses set `cloud_credentials_required: false` for
+  Plaud OAuth (not a claim that inference is air-gapped).
 - No raw credential export; no Plaud cloud writes via this server.
+- get/list payloads omit `audio_path` and other raw filesystem paths.
 
 ---
 

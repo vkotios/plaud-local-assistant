@@ -55,6 +55,16 @@ def _file_id(value: str) -> str:
     return value
 
 
+def _require_active_recording(file_id: str) -> str:
+    """Validate file_id and refuse missing or trashed recordings."""
+    file_id = _file_id(file_id)
+    with session_scope() as session:
+        row = session.get(PlaudFile, file_id)
+        if row is None or row.is_trash:
+            raise KnowledgeToolError("recording not found")
+    return file_id
+
+
 def _clamp_max_chars(max_chars: int) -> int:
     return max(_MIN_CHARS, min(int(max_chars), _MAX_CHARS_CAP))
 
@@ -69,6 +79,7 @@ def _paginate(text: str, *, max_chars: int, offset: int) -> dict[str, Any]:
         "next_offset": end if end < len(text) else None,
         "end_of_document": end >= len(text),
         "total_chars": len(text),
+        "max_chars": max_chars,
         "content": text[offset:end],
     }
 
@@ -89,7 +100,7 @@ def _public_source(hit: dict) -> dict:
             "target",
             "artifact_id",
         )
-        if key in hit or hit.get(key) is not None
+        if key in hit
     }
 
 
@@ -154,12 +165,17 @@ def knowledge_ask(
     file_id: str | None = None,
     top_k: int = 6,
 ) -> dict[str, Any]:
-    """Grounded Ask over one recording or the whole library."""
+    """Grounded Ask over one recording or the whole library.
+
+    Uses the app's configured embed/Ask profile (may egress if cloud/remote is
+    opted in). Never calls Plaud cloud. May write non-destructive
+    ``provider_cost_reservations`` accounting rows — same as Web Ask.
+    """
     question = (question or "").strip()
     if not question:
         raise KnowledgeToolError("question must not be empty")
     top_k = max(1, min(int(top_k), 12))
-    scoped_id = _file_id(file_id) if file_id else None
+    scoped_id = _require_active_recording(file_id) if file_id is not None else None
     from localplaud.worker.qa import answer
 
     result = answer(question, top_k=top_k, file_id=scoped_id)
@@ -175,6 +191,7 @@ def knowledge_ask(
             "profile": provenance.get("profile"),
         },
         "cloud_credentials_required": False,
+        "side_effects": ["provider_cost_reservations"],
     }
 
 
@@ -287,11 +304,10 @@ def knowledge_list_tags() -> dict[str, Any]:
 
 def knowledge_get_recording(file_id: str) -> dict[str, Any]:
     """Return one recording's library metadata plus ingest provenance."""
-    file_id = _file_id(file_id)
+    file_id = _require_active_recording(file_id)
     with session_scope() as session:
         row = session.get(PlaudFile, file_id)
-        if row is None or row.is_trash:
-            raise KnowledgeToolError("recording not found")
+        assert row is not None  # validated above
         tag_names = [tag.name for tag in row.tags]
         folder_name = row.folder.name if row.folder is not None else None
         meta = {
@@ -337,7 +353,7 @@ def knowledge_get_transcript(
     timestamps: bool = True,
     speakers: bool = True,
 ) -> dict[str, Any]:
-    file_id = _file_id(file_id)
+    file_id = _require_active_recording(file_id)
     try:
         payload, _media = render_transcript(
             file_id, "txt", timestamps=timestamps, speakers=speakers
@@ -360,7 +376,7 @@ def knowledge_get_notes(
     max_chars: int = 16_000,
     offset: int = 0,
 ) -> dict[str, Any]:
-    file_id = _file_id(file_id)
+    file_id = _require_active_recording(file_id)
     try:
         payload, _media = render_notes(file_id, "md")
     except MissingExportContentError as exc:
@@ -377,7 +393,7 @@ def knowledge_get_notes(
 
 def knowledge_get_provenance(file_id: str) -> dict[str, Any]:
     """Combine ingest transport provenance with canonical transcript lineage."""
-    file_id = _file_id(file_id)
+    file_id = _require_active_recording(file_id)
     ingest = provenance_for_file(file_id)
     if ingest is None:
         raise KnowledgeToolError("recording not found")
