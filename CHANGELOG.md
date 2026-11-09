@@ -6,6 +6,16 @@ breaking configuration or schema changes, which are called out explicitly.
 
 ## [Unreleased]
 
+### Packaging
+- Phase 6 platform packaging: published [platform matrix](docs/platform-matrix.md),
+  Fedora core install ([deploy-fedora.md](docs/deploy-fedora.md)), Windows 11
+  WSL2/Docker policy ([windows.md](docs/windows.md)), and BLE **host**
+  requirements ([ble-host.md](docs/ble-host.md)). Compose adds a `core` profile
+  (alias of `cpu`), sets `LOCALPLAUD_RUNTIME=docker`, and documents that BLE is
+  unsupported in default containers; `localplaud doctor` fails loudly if BLE is
+  enabled there. AMD Strix Halo operators are pointed at IGM/ROCm, not the CUDA
+  `gpu` profile. Optional Obsidian export remains out of scope.
+
 ### Knowledge
 - Product **local knowledge MCP** (`plaud-local-knowledge-mcp` /
   `python -m plaud_local.mcp_knowledge`): read-only stdio tools for search, Ask,

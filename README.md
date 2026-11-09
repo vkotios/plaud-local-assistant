@@ -8,8 +8,12 @@
 > [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Phase 5 adds a **local knowledge
 > MCP** (`plaud-local-knowledge-mcp`) over the local library — distinct from the
 > official `@plaud-ai/mcp` cloud ingest client —
-> [docs/mcp-knowledge.md](docs/mcp-knowledge.md). Private/RE Plaud APIs remain
-> rejected; BLE Note Pro support is a separate experimental track.
+> [docs/mcp-knowledge.md](docs/mcp-knowledge.md). Phase 6 publishes the
+> [platform matrix](docs/platform-matrix.md) and Fedora/Windows/Docker packaging
+> ([deploy-fedora.md](docs/deploy-fedora.md), [windows.md](docs/windows.md),
+> [ble-host.md](docs/ble-host.md)): Compose `core` profile, BLE unsupported in
+> default containers, AMD/IGM not CUDA. Private/RE Plaud APIs remain rejected;
+> BLE Note Pro protocol remains a separate experimental track (PR #6).
 
 <p align="center">
   <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">
@@ -181,7 +185,7 @@ end; full Plaud parity and broader language/hardware benchmarks are in progress.
 
 | Topic | Read |
 | --- | --- |
-| Install and operate | [Deployment](docs/deploy.md) · [Accounts](docs/accounts.md) · [Backups](docs/backups.md) |
+| Install and operate | [Platform matrix](docs/platform-matrix.md) · [Fedora](docs/deploy-fedora.md) · [Windows](docs/windows.md) · [BLE host](docs/ble-host.md) · [Deployment](docs/deploy.md) · [Accounts](docs/accounts.md) · [Backups](docs/backups.md) |
 | Speech and speakers | [Speech quality](docs/speech-quality.md) · [Remote workers](docs/remote-worker.md) · [Speaker identities](docs/cross-recording-speakers.md) |
 | Notes | [Note quality](docs/note-quality.md) · [Chapter outlines](docs/chapter-outline.md) |
 | Integrations | [Webhooks](docs/webhooks.md) · [Email delivery](docs/email-integrations.md) |

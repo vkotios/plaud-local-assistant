@@ -46,3 +46,12 @@ automatic HTTPS via Let's Encrypt, one domain per host (e.g.
   toil; per-host `public_url` config keeps links correct behind the proxy.
 - CI can build the plain and CUDA images from the same Dockerfile
   (multi-stage / build args), keeping drift between profiles low.
+
+## Plaud-local amendment (Phase 6)
+
+- Add Compose profile **`core`** as an alias of the slim `cpu` service for the
+  Fedora primary path; publish an honest platform matrix (BLE unsupported in
+  default containers; Windows via WSL2/Docker; AMD → IGM/ROCm, not `gpu`).
+- Set `LOCALPLAUD_RUNTIME=docker` so `localplaud doctor` can refuse in-container
+  BLE loudly. Host BLE packaging is documented separately; it is not a compose
+  profile.

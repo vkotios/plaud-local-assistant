@@ -3,6 +3,9 @@
 Plaud-local does **not** assume NVIDIA CUDA. On AMD Strix Halo and other Fedora
 hosts, prefer CPU ASR extras locally and send LLM traffic to
 **inference-gateway-manager** (ROCm/HIP engines live there, not in this repo).
+Do **not** install the `cuda` extra or Compose `--profile gpu` on AMD-only
+machines — that profile is NVIDIA-only. See [platform-matrix.md](platform-matrix.md)
+and [deploy-fedora.md](deploy-fedora.md).
 
 | Extra (`pyproject.toml`) | Purpose | Plaud-local guidance |
 | --- | --- | --- |

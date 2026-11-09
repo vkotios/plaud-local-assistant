@@ -5,16 +5,26 @@ Compose **profiles**. A bundled Caddy reverse proxy terminates HTTPS for your
 domain automatically. See [ADR 0004](adr/0004-deployment-profiles.md) for the
 rationale.
 
-**Plaud-local operators:** for Fedora + inference-gateway-manager (IGM) client
-wiring, AMD/CPU extras, and Windows WSL policy, see
-[deploy-fedora-igm.md](deploy-fedora-igm.md) and [extras-matrix.md](extras-matrix.md).
-Those overlays do not change the upstream Docker profiles below.
+**Plaud-local operators:** start with the published
+[platform matrix](platform-matrix.md), then the clean Fedora path in
+[deploy-fedora.md](deploy-fedora.md). IGM client wiring:
+[deploy-fedora-igm.md](deploy-fedora-igm.md). AMD/CPU extras:
+[extras-matrix.md](extras-matrix.md). Windows 11:
+[windows.md](windows.md). BLE host requirements (not in Docker):
+[ble-host.md](ble-host.md). Those overlays add a `core` Compose profile alias
+and honest BLE/Windows statements; they do not replace the upstream profile
+table below.
 
 | Profile | Hardware                     | ASR                                   |
 | ------- | ---------------------------- | ------------------------------------- |
+| `core`  | Fedora/CPU primary (Plaud-local) | same slim image as `cpu`; prefer host ASR + IGM on AMD |
 | `cpu`   | CPU-only machine             | local turbo where practical; explicit cloud opt-in |
-| `gpu`   | NVIDIA + CUDA                | local Whisper large-v3-turbo           |
+| `gpu`   | NVIDIA + CUDA **only**       | local Whisper large-v3-turbo (not for AMD Strix Halo) |
 | `mac`   | Apple Silicon                | local MLX large-v3-turbo on the host   |
+
+> **BLE:** default containers set `LOCALPLAUD_RUNTIME=docker` and do **not**
+> support Bluetooth Note Pro. `localplaud doctor` fails loudly if BLE is enabled
+> inside a container.
 
 The subscription-independent reference profile uses local Whisper large-v3-turbo plus
 alignment and diarization. A cloud ASR remains possible, but is an explicit cost and

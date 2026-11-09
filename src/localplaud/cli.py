@@ -689,6 +689,7 @@ def doctor():
         mark = "[green]✓[/]" if ok else "[red]✗[/]"
         table.add_row(name, f"{mark} {detail}".strip())
 
+    from .platform_runtime import ble_packaging_status, running_in_container
     from .worker.convert import ffmpeg_available
 
     row(
@@ -696,6 +697,11 @@ def doctor():
         ffmpeg_available(),
         "on PATH" if ffmpeg_available() else "missing (needed to transcode)",
     )
+
+    runtime_label = "docker/container" if running_in_container() else "host/native"
+    row("runtime", True, runtime_label)
+    ble = ble_packaging_status()
+    row("ble packaging", ble["ok"], ble["detail"])
 
     from .worker.diarize import health as diarization_health
 
