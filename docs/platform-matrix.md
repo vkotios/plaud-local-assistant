@@ -32,5 +32,6 @@ executive report — do not inflate “Yes” into verified live BLE download.
 - Compose CI smoke proves **core** container health, not BLE transfer.
 - Building `plaud-bridge` in CI (when the crate is present) is **compile**
   evidence only — it is not Note Pro download acceptance.
-- Live hardware BLE remains **experimental** until an acceptance report lands
-  (prefer macOS for first live radio; Linux/WSL secondary).
+- Live hardware BLE remains **experimental / not GA**. Partner authorize is
+  deferred; Mac scan is proven; cloud Open API is the supported ingest path
+  ([ble.md](ble.md)). Prefer macOS for radio trials; Linux/WSL secondary.

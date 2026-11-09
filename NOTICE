@@ -38,7 +38,10 @@ Not redistributed: Plaud SDK AAR binaries, Plaud trademarks, OpenPlod vault/UI/
 transcription/MCP product surface.
 
 CI ``plaud-bridge`` builds are compile evidence only — not transfer proof.
-Supported recording ingest for now is official Open API cloud poll/download.
+Until hardware acceptance on a declared OS, BLE remains experimental and is
+**not GA**. Partner authorize (``gen-key`` / ``plaud-device.json``) is deferred when
+the Partner SDK blocks provision; official Open API cloud ingest remains the
+supported path. See docs/ble.md and docs/adr/0011-ble-experimental-policy.md.
 
 ---------------------------------------------------------------------------
 Private / reverse-engineered Plaud APIs

@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import tempfile
 import threading
 import uuid
 import zipfile
@@ -301,6 +302,34 @@ def _read_manifest(path) -> dict:
     return value
 
 
+def _seal_verified_archive(handle, expected_sha256: str) -> Path:
+    """Copy verified archive bytes into a private temp file and re-check the digest.
+
+    Restoring from this sealed copy means later path replacement or in-place writes
+    against the operator-facing archive path cannot change what is extracted. The
+    copy is hashed while streaming so a mid-copy mutation of a shared inode is
+    still rejected when the final digest diverges from the trusted value.
+    """
+    handle.seek(0)
+    fd, name = tempfile.mkstemp(prefix="localplaud-restore-", suffix=".zip")
+    path = Path(name)
+    try:
+        os.fchmod(fd, 0o600)
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "wb") as output:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if digest.hexdigest() != expected_sha256:
+            raise ValueError("backup archive changed during restore")
+        return path
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def restore_workspace_backup(
     archive_path: Path, destination: Path, *, expected_sha256: str
 ) -> dict:
@@ -311,15 +340,26 @@ def restore_workspace_backup(
     """
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
         raise ValueError("backup archive checksum mismatch")
-    # Keep the same open file for verification, manifest, and extraction. Reopening
-    # a pathname after hashing would allow a different, valid ZIP to replace it.
+    # Pin one descriptor for the trusted digest, then seal those bytes into a
+    # private tempfile before reading the manifest or extracting members.
+    # Reopening the operator path after hashing would allow a different ZIP to
+    # replace it; extracting from the original inode alone is also insufficient
+    # on filesystems where same-size in-place rewrites may not advance ctime.
     with archive_path.open("rb") as handle:
         before = os.fstat(handle.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("backup archive must be a regular file")
         if _stream_sha256(handle) != expected_sha256:
             raise ValueError("backup archive checksum mismatch")
-        return _restore_verified_archive(handle, destination, expected_sha256, before)
+        sealed = _seal_verified_archive(handle, expected_sha256)
+    try:
+        with sealed.open("rb") as sealed_handle:
+            sealed_before = os.fstat(sealed_handle.fileno())
+            return _restore_verified_archive(
+                sealed_handle, destination, expected_sha256, sealed_before
+            )
+    finally:
+        sealed.unlink(missing_ok=True)
 
 
 def _restore_verified_archive(handle, destination: Path, expected_sha256: str, before) -> dict:
@@ -403,9 +443,9 @@ def _restore_verified_archive(handle, destination: Path, expected_sha256: str, b
         manifest_path = destination / "manifest.json"
         manifest_path.touch(mode=0o600, exist_ok=False)
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        # A pinned descriptor defeats replacement, but not writes to that inode.
-        # Rehash after all reads and compare metadata across the entire operation,
-        # including ctime so restoring mtime cannot conceal an in-place write.
+        # The sealed tempfile should be immutable for the lifetime of this restore.
+        # Rehash and compare size/mtime/ctime so a compromised temp directory cannot
+        # silently substitute another archive after the seal digest check.
         checksum = _stream_sha256(handle)
         after = os.fstat(handle.fileno())
         if checksum != expected_sha256 or (
