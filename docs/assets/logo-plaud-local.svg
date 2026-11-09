@@ -1,0 +1,9 @@
+<svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Plaud-local">
+  <!-- Fork mark: slate tile + mic; teal accent distinguishes from upstream localplaud -->
+  <rect width="48" height="48" rx="12" fill="#0F172A"/>
+  <rect x="18" y="9" width="12" height="19" rx="6" fill="#F8FAFC"/>
+  <path d="M13.5 22.5a10.5 10.5 0 0 0 21 0" fill="none" stroke="#F8FAFC" stroke-width="3" stroke-linecap="round"/>
+  <path d="M24 33v5" stroke="#F8FAFC" stroke-width="3" stroke-linecap="round"/>
+  <path d="M18.5 38.5h11" stroke="#F8FAFC" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="24" cy="15.5" r="2" fill="#0D9488"/>
+</svg>

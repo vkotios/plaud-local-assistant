@@ -1,7 +1,23 @@
-# localplaud brand assets
+# Brand assets
 
-Original marks for the project (in `src/localplaud/api/static/`), served by the
-app and usable in docs. Not affiliated with Plaud.
+## Plaud-local (this repository)
+
+GitHub README / project-page marks for **Plaud-local**
+(`vkotios/plaud-local-assistant`). Distinct from upstream localplaud branding.
+
+| File | Use |
+| --- | --- |
+| [`docs/assets/wordmark-plaud-local.svg`](assets/wordmark-plaud-local.svg) | README lockup: mark + “Plaud-local” + repo slug |
+| [`docs/assets/logo-plaud-local.svg`](assets/logo-plaud-local.svg) | Square mark (slate tile, teal local node) |
+
+Palette: slate `#0F172A`, teal `#0D9488`, muted `#64748B` — light-background
+safe; no purple-glow treatment. Keep upstream attribution in README text
+([NOTICE](../NOTICE), [ATTRIBUTION.md](../ATTRIBUTION.md)).
+
+## localplaud (in-app / upstream)
+
+Original marks for the localplaud Web App (in `src/localplaud/api/static/`),
+served by the app. Not affiliated with Plaud.
 
 | File | Use |
 | --- | --- |
