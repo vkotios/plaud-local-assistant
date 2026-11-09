@@ -6,9 +6,22 @@ eventually authorize a Note Pro and ingest decoded audio into the Phase 3
 orchestrator. Vault, UI, and transcription stay **localplaud** — the full
 OpenPlod app is **not** installed or merged.
 
-**Status (2026-11):** **experimental and deferred** for live authorize/download.
-Feature flag `[ble] enabled = false` by default. Protocol **20** / Note Pro
-(advertisement projects 881/883) only. No Android.
+**Status (2026-11):** **experimental / not GA**; live authorize/download is
+**deferred**. Feature flag `[ble] enabled = false` by default. Protocol **20** /
+Note Pro (advertisement projects 881/883) only. No Android. Policy:
+[ADR 0011](adr/0011-ble-experimental-policy.md).
+
+### What you can rely on
+
+| Path | Status |
+| --- | --- |
+| Cloud Open API (`localplaud auth login` + poll/download) | **Supported** |
+| Filesystem / Web upload ingest | **Supported** |
+| Mac BLE scan / bridge detection | **Proven** in live trials (experimental) |
+| BLE authorize → `plaud-device.json` (Partner `gen-key` / `sn-sign`) | **Deferred** — Partner SDK returns HTTP 500 for official OAuth tokens; consumer JWTs rejected |
+| Linux full BLE download | **Not verified** |
+| Windows WinRT scan | **Not verified** (bridge may build; detection failed in trials) |
+| BLE inside default Docker images | **Unsupported** (doctor fails if enabled) |
 
 ### Supported recording path right now
 
@@ -20,7 +33,9 @@ uv run localplaud poll --once  # or `localplaud run` / scheduled poll
 ```
 
 Do **not** treat BLE Note Pro radio ingest as a supported product path until
-Partner SDK device authorization works for the account (see below).
+Partner SDK device authorization works for the account (see below). Do **not**
+describe BLE as production-ready, GA, or “authorized device sync.” Compile
+evidence for `plaud-bridge` is **not** transfer acceptance.
 
 Host packaging (BlueZ / Docker refusal / Windows policy): [ble-host.md](ble-host.md).
 
@@ -65,6 +80,8 @@ accepts a mintable token (or an alternate authorize path is documented).
    (or packaging script / `LOCALPLAUD_BLE__BRIDGE_PATH`).
 4. Optionally `[ble] enabled = true`; keep device awake / button-held for ads.
 5. `localplaud ble doctor` then scan / transfer / Phase 3 ingest.
+6. Release notes may then narrow “deferred authorize”; GA still needs a written
+   acceptance matrix.
 
 Partner portal `client_id` / `client_secret` is **not** required by the
 paste-token code path. Whether Plaud accepts a given JWT remains **server-side**.

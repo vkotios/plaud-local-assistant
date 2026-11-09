@@ -283,8 +283,8 @@ def test_restore_maps_relative_and_home_paths_without_live_source_context(
     assert path.read_bytes() == original.read_bytes()
 
 
-@pytest.mark.parametrize("change", ["replace", "inplace"])
-def test_restore_never_accepts_another_valid_zip_after_trusted_hash(monkeypatch, tmp_path, change):
+def test_restore_rejects_inplace_substitution_before_seal(monkeypatch, tmp_path):
+    """In-place inode writes after the trusted hash must fail the seal digest."""
     _database, _media, original = _workspace(monkeypatch, tmp_path)
     first = backups.create_workspace_backup(include_media=True)
     source = backups.workspace_backup_path(first["name"])
@@ -292,34 +292,64 @@ def test_restore_never_accepts_another_valid_zip_after_trusted_hash(monkeypatch,
     second = backups.create_workspace_backup(include_media=True)
     replacement = backups.workspace_backup_path(second["name"])
     stream_sha256 = backups._stream_sha256
-    hashed_fd = None
+    mutated = False
 
-    def hash_then_change(handle):
-        nonlocal hashed_fd
+    def hash_then_inplace(handle):
+        nonlocal mutated
         digest = stream_sha256(handle)
-        if hashed_fd is None:
-            hashed_fd = handle.fileno()
-            if change == "replace":
-                os.replace(replacement, source)
-            else:
-                with source.open("r+b") as output:
-                    output.write(replacement.read_bytes())
-                    output.truncate()
-        else:
-            assert handle.fileno() == hashed_fd
+        if not mutated:
+            mutated = True
+            with source.open("r+b") as output:
+                output.write(replacement.read_bytes())
+                output.truncate()
         return digest
 
-    monkeypatch.setattr(backups, "_stream_sha256", hash_then_change)
-    destination = tmp_path / "refused-race"
+    monkeypatch.setattr(backups, "_stream_sha256", hash_then_inplace)
+    destination = tmp_path / "refused-inplace-seal"
     with pytest.raises(ValueError, match="archive changed during restore"):
         backups.restore_workspace_backup(source, destination, expected_sha256=first["sha256"])
     assert not destination.exists()
 
 
+def test_restore_keeps_trusted_bytes_when_path_is_replaced_after_hash(monkeypatch, tmp_path):
+    """Path replacement after hashing cannot redirect a sealed restore."""
+    _database, _media, original = _workspace(monkeypatch, tmp_path)
+    first = backups.create_workspace_backup(include_media=True)
+    source = backups.workspace_backup_path(first["name"])
+    original.write_bytes(b"different recording fixture")
+    second = backups.create_workspace_backup(include_media=True)
+    replacement = backups.workspace_backup_path(second["name"])
+    stream_sha256 = backups._stream_sha256
+    replaced = False
+
+    def hash_then_replace(handle):
+        nonlocal replaced
+        digest = stream_sha256(handle)
+        if not replaced:
+            replaced = True
+            os.replace(replacement, source)
+        return digest
+
+    monkeypatch.setattr(backups, "_stream_sha256", hash_then_replace)
+    destination = tmp_path / "sealed-after-replace"
+    restored = backups.restore_workspace_backup(
+        source, destination, expected_sha256=first["sha256"]
+    )
+    with closing(sqlite3.connect(restored["database"])) as connection:
+        path = Path(connection.execute("SELECT audio_path FROM plaud_files").fetchone()[0])
+    assert path.read_bytes() == b"fixture audio"
+
+
 @pytest.mark.parametrize("restore_bytes", [False, True])
-def test_restore_rejects_same_size_inplace_writes_even_with_restored_mtime(
+def test_sealed_restore_ignores_later_same_size_source_rewrites(
     monkeypatch, tmp_path, restore_bytes
 ):
+    """After sealing, operator-path rewrites cannot change extracted members.
+
+    Phase 0 relied on ctime advancing for same-size in-place rewrites. Some
+    kernels/filesystems leave ctime unchanged when a rewrite restores the
+    original bytes and mtime; sealing removes that dependency.
+    """
     _workspace(monkeypatch, tmp_path)
     result = backups.create_workspace_backup(include_media=True)
     source = backups.workspace_backup_path(result["name"])
@@ -344,10 +374,12 @@ def test_restore_rejects_same_size_inplace_writes_even_with_restored_mtime(
         return manifest
 
     monkeypatch.setattr(backups, "_read_manifest", read_then_modify)
-    destination = tmp_path / "refused-inplace"
-    with pytest.raises(ValueError, match="archive changed during restore"):
-        backups.restore_workspace_backup(source, destination, expected_sha256=trusted)
-    assert not destination.exists()
+    destination = tmp_path / "sealed-ignores-source-rewrite"
+    restored = backups.restore_workspace_backup(
+        source, destination, expected_sha256=trusted
+    )
+    assert Path(restored["database"]).is_file()
+    assert (Path(restored["media_root"]) / "kept/audio.opus").read_bytes() == b"fixture audio"
 
 
 def test_unreferenced_uploads_and_staging_files_are_excluded_and_archives_are_private(

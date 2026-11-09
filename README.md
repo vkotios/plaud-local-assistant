@@ -13,8 +13,10 @@
 > Phase 6 publishes the [platform matrix](docs/platform-matrix.md) and
 > Fedora/Windows/Docker packaging ([deploy-fedora.md](docs/deploy-fedora.md),
 > [windows.md](docs/windows.md), [ble-host.md](docs/ble-host.md)): Compose `core`
-> profile, BLE unsupported in default containers, AMD/IGM not CUDA. Private/RE
-> Plaud APIs remain rejected.
+> profile, BLE unsupported in default containers, AMD/IGM not CUDA. Phase 7 adds
+> hardening acceptance ([security-checklist.md](docs/security-checklist.md),
+> [UPSTREAM.md](docs/UPSTREAM.md), [performance.md](docs/performance.md)).
+> Private/RE Plaud APIs remain rejected. BLE is **not GA**.
 
 <p align="center">
   <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">

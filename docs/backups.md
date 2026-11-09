@@ -107,11 +107,14 @@ restored = restore_workspace_backup(
 print(restored)  # database and media_root paths for the isolated copy
 ```
 
-The helper pins one archive file descriptor for hashing, manifest reads, and
-extraction. It rechecks the complete digest and file size, mtime, and ctime before
-returning success; replacement or in-place modification cannot substitute another
-archive after the trusted digest check. This adds a second full archive read.
-Any detected change removes the isolated restore.
+The helper pins one archive file descriptor for the trusted digest, then **seals**
+those bytes into a private tempfile before reading the manifest or extracting
+members. Extraction runs only from the sealed copy, so later path replacement or
+in-place rewrites against the operator-facing archive path cannot redirect the
+restore. The seal stream is re-hashed; a mid-copy inode mutation that changes
+bytes is rejected. The sealed tempfile is rechecked (digest plus size/mtime/ctime)
+before success. This adds extra full archive reads. Any detected change removes
+the isolated restore.
 
 The helper verifies the archive digest, inventory, member sizes and checksums,
 database integrity, and complete media-reference mapping. It rejects unsafe member

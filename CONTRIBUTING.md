@@ -73,6 +73,15 @@ content states. See [UI verification](tests/ui/README.md).
 - Treat Plaud product research as read-only. Do not generate, share, edit,
   export, or delete account data as part of an audit without explicit permission.
 
+## Plaud-local upstream discipline
+
+This product tree tracks [localplaud](https://github.com/skyhong2002/localplaud).
+Before bumping the pin or rebasing onto upstream, read
+[docs/UPSTREAM.md](docs/UPSTREAM.md) and [ADR 0009](docs/adr/0009-fork-wrap-boundary.md).
+Do not combine upstream bumps with BLE vendor drops. Keep secrets and recording
+fixtures out of Git. For release/hardening PRs, also use
+[docs/release-checklist.md](docs/release-checklist.md).
+
 ## Open a pull request
 
 Explain the concrete trigger, the behavior before and after, and the checks you

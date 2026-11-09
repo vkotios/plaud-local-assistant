@@ -6,6 +6,17 @@ breaking configuration or schema changes, which are called out explicitly.
 
 ## [Unreleased]
 
+### Hardening
+- Phase 7 hardening and acceptance: sealed backup restore (private tempfile after
+  trusted digest) so path replacement / in-place archive rewrites cannot redirect
+  extraction; security checklist and product [SECURITY.md](SECURITY.md) advisory
+  URL; ADRs for fork/wrap boundary, MCP split, and BLE experimental policy;
+  [upstream rebase notes](docs/UPSTREAM.md); [performance](docs/performance.md)
+  notes for personal-scale libraries; [release checklist](docs/release-checklist.md).
+- BLE release note: **experimental / Partner authorize deferred** — not GA;
+  Mac scan proven; cloud Open API remains the supported ingest path
+  ([docs/ble.md](docs/ble.md)).
+
 ### Packaging
 - Phase 6 platform packaging: published [platform matrix](docs/platform-matrix.md),
   Fedora core install ([deploy-fedora.md](docs/deploy-fedora.md)), Windows 11

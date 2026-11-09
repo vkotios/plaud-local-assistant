@@ -4,9 +4,9 @@ Plaud-local’s Note Pro path is an **isolated experimental adapter** (Phase 4).
 This document covers **host packaging only** — BlueZ, D-Bus, the `plaud-bridge`
 binary, and ffmpeg. Partner provision / protocol / transfer: [ble.md](ble.md).
 
-**Status:** experimental; **live BLE authorize/download is deferred** (Partner
-SDK blocked for the tested account — see [ble.md](ble.md)). Supported recording
-ingest for now is **official Open API** cloud poll/download
+**Status:** experimental / **not GA**. Live BLE authorize/download is
+**deferred** (Partner SDK blocked for the tested account — see [ble.md](ble.md)).
+Supported recording ingest for now is **official Open API** cloud poll/download
 (`localplaud auth login`). Linux full BLE download remains **Not verified**.
 macOS scan/bridge was proven in Phase 4 live tests; default Docker images do
 **not** ship BLE.
