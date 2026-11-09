@@ -32,12 +32,13 @@ COPY src ./src
 RUN pip install --no-deps --force-reinstall .
 
 # --------------------------------------------------------------------------- #
-# Runtime stage: slim image with ffmpeg and the prebuilt venv.
+# Runtime stage: slim image with ffmpeg, procps (/bin/ps), and the prebuilt venv.
+# `localplaud run` calls /bin/ps in maintenance.process_birth; python:*-slim omits it.
 # --------------------------------------------------------------------------- #
 FROM python:3.12-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl \
+    && apt-get install -y --no-install-recommends ffmpeg curl procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/venv /opt/venv

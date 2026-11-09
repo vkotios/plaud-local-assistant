@@ -17,7 +17,7 @@ RUN apt-get update \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3.12-dev \
-        ffmpeg curl git build-essential \
+        ffmpeg curl procps git build-essential \
         libcudnn8=8.9.7.29-1+cuda12.2 \
     && rm -rf /var/lib/apt/lists/*
 

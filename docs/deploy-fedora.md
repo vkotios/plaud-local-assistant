@@ -56,6 +56,7 @@ cp config.example.toml config.toml && $EDITOR config.toml
 # missing host path as root, which then PermissionError's on schema.lock.
 ./scripts/deploy/prepare-data-dir.sh
 
+# Image CMD is `localplaud run` (needs /bin/ps via procps in the Dockerfile).
 docker compose --profile core up -d --build
 ./scripts/deploy/smoke-test.sh http://127.0.0.1:8081
 ```
