@@ -103,6 +103,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install BlueZ/D-Bus build deps (Linux bridge only)
+        run: |
+          # btleplug → libdbus-sys needs dbus-1.pc on Linux. Compile ≠ transfer proof.
+          if [ -f vendor/openplod-ble/plaud-bridge/Cargo.toml ]; then
+            sudo apt-get update
+            sudo apt-get install -y libdbus-1-dev pkg-config
+          fi
       - name: Build plaud-bridge when vendored (else skip)
         run: |
           # When Phase 4 has not merged the crate, this exits 0 with "skipped".
