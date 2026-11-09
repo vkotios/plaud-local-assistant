@@ -47,6 +47,15 @@ dedupe_mode = "link"             # off | link | reject_new
 hash_on_ingest = true
 fingerprint_hook = false         # reserved; no acoustic fingerprint ships yet
 
+# Experimental Bluetooth Note Pro adapter (Phase 4). Off by default.
+# Protocol 20 only. Paste tokenstr from web.plaud.ai → localplaud ble provision.
+# Never commit plaud-device.json. See docs/ble.md.
+[ble]
+enabled = false
+# identity_path = "./data/plaud-device.json"
+# bridge_path = "./bin/plaud-bridge"
+domain = "platform-us.plaud.ai"  # or platform-jp.plaud.ai
+
 [store]
 database_url = "sqlite:///./data/localplaud.db"
 # Keep local uploads forever. When enabled, completed Plaud-backed recordings

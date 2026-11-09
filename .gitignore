@@ -7,6 +7,10 @@ config.toml.*
 *.cookie
 *.token
 secrets/
+plaud-device.json
+**/plaud-device.json
+plaud-developer.json
+**/plaud-developer.json
 
 # ---- Data (audio, transcripts, db) ----
 data/
@@ -46,6 +50,10 @@ htmlcov/
 *.log
 caddy_data/
 caddy_config/
+
+# ---- Local BLE bridge build artifacts (never commit binaries) ----
+bin/
+vendor/**/target/
 
 # ---- Session / local agent artifacts ----
 GOAL_CONDITION.md

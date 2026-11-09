@@ -1,0 +1,34 @@
+OpenPlod BLE materials vendored / adapted for Plaud-local
+==========================================================
+
+This directory contains the ``plaud-bridge`` Rust crate copied from OpenPlod
+and used as the selective Bluetooth radio helper for Plaud-local.
+
+Upstream
+--------
+- Project: https://github.com/RemiPelloux/OpenPlod
+- Revision: d5c27989b05837cd49ff7780595514e133bd1c0d
+- License: MIT (see LICENSE in this directory)
+- Copyright: 2026 Remi Pelloux and OpenPlod contributors
+
+OpenPlod documents derivation from ``jddavenportOpen/openplaud``. The
+openplaud standalone LICENSE file was unavailable when OpenPlod recorded
+provenance (2026-09-07). Plaud-local ships OpenPlod MIT contributions with
+attribution; residual openplaud provenance risk is accepted by the product
+owner for this adapter.
+
+Not included
+------------
+- OpenPlod vault / UI / transcription / MCP / Tauri chrome
+- Plaud SDK AAR binaries or trademarks
+- Android companion enrollment
+
+Python protocol / provision / crypto / audio modules adapted from OpenPlod
+``src/sync/*`` live under ``src/localplaud/ble/`` with SPDX-style file headers
+pointing at the OpenPlod sources.
+
+Third-party (bridge)
+--------------------
+- btleplug 0.11 — MIT / Apache-2.0 / BSD-3-Clause
+- rsa (Rust) — MIT / Apache-2.0
+- Tokio / serde_json / uuid / base64 / futures — as declared in Cargo.toml

@@ -61,6 +61,8 @@ cloud = ["openai>=1.35", "deepgram-sdk>=3.2", "assemblyai>=0.28", "anthropic>=0.
 # Local knowledge MCP stdio server (product MCP — not @plaud-ai/mcp cloud ingest).
 # Pin mcp v1 FastMCP API; do not bump to mcp>=2 without a dedicated migration.
 mcp = ["mcp>=1.0,<2"]
+# Experimental / deferred BLE Note Pro crypto (ChaCha20 / RSA unwrap). Bridge separate.
+ble = ["cryptography>=42"]
 dev = [
     "pytest>=8.2",
     "ruff>=0.5",
@@ -68,7 +70,9 @@ dev = [
     "respx>=0.21",
     "pypdf>=5.0",
     "mcp>=1.0,<2",
+    "cryptography>=42",
 ]
+
 
 [project.scripts]
 localplaud = "localplaud.cli:app"

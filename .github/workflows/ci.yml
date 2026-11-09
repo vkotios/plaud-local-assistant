@@ -28,7 +28,7 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
       - name: Install application and provider test dependencies
-        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev --extra cloud
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev --extra cloud --extra ble
       - name: Install CPU tensor test dependency
         run: uv pip install "torch>=2.8" --index-url https://download.pytorch.org/whl/cpu
       - name: Lint
@@ -103,6 +103,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install BlueZ/D-Bus build deps (Linux bridge only)
+        run: |
+          # btleplug → libdbus-sys needs dbus-1.pc on Linux. Compile ≠ transfer proof.
+          if [ -f vendor/openplod-ble/plaud-bridge/Cargo.toml ]; then
+            sudo apt-get update
+            sudo apt-get install -y libdbus-1-dev pkg-config
+          fi
       - name: Build plaud-bridge when vendored (else skip)
         run: |
           # When Phase 4 has not merged the crate, this exits 0 with "skipped".

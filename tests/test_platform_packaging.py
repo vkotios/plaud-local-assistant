@@ -51,10 +51,24 @@ def test_fedora_windows_ble_host_docs_exist():
     assert "prepare-data-dir.sh" in fedora
 
 
-def test_bridge_packaging_script_skips_without_vendor_crate():
+def test_bridge_packaging_script_skips_or_documents_build():
+    """When the Phase 4 crate is absent, the script must skip cleanly.
+
+    When the crate is present (this tree after Phase 4), do **not** invoke
+    ``cargo build`` from pytest — that needs Rust + libdbus on Linux and belongs
+    in the dedicated ``plaud-bridge-packaging`` CI job (compile ≠ transfer).
+    """
     import subprocess
 
     script = ROOT / "scripts/packaging/build-plaud-bridge.sh"
+    crate = ROOT / "vendor/openplod-ble/plaud-bridge/Cargo.toml"
+    text = script.read_text(encoding="utf-8")
+    assert "skipped: plaud-bridge crate not present" in text
+    assert "cargo build --release" in text
+
+    if crate.exists():
+        return
+
     result = subprocess.run(
         ["bash", str(script)],
         cwd=ROOT,
@@ -64,8 +78,6 @@ def test_bridge_packaging_script_skips_without_vendor_crate():
     )
     assert result.returncode == 0, result.stderr
     assert "skipped: plaud-bridge crate not present" in result.stdout
-    # Ensure we did not invent a vendor tree as a side effect
-    assert not (ROOT / "vendor/openplod-ble/plaud-bridge/Cargo.toml").exists()
 
 
 def test_doctor_reports_runtime_and_ble_packaging(monkeypatch, tmp_path):
@@ -92,10 +104,13 @@ def test_doctor_reports_runtime_and_ble_packaging(monkeypatch, tmp_path):
 
 
 def test_ble_packaging_status_container_ok_when_disabled(monkeypatch):
+    from localplaud.config import get_settings
     from localplaud.platform_runtime import ble_packaging_status
 
     monkeypatch.setenv("LOCALPLAUD_RUNTIME", "docker")
-    monkeypatch.delenv("LOCALPLAUD_BLE__ENABLED", raising=False)
+    # Explicit false + reload: prior tests may have left settings.ble.enabled=True.
+    monkeypatch.setenv("LOCALPLAUD_BLE__ENABLED", "false")
+    get_settings(reload=True)
     status = ble_packaging_status()
     assert status["ok"] is True
     assert status["in_container"] is True

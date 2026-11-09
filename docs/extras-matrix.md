@@ -12,6 +12,7 @@ and [deploy-fedora.md](deploy-fedora.md).
 | *(base)* | App, SQLite, UI, official Open API | Always install |
 | `dev` | pytest, ruff, mypy, respx | CI and local development |
 | `cloud` | openai / deepgram / assemblyai / anthropic SDKs | Install for tests or when explicitly enabling a cloud provider; **providers stay opt-in** |
+| `ble` | cryptography (ChaCha20 / RSA unwrap) | Experimental Note Pro BLE (`docs/ble.md`); bridge binary built separately |
 | `faster-whisper` | Local CTranslate2 ASR | Default local ASR path; use `device=cpu` on non-NVIDIA hosts |
 | `cuda` | faster-whisper + NVIDIA cuBLAS/cuDNN wheels | **Do not** install on AMD-only hosts |
 | `mlx` | Apple Silicon ASR | Not for Fedora/AMD |
@@ -41,7 +42,7 @@ Point `[llm]` at `ai-gateway` → IGM (`docs/deploy-fedora-igm.md`). Leave
 GitHub Actions runs:
 
 ```bash
-uv sync --locked --extra dev --extra cloud
+uv sync --locked --extra dev --extra cloud --extra ble
 uv pip install "torch>=2.8" --index-url https://download.pytorch.org/whl/cpu
 uv run ruff check src tests
 uv run pytest -q

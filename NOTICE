@@ -6,26 +6,39 @@ localplaud (https://github.com/skyhong2002/localplaud), licensed under the MIT
 License. See LICENSE and ATTRIBUTION.md.
 
 Plaud-local product overlays (inference-gateway-manager client wiring, Fedora
-deploy docs, and future adapters) are Copyright (c) 2026 Vasileios Kotios and
+deploy docs, and BLE adapter) are Copyright (c) 2026 Vasileios Kotios and
 contributors, also under MIT unless a file states otherwise.
 
 ---------------------------------------------------------------------------
-Bluetooth / OpenPlod (experimental — packaging vs protocol)
+Bluetooth / OpenPlod (experimental — packaging + deferred adapter)
 ---------------------------------------------------------------------------
 
-Phase 6 publishes **host packaging** requirements only
+Phase 6 publishes **host packaging** requirements
 (`docs/ble-host.md`, Compose/doctor refusals for in-container BLE). Default
 Docker `core`/`cpu`/`gpu`/`mac` profiles do **not** support Bluetooth radio.
 
-No OpenPlod / openplaud-derived **protocol or provision** code is required for
-core packaging. When the Phase 4 BLE adapter is present in-tree:
+Phase 4 includes selective OpenPlod-derived BLE modules under MIT (feature-flagged
+``[ble] enabled = false``; live Partner authorize currently **deferred** —
+see ``docs/ble.md``):
 
-- Preserve MIT notices for OpenPlod contributions.
-- Keep openplaud provenance / licence attribution current in ATTRIBUTION.md.
-- Do not redistribute Plaud SDK AAR binaries or trademarks.
-- Treat CI `plaud-bridge` builds as compile evidence only — not transfer proof.
+- Python adaptations: ``src/localplaud/ble/`` (provision, protocol, crypto,
+  audio, transport, doctor) adapted from OpenPlod ``src/sync/*``.
+- Vendored bridge crate: ``vendor/openplod-ble/plaud-bridge/`` from OpenPlod
+  ``src-tauri/plaud-bridge``.
+- Upstream revision: d5c27989b05837cd49ff7780595514e133bd1c0d
+  (https://github.com/RemiPelloux/OpenPlod).
+- Copyright: 2026 Remi Pelloux and OpenPlod contributors (MIT). See
+  ``vendor/openplod-ble/LICENSE`` and ``vendor/openplod-ble/NOTICE``.
 
-Until hardware acceptance on a declared OS, BLE remains experimental.
+OpenPlod documents derivation from ``jddavenportOpen/openplaud``; a standalone
+openplaud LICENSE was unavailable when OpenPlod recorded provenance. The product
+owner accepts residual provenance risk for this selective adapter.
+
+Not redistributed: Plaud SDK AAR binaries, Plaud trademarks, OpenPlod vault/UI/
+transcription/MCP product surface.
+
+CI ``plaud-bridge`` builds are compile evidence only — not transfer proof.
+Supported recording ingest for now is official Open API cloud poll/download.
 
 ---------------------------------------------------------------------------
 Private / reverse-engineered Plaud APIs
@@ -35,3 +48,8 @@ Private or reverse-engineered Plaud session/API clients are permanently out of
 scope for Plaud-local cloud sync. Official Open API (and official cloud MCP for
 ingest) are the only supported cloud paths. Do not add clients derived from
 Applaud, plaud-tools, plaud-toolkit, PlaudNotes, or similar private stacks.
+
+Device identity minting uses Plaud Partner SDK endpoints
+(``…/developer/api/open/partner/sdk/gen-key`` and ``sn-sign``) with a pasted
+consumer sign-in token — the same surface OpenPlod documents for desktop
+authorization — not private consumer-cloud reverse engineering.
