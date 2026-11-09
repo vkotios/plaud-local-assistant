@@ -1,41 +1,73 @@
-# Bluetooth Note Pro adapter (experimental)
+# Bluetooth Note Pro adapter (experimental / deferred)
 
 Phase 4 adds an **isolated** BLE adapter adapted from
 [OpenPlod](https://github.com/RemiPelloux/OpenPlod) (MIT) so Plaud-local can
-authorize a Note Pro and ingest decoded audio into the Phase 3 orchestrator.
-Vault, UI, and transcription stay **localplaud** — the full OpenPlod app is
-**not** installed or merged.
+eventually authorize a Note Pro and ingest decoded audio into the Phase 3
+orchestrator. Vault, UI, and transcription stay **localplaud** — the full
+OpenPlod app is **not** installed or merged.
 
-**Status:** experimental. Feature flag `[ble] enabled = false` by default.
-Protocol **20** / Note Pro (advertisement projects 881/883) only. No Android.
+**Status (2026-11):** **experimental and deferred** for live authorize/download.
+Feature flag `[ble] enabled = false` by default. Protocol **20** / Note Pro
+(advertisement projects 881/883) only. No Android.
 
-## What you must do once (owner)
+### Supported recording path right now
 
-1. Sign in at [web.plaud.ai](https://web.plaud.ai).
-2. Open browser DevTools → **Application** → **Local Storage** →
-   `https://web.plaud.ai` → copy **`tokenstr`**.
-3. Wake the Note Pro near the PC. Note its Bluetooth address (or run a scan
-   once `plaud-bridge` is built).
-4. Provision (token via prompt / `--token-file` / stdin — prefer file over shell
-   history):
+Use the **official Plaud Open API** (cloud poll/download):
 
-   ```bash
-   localplaud ble provision \
-     --serial <16-HEX-SERIAL> \
-     --identifier <BD_ADDR-or-UUID>
-   ```
+```bash
+uv run localplaud auth login   # one-time browser OAuth
+uv run localplaud poll --once  # or `localplaud run` / scheduled poll
+```
 
-5. Confirm readiness (output is redacted):
+Do **not** treat BLE Note Pro radio ingest as a supported product path until
+Partner SDK device authorization works for the account (see below).
 
-   ```bash
-   localplaud ble doctor
-   ```
+Host packaging (BlueZ / Docker refusal / Windows policy): [ble-host.md](ble-host.md).
 
-Partner portal `client_id` / `client_secret` is **not** required for this path.
-Whether Plaud accepts a fresh consumer JWT on Partner SDK `gen-key` / `sn-sign`
-is **server-side / unverified** for some accounts (OpenPlod documented the same
-caveat). If Plaud returns `CLIENT_USER_NOT_FOUND`, the account is not enabled
-for device authorization in that region.
+## Why BLE authorize is deferred
+
+Live Mac testing showed:
+
+| Token source | Partner `POST …/partner/sdk/gen-key` |
+| --- | --- |
+| Consumer web session (`pld_ut` / Chrome extract, EU `api-euc1`) | **ACCESS_TOKEN_INVALID** on `platform-us` and `platform-jp` |
+| Official Open API OAuth (`localplaud auth login`) | **HTTP 500** on `platform-us` and `platform-jp` |
+
+There is **no** published EU Partner host (`platform-euc1` / `platform-eu` do
+not resolve). `developer-euc1.plaud.ai` exists but the Partner `gen-key` path
+is **404**. Without a successful `gen-key` + `sn-sign`, no `plaud-device.json`
+is written, so BLE list/import cannot run.
+
+Mac **scan / CoreBluetooth bridge / connection verify** worked when the owner
+held the device button. Windows WinRT **scan** did not find advertisements in
+earlier probes. Neither path completed authorize.
+
+The BLE **code remains in-tree** for a later resume when Plaud Partner SDK
+accepts a mintable token (or an alternate authorize path is documented).
+
+## What lands in-tree (kept)
+
+1. **Provision CLI/module** (`localplaud ble provision`) — paste/file token →
+   Partner SDK `gen-key` + `sn-sign` → private `plaud-device.json` (0600).
+2. **Isolated package** `src/localplaud/ble/` → Phase 3 ingest
+   (`source_transport=ble`, `serial:sessionId`) when identity + transfer exist.
+3. **Vendored** `plaud-bridge` under `vendor/openplod-ble/` (MIT + NOTICE).
+4. Helpers: `scripts/extract_plaud_chrome_token.py` (macOS Chrome cookies → EU
+   refresh; does **not** bypass Partner rejection).
+5. Tests: mocked provision + protocol fixtures + BLE ingest dedupe (no live secrets).
+
+## Resume later (operator checklist)
+
+1. Confirm Partner `gen-key` succeeds for a real token (us/jp or a future EU host).
+2. `localplaud ble provision --serial … --identifier … --token-file …`
+   (macOS identifier is a CoreBluetooth **UUID**, not a MAC).
+3. Build bridge: `cd vendor/openplod-ble/plaud-bridge && cargo build --release`
+   (or packaging script / `LOCALPLAUD_BLE__BRIDGE_PATH`).
+4. Optionally `[ble] enabled = true`; keep device awake / button-held for ads.
+5. `localplaud ble doctor` then scan / transfer / Phase 3 ingest.
+
+Partner portal `client_id` / `client_secret` is **not** required by the
+paste-token code path. Whether Plaud accepts a given JWT remains **server-side**.
 
 ## Identity file
 
@@ -48,7 +80,7 @@ Writes private `plaud-device.json` (mode `0600` on POSIX):
 
 **Never commit** this file. It holds binding token, signature, and RSA keys.
 
-Regions: `platform-us.plaud.ai` (default), `platform-jp.plaud.ai`.
+Regions currently coded: `platform-us.plaud.ai` (default), `platform-jp.plaud.ai`.
 
 ## Build the radio bridge
 
@@ -60,39 +92,12 @@ cargo build --release
 Set `LOCALPLAUD_BLE__BRIDGE_PATH` or place the binary on `PATH` / `./bin/`.
 Source notice: `vendor/openplod-ble/NOTICE`.
 
-## Enable the feature flag
-
-```toml
-[ble]
-enabled = true
-domain = "platform-us.plaud.ai"
-```
-
-Decoded BLE audio ingests with `source_transport=ble` and external id
-`serial:sessionId` (Phase 3 dedupe). Live radio download additionally needs
-identity + bridge; until hardware acceptance, treat transfer as experimental.
-
-```bash
-# After you have decoded audio on disk (fixture or successful download):
-# use the ingest API / BleBackend.item_from_session path — see tests.
-localplaud ble doctor --json
-```
-
-## Windows vs WSL (honest)
-
-| Host | Reality |
-| --- | --- |
-| **Windows native** | Implemented first here (WinRT via `plaud-bridge`). Upstream OpenPlod built the bridge for Windows; **full Note Pro extraction on Windows is not verified**. |
-| **WSL** | Bluetooth passthrough is limited/unreliable. Do **not** treat WSL as the acceptance path for Phase 4 hardware until proven. Prefer native Windows for provision/doctor on this machine, and Linux+BlueZ (non-WSL) for later acceptance. |
-| **Linux (BlueZ)** | Preferred long-term acceptance target. Upstream verified discovery/connect; full download not recorded without a provisioned identity. |
-| **Docker** | BLE unsupported in default containers. |
-
 ## Doctor / CLI
 
 | Command | Purpose |
 | --- | --- |
 | `localplaud ble doctor` | Redacted readiness (flag, bridge, identity, ffmpeg) |
-| `localplaud ble provision` | Paste token → Partner SDK → `plaud-device.json` |
+| `localplaud ble provision` | Token → Partner SDK → `plaud-device.json` (deferred live) |
 | `localplaud ble scan` | Optional scan when bridge present (redacted) |
 | `localplaud ble scan-verbose` | Count ads vs filter rejects (no MAC/serial) |
 | `localplaud ble clear-identity --yes` | Delete local authorization |
@@ -101,23 +106,13 @@ localplaud ble doctor --json
 
 On macOS, CoreBluetooth does **not** expose a Bluetooth MAC. `plaud-bridge`
 therefore reports the CoreBluetooth peripheral UUID as `identifier` (not
-`00:00:00:00:00:00`). Use that UUID with `ble provision --identifier`. The same
-identity file remains usable later on Windows once a working radio path can
-scan; Windows still needs WinRT (or another stack) to pull new recordings.
+`00:00:00:00:00:00`). Use that UUID with `ble provision --identifier`.
 
 ### WinRT scan filter (vs Mac)
 
-Mac `scan-plaud.swift` matches **name contains "plaud"** only. OpenPlod's Rust
-bridge matches name **or** GATT service `0x1910`. On Windows, WinRT ads often
-omit both while still carrying Note Pro manufacturer data, so `plaud-bridge`
-also accepts:
-
-- service UUID `0x1910` in `services` **or** `service_data`
-- manufacturer framing for projects **881 / 883** (strict TLV or looser project-id)
-
-`scan-verbose` reports count-only stages (`uniquePeripherals`,
-`acceptedByFilter`, `rejectedByFilter`, `legacyFilterWouldAccept`, …) with no
-identifiers.
+Mac name matching vs WinRT manufacturer/service gaps: see bridge comments and
+`scan-verbose` count-only diagnostics. Windows live scan was **not** verified
+to detect the owner's Note Pro in Phase 4 probes.
 
 Optional Python crypto: `pip install 'localplaud[ble]'` (ChaCha20 / RSA unwrap).
 
