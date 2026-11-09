@@ -53,6 +53,10 @@ ordinary database rows, logs, diagnostics, or repository files.
 
 Official documentation: <https://docs.plaud.ai/plaud-mcp-cli/mcp>
 
+This cloud ingest MCP is **not** the product local knowledge MCP. For search,
+Ask, transcripts, and provenance over the local library, see
+[mcp-knowledge.md](mcp-knowledge.md) (`plaud-local-knowledge-mcp`).
+
 ### Link-backed migration bodies
 
 Official detail responses may include empty `data_content` plus `data_link` for

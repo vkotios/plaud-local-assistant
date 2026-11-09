@@ -5,8 +5,11 @@
 > [inference-gateway-manager](https://github.com/vkotios/inference-gateway-manager)
 > (`/v1`, concurrency 1, HTTP 409 busy retry) — [docs/deploy-fedora-igm.md](docs/deploy-fedora-igm.md).
 > Phase 3 adds unified ingest + library dedupe (link-by-default; BLE stub only) —
-> [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Private/RE Plaud APIs and
-> OpenPlod BLE protocol code remain out of scope until Phase 4.
+> [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Phase 5 adds a **local knowledge
+> MCP** (`plaud-local-knowledge-mcp`) over the local library — distinct from the
+> official `@plaud-ai/mcp` cloud ingest client —
+> [docs/mcp-knowledge.md](docs/mcp-knowledge.md). Private/RE Plaud APIs and
+> OpenPlod BLE protocol code remain out of scope on main until Phase 4 merges.
 
 <p align="center">
   <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">
@@ -182,7 +185,7 @@ end; full Plaud parity and broader language/hardware benchmarks are in progress.
 | Speech and speakers | [Speech quality](docs/speech-quality.md) · [Remote workers](docs/remote-worker.md) · [Speaker identities](docs/cross-recording-speakers.md) |
 | Notes | [Note quality](docs/note-quality.md) · [Chapter outlines](docs/chapter-outline.md) |
 | Integrations | [Webhooks](docs/webhooks.md) · [Email delivery](docs/email-integrations.md) |
-| Product and API | [Changelog](CHANGELOG.md) · [Product workflow](docs/product-workflow.md) · [Plaud API](docs/plaud-api.md) · [ADRs](docs/adr/) |
+| Product and API | [Changelog](CHANGELOG.md) · [Product workflow](docs/product-workflow.md) · [Plaud API](docs/plaud-api.md) · [Local knowledge MCP](docs/mcp-knowledge.md) · [ADRs](docs/adr/) |
 | Troubleshooting | [Acceptance](docs/acceptance.md) · [Processing repair](docs/processing-repair.md) · [Support](docs/support.md) |
 
 ## Contributing
