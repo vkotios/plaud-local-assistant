@@ -1,64 +1,107 @@
-> **Plaud-local** (`vkotios/plaud-local-assistant`) is a product tree based on
-> [localplaud](https://github.com/skyhong2002/localplaud) (MIT). Upstream history
-> is preserved; see [docs/UPSTREAM.md](docs/UPSTREAM.md), [NOTICE](NOTICE), and
-> [ATTRIBUTION.md](ATTRIBUTION.md). Local LLM traffic targets
-> [inference-gateway-manager](https://github.com/vkotios/inference-gateway-manager)
-> (`/v1`, concurrency 1, HTTP 409 busy retry) — [docs/deploy-fedora-igm.md](docs/deploy-fedora-igm.md).
-> Phase 3 adds unified ingest + library dedupe (link-by-default) —
-> [docs/ingest-dedupe.md](docs/ingest-dedupe.md). Phase 4 ships an **experimental /
-> deferred** BLE Note Pro adapter (code kept; Partner authorize blocked for now) —
-> [docs/ble.md](docs/ble.md). **Supported cloud path:** official Open API via
-> `localplaud auth login` + poll/download. Phase 5 adds a **local knowledge MCP**
-> (`plaud-local-knowledge-mcp`) — [docs/mcp-knowledge.md](docs/mcp-knowledge.md).
-> Phase 6 publishes the [platform matrix](docs/platform-matrix.md) and
-> Fedora/Windows/Docker packaging ([deploy-fedora.md](docs/deploy-fedora.md),
-> [windows.md](docs/windows.md), [ble-host.md](docs/ble-host.md)): Compose `core`
-> profile, BLE unsupported in default containers, AMD/IGM not CUDA. Phase 7 adds
-> hardening acceptance ([security-checklist.md](docs/security-checklist.md),
-> [UPSTREAM.md](docs/UPSTREAM.md), [performance.md](docs/performance.md)).
-> Private/RE Plaud APIs remain rejected. BLE is **not GA**.
-
 <p align="center">
-  <img src="src/localplaud/api/static/wordmark.svg" alt="localplaud" height="56">
+  <img src="docs/assets/wordmark-plaud-local.svg" alt="Plaud-local (plaud-local-assistant)" height="64">
 </p>
 
-<h1 align="center">Your recordings. Your intelligence.</h1>
+<h1 align="center">Plaud-local</h1>
 
 <p align="center">
-  Turn Plaud recordings into editable transcripts, useful notes, and answers you can trace.<br>
-  An open-source, self-hosted alternative to the Plaud Intelligence workflow.
+  Self-hosted Plaud Note intelligence on
+  <a href="https://github.com/skyhong2002/localplaud">localplaud</a>.<br>
+  Product repository:
+  <a href="https://github.com/vkotios/plaud-local-assistant"><code>vkotios/plaud-local-assistant</code></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/skyhong2002/localplaud/actions/workflows/ci.yml"><img src="https://github.com/skyhong2002/localplaud/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+  <a href="https://github.com/vkotios/plaud-local-assistant/actions/workflows/ci.yml"><img src="https://github.com/vkotios/plaud-local-assistant/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"></a>
-  <a href="docs/deploy.md"><img src="https://img.shields.io/badge/runs_on-Apple_Silicon_%7C_NVIDIA_%7C_CPU-667085" alt="Runs on Apple Silicon, NVIDIA, and CPU"></a>
-  <a href="#faq"><img src="https://img.shields.io/badge/status-active_development-8F53ED" alt="Status: active development"></a>
+  <a href="docs/platform-matrix.md"><img src="https://img.shields.io/badge/core-Fedora%20%7C%20Docker%20%7C%20WSL-0D9488" alt="Core platforms"></a>
+  <a href="docs/ble.md"><img src="https://img.shields.io/badge/BLE-experimental-64748B" alt="BLE: experimental"></a>
 </p>
 
 <p align="center">
-  <a href="https://skyhong2002.github.io/localplaud/demo/"><b>Live demo</b></a> ·
   <a href="#quickstart">Get started</a> ·
-  <a href="docs/deploy.md">Self-host</a> ·
+  <a href="docs/platform-matrix.md">Platforms</a> ·
+  <a href="docs/UPSTREAM.md">Upstream</a> ·
   <a href="#documentation">Docs</a> ·
-  <a href="https://github.com/skyhong2002/localplaud/discussions">Community</a> ·
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
+## What this is
+
+**Plaud-local** keeps the Plaud recorder + official App for capture and cloud
+raw-audio upload, then runs transcription, diarization, notes, Ask, and export
+on hardware you control—so you can stay on Plaud’s free plan and never press
+Generate.
+
+It is a **fork / product tree** of [localplaud](https://github.com/skyhong2002/localplaud)
+(MIT), with packaging, ingest, inference, MCP, and experimental BLE overlays for
+this repository. Upstream history is preserved; pin and rebase notes live in
+[docs/UPSTREAM.md](docs/UPSTREAM.md). Attribution:
+[NOTICE](NOTICE), [ATTRIBUTION.md](ATTRIBUTION.md).
+
+You can also upload any audio file. Screenshots below show the upstream
+localplaud Web App (synthetic demo library).
+
 <p align="center">
-  <img src="docs/assets/screenshots/hero.webp" alt="localplaud on desktop and mobile: a speaker-labelled transcript with synchronized audio" width="100%">
+  <img src="docs/assets/screenshots/hero.webp" alt="localplaud Web App: speaker-labelled transcript with synchronized audio" width="100%">
 </p>
 
-Keep recording with your Plaud device and the official Plaud App. localplaud
-downloads the raw audio and does the rest on hardware you control—**no Plaud
-Generate button, no paid Intelligence plan.** You can also upload any audio file.
+## Upstream / fork
 
-## Features
+| | |
+| --- | --- |
+| **This repo** | https://github.com/vkotios/plaud-local-assistant |
+| **Upstream** | https://github.com/skyhong2002/localplaud |
+| **Pin / rebase** | [docs/UPSTREAM.md](docs/UPSTREAM.md) (ADR [0009](docs/adr/0009-fork-wrap-boundary.md)) |
+| **Licence** | MIT (localplaud + Plaud-local overlays; OpenPlod BLE under MIT — see NOTICE) |
+
+Prefer wrap/adapt overlays over rewriting shared localplaud modules. Contribute
+generic fixes upstream when they belong there.
+
+## Mods & additions vs upstream
+
+Shipped on this `main` (see [CHANGELOG](CHANGELOG.md)):
+
+- **Unified ingest + dedupe** — cloud Open API and filesystem import with
+  library dedupe (link-by-default); BLE adapter present but experimental
+  ([docs/ingest-dedupe.md](docs/ingest-dedupe.md), [docs/ble.md](docs/ble.md))
+- **Official Plaud Open API only** for cloud sync — no private / reverse-engineered
+  Plaud APIs ([docs/plaud-api.md](docs/plaud-api.md), NOTICE)
+- **IGM-oriented gateway client** — OpenAI-compatible
+  [inference-gateway-manager](https://github.com/vkotios/inference-gateway-manager)
+  (`/v1`, concurrency **1**, HTTP 409 busy retry); cloud LLM opt-in
+  ([docs/deploy-fedora-igm.md](docs/deploy-fedora-igm.md))
+- **Read-only local knowledge MCP** — `plaud-local-knowledge-mcp`, distinct from
+  `@plaud-ai/mcp` ([docs/mcp-knowledge.md](docs/mcp-knowledge.md), ADR [0010](docs/adr/0010-mcp-split.md))
+- **Platform packaging** — Fedora/Docker core, Windows 11 WSL policy, BLE **host**
+  docs; Compose `core` profile; BLE unsupported in default containers
+  ([docs/platform-matrix.md](docs/platform-matrix.md),
+  [deploy-fedora.md](docs/deploy-fedora.md),
+  [windows.md](docs/windows.md),
+  [ble-host.md](docs/ble-host.md))
+- **Experimental BLE Note Pro adapter** — OpenPlod-derived (MIT attribution);
+  Mac scan proven; Partner authorize / download **deferred**; **not GA**
+  ([docs/ble.md](docs/ble.md), ADR [0011](docs/adr/0011-ble-experimental-policy.md))
+- **Hardening** — sealed backup restore fix, [SECURITY.md](SECURITY.md) overlay,
+  security / release checklists, ADRs 0009–0011
+  ([docs/security-checklist.md](docs/security-checklist.md),
+  [docs/performance.md](docs/performance.md))
+
+### Supported vs experimental
+
+| Path | Status |
+| --- | --- |
+| Cloud ingest via official Plaud Open API (`auth login` + poll/download) | **Supported** |
+| Filesystem / Web App upload | **Supported** |
+| BLE Note Pro transfer (OpenPlod-adapted adapter) | **Experimental / deferred** — not GA |
+| Default Docker profiles for BLE radio | **Not supported** |
+
+## Features (from localplaud)
 
 ### Transcripts with speakers you can name
 
-Shown above: Whisper large-v3-turbo plus pyannote diarization. Click any line to seek, rename
+Whisper large-v3-turbo plus pyannote diarization. Click any line to seek, rename
 speakers once, fix text inline, and compare the corrected transcript with raw ASR.
 
 ### Notes from your own templates
@@ -89,43 +132,16 @@ locally, on your own worker, or with a cloud provider.
 
 <sub>Screenshots use the synthetic demo library from <code>scripts/seed_demo.py</code>.</sub>
 
-## How it compares
-
-Speaker labels are one of the most frequent complaints in r/PlaudNoteUsers:
-voices merged or split, and names that must be re-entered for every recording.
-Plaud's own help center says it [does not automatically identify other
-speakers](https://support.plaud.ai/hc/en-us/articles/54027338385177-Auto-speaker-labeling).
-
-| | **localplaud** | Plaud Intelligence | Otter.ai | Meetily (open source) |
-| --- | --- | --- | --- | --- |
-| Price | Free (MIT) + your hardware | Free 300 min/mo · Pro $17.99/mo · Unlimited $29.99/mo | Free 300 min/mo · Pro $16.99/mo | Free · Pro $10/user/mo |
-| Minute caps | None | 300 / 1,200 / unlimited | 300 / 1,200 / unlimited | None |
-| Where AI runs | Local, your worker, or a cloud provider you choose | Plaud cloud | Otter cloud | Local or your API key |
-| Self-hostable | ✅ | — | — | ✅ |
-| Speaker diarization | ✅ pyannote, editable per segment | ✅ | ✅ | Pro plan |
-| Names remembered across recordings | ✅ optional local voiceprints | Your own voice only | ✅ (cloud) | Not verified |
-| Speaker rename updates notes | Re-indexed instantly; notes regenerate with no per-minute fees | Regenerate summary (uses minutes) | Not verified | Not verified |
-| Works with Plaud recorders | ✅ automatic raw-audio sync | ✅ | Manual file upload | Not verified |
-| Bulk export | ZIP of up to 50 recordings | Per file | Business plan | Not verified |
-
-Sources (November 2026, monthly USD pricing):
-[Plaud plans](https://www.plaud.ai/pages/plaud-ai-plan-pricing) ·
-[Otter speaker ID](https://help.otter.ai/hc/en-us/articles/21665587209367-Speaker-Identification-Overview) ·
-[Otter export](https://help.otter.ai/hc/en-us/articles/360047733634-Export-conversations) ·
-[Meetily](https://meetily.ai/pro). “Not verified” means we found no public source.
-localplaud's cross-recording voice identification is an optional
-[voice service](docs/cross-recording-speakers.md) that needs extra setup.
-Spot an error? [Open an issue](https://github.com/skyhong2002/localplaud/issues/new/choose).
-
 ## How it works
 
 ```mermaid
 flowchart LR
     recorder["Plaud recorder"] --> app["Plaud App + cloud<br/>raw-audio upload"]
-    app -->|"read-only sync"| audio
-    upload["Upload your own audio"] --> audio
+    app -->|"Open API sync"| audio
+    upload["Upload / filesystem"] --> audio
+    ble["BLE Note Pro<br/>(experimental)"] -.-> audio
 
-    subgraph localplaud["Your localplaud workspace"]
+    subgraph workspace["Plaud-local workspace"]
         audio["Raw audio"] --> transcript["Transcribe · align<br/>identify speakers · correct"]
         transcript --> knowledge["Notes · mind map · index"]
         knowledge --> use["Listen · edit · Ask<br/>organize · export"]
@@ -133,41 +149,46 @@ flowchart LR
 ```
 
 Speech runs on Whisper large-v3-turbo (MLX on Apple Silicon, faster-whisper on
-CUDA/CPU) with pyannote speaker diarization. Text generation defaults to Ollama.
+CUDA/CPU) with pyannote speaker diarization. On this fork, text generation
+defaults toward an IGM OpenAI-compatible gateway (concurrency 1); Ollama and
+other providers remain available per stage.
 
 ## Quickstart
 
 Requires **Python 3.11+**, **ffmpeg**, [uv](https://docs.astral.sh/uv/), and a
-running [Ollama](https://ollama.com/).
+reachable LLM endpoint (IGM recommended on Fedora/AMD hosts; Ollama also works).
 
 ```bash
-git clone https://github.com/skyhong2002/localplaud.git
-cd localplaud
+git clone https://github.com/vkotios/plaud-local-assistant.git
+cd plaud-local-assistant
 
 # Apple Silicon: use --extra mlx · NVIDIA: use --extra cuda
 uv sync --extra faster-whisper --extra diarize --extra vad --extra local-llm
 
 cp config.example.toml config.toml
 cp .env.example .env
-ollama pull llama3.1:8b
 ```
 
 For speaker labels, accept the terms for
 [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1)
 and add `LOCALPLAUD_DIARIZE__HF_TOKEN=hf_...` to `.env`. On Apple Silicon, set
-`asr.provider = "mlx-whisper"` in `config.toml`.
+`asr.provider = "mlx-whisper"` in `config.toml`. Point LLM stages at IGM when
+using [deploy-fedora-igm.md](docs/deploy-fedora-igm.md).
 
 ```bash
 uv run localplaud init
-uv run localplaud auth login   # one-time Plaud OAuth
+uv run localplaud auth login   # one-time Plaud Open API OAuth (supported sync)
 uv run localplaud doctor       # check auth, ffmpeg, and providers
 uv run localplaud run          # sync + process + serve
 ```
 
 Open **[localhost:8080](http://localhost:8080)**. The first sync catalogs your
 library without downloading it; choose **Import audio** on any recording, and new
-uploads download automatically. Docker, CUDA, and remote-worker setups are in the
-[deployment guide](docs/deploy.md).
+uploads download automatically.
+
+Operators: [platform matrix](docs/platform-matrix.md),
+[Fedora](docs/deploy-fedora.md), [Windows / WSL](docs/windows.md),
+[upstream deploy guide](docs/deploy.md).
 
 ## FAQ
 
@@ -177,31 +198,40 @@ download, processing can be fully local; cloud providers are opt-in per stage.
 **Can I use it without a Plaud recorder?** Yes—upload files with **Add audio**
 ([formats](docs/uploads.md)).
 
+**Does BLE replace cloud sync?** No. Cloud Open API is the supported path. BLE
+is experimental and Partner authorize/download is deferred ([docs/ble.md](docs/ble.md)).
+
 **Is it safe to expose online?** It binds to `127.0.0.1` by default. Configure
 [accounts](docs/accounts.md), a session secret, and HTTPS first. Plaud access is
 read-only.
 
-**Is it finished?** It's in active development. The core workflow works end to
-end; full Plaud parity and broader language/hardware benchmarks are in progress.
+**Is it finished?** Active development. Core cloud + library workflow works end
+to end; BLE is not GA.
 
 ## Documentation
 
 | Topic | Read |
 | --- | --- |
-| Install and operate | [Platform matrix](docs/platform-matrix.md) · [Fedora](docs/deploy-fedora.md) · [Windows](docs/windows.md) · [BLE host](docs/ble-host.md) · [Deployment](docs/deploy.md) · [Accounts](docs/accounts.md) · [Backups](docs/backups.md) |
+| Fork / upstream | [UPSTREAM.md](docs/UPSTREAM.md) · [NOTICE](NOTICE) · [ATTRIBUTION.md](ATTRIBUTION.md) · [ADRs](docs/adr/) |
+| Install and operate | [Platform matrix](docs/platform-matrix.md) · [Fedora](docs/deploy-fedora.md) · [IGM](docs/deploy-fedora-igm.md) · [Windows](docs/windows.md) · [BLE host](docs/ble-host.md) · [Deployment](docs/deploy.md) · [Accounts](docs/accounts.md) · [Backups](docs/backups.md) |
+| Ingest & BLE | [Ingest / dedupe](docs/ingest-dedupe.md) · [BLE](docs/ble.md) · [Plaud API](docs/plaud-api.md) |
 | Speech and speakers | [Speech quality](docs/speech-quality.md) · [Remote workers](docs/remote-worker.md) · [Speaker identities](docs/cross-recording-speakers.md) |
 | Notes | [Note quality](docs/note-quality.md) · [Chapter outlines](docs/chapter-outline.md) |
-| Integrations | [Webhooks](docs/webhooks.md) · [Email delivery](docs/email-integrations.md) |
-| Product and API | [Changelog](CHANGELOG.md) · [Product workflow](docs/product-workflow.md) · [Plaud API](docs/plaud-api.md) · [Local knowledge MCP](docs/mcp-knowledge.md) · [ADRs](docs/adr/) |
+| Integrations | [Local knowledge MCP](docs/mcp-knowledge.md) · [Webhooks](docs/webhooks.md) · [Email delivery](docs/email-integrations.md) |
+| Product and ops | [Changelog](CHANGELOG.md) · [Product workflow](docs/product-workflow.md) · [Security checklist](docs/security-checklist.md) · [Performance](docs/performance.md) |
 | Troubleshooting | [Acceptance](docs/acceptance.md) · [Processing repair](docs/processing-repair.md) · [Support](docs/support.md) |
 
 ## Contributing
 
 See the [contribution guide](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md).
-Questions go to [Discussions](https://github.com/skyhong2002/localplaud/discussions);
-vulnerabilities to the [private security channel](SECURITY.md).
+Questions about upstream localplaud go to its
+[Discussions](https://github.com/skyhong2002/localplaud/discussions).
+Vulnerabilities for this product tree: [SECURITY.md](SECURITY.md).
 
-## License
+## License & attribution
 
-[MIT](LICENSE) © 2026 Sky Hong. localplaud is an independent project, not
-affiliated with or endorsed by Plaud.
+[MIT](LICENSE). Based on **localplaud** © 2026 Sky Hong. Plaud-local overlays
+© 2026 Vasileios Kotios and contributors. Experimental BLE modules adapted from
+**OpenPlod** (MIT) — see [NOTICE](NOTICE) and [ATTRIBUTION.md](ATTRIBUTION.md).
+
+Independent project; not affiliated with or endorsed by Plaud.
