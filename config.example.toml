@@ -25,6 +25,9 @@ provider = "official"
   # command = "npx"
   # args = ["-y", "@plaud-ai/mcp@latest"]
   # tokens_path = "~/.plaud/tokens-mcp.json"
+  # Cloud ingest only. The product local knowledge MCP is separate:
+  #   uv run plaud-local-knowledge-mcp
+  # See docs/mcp-knowledge.md (stdio; no Plaud OAuth).
   # request_timeout_seconds = 30
 
 [poller]
