@@ -44,8 +44,11 @@ def test_fedora_windows_ble_host_docs_exist():
         "deploy/caddy/Caddyfile.host-native",
         "scripts/packaging/build-plaud-bridge.sh",
         "scripts/deploy/bootstrap-fedora.sh",
+        "scripts/deploy/prepare-data-dir.sh",
     ):
         assert (ROOT / rel).is_file(), rel
+    fedora = (ROOT / "docs/deploy-fedora.md").read_text(encoding="utf-8")
+    assert "prepare-data-dir.sh" in fedora
 
 
 def test_bridge_packaging_script_skips_without_vendor_crate():

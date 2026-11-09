@@ -42,6 +42,8 @@ x-localplaud: &localplaud
     # Packaging marker: doctor refuses BLE when this is set / detected.
     LOCALPLAUD_RUNTIME: docker
   volumes:
+    # Host ./data must be writable by uid 1000 (image USER). Run
+    # scripts/deploy/prepare-data-dir.sh before first up — see docs/deploy-fedora.md.
     - ./data:/app/data
     - ./config.toml:/app/config.toml:ro
     - model_cache:/home/localplaud/.cache

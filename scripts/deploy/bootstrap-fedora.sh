@@ -73,6 +73,7 @@ fi
 
 log "done. Next:"
 log "  docs/deploy-fedora.md          # native or Docker core"
+log "  ./scripts/deploy/prepare-data-dir.sh   # before first compose up"
 log "  docs/deploy-fedora-igm.md      # IGM / ROCm client wiring"
 log "  docs/platform-matrix.md        # honest OS matrix"
 log "  # AMD hosts: do NOT use compose --profile gpu (NVIDIA/CUDA only)"

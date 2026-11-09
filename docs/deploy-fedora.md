@@ -52,6 +52,10 @@ Slim CPU image + Caddy. No CUDA. No BLE radio.
 cp .env.example .env && $EDITOR .env           # DOMAIN, ACME_EMAIL, …
 cp config.example.toml config.toml && $EDITOR config.toml
 
+# Bind mount ./data → /app/data. The image runs as uid 1000; Docker creates a
+# missing host path as root, which then PermissionError's on schema.lock.
+./scripts/deploy/prepare-data-dir.sh
+
 docker compose --profile core up -d --build
 ./scripts/deploy/smoke-test.sh http://127.0.0.1:8081
 ```
