@@ -5,7 +5,7 @@ DyNet38==2.2
 nagisa==0.3.1
 psutil==7.2.2
 soynlp==0.0.493
-aistore==1.26.0
+aistore==2.1.0
 antlr4-python3-runtime==4.13.2
 audioread==3.1.0
 braceexpand==0.1.7
